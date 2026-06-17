@@ -1337,6 +1337,10 @@ dependencies = [
 [[package]]
 name = "sc-load"
 version = "0.0.1"
+dependencies = [
+ "approx",
+ "sc-core",
+]
 
 [[package]]
 name = "sc-material"
