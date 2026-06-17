@@ -5,7 +5,7 @@ use sha2::{Digest, Sha256};
 use std::io::{Read, Write};
 use std::path::Path;
 
-pub const CURRENT_SCHEMA_VERSION: u32 = 2;
+pub const CURRENT_SCHEMA_VERSION: u32 = 3;
 
 #[derive(Debug, thiserror::Error)]
 pub enum IoError {

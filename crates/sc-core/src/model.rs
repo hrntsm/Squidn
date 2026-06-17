@@ -158,6 +158,8 @@ pub struct Section {
     pub as_z: f64,
     #[serde(default)]
     pub panel_thickness: Option<f64>,
+    #[serde(default)]
+    pub thickness: Option<f64>,
 }
 
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -473,6 +475,7 @@ mod tests {
             as_y: 0.0,
             as_z: 0.0,
             panel_thickness: None,
+            thickness: None,
         };
         assert_eq!(sec.depth, 0.0);
         assert!(sec.panel_thickness.is_none());

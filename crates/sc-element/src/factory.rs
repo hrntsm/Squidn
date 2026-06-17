@@ -11,6 +11,10 @@ pub fn build_behavior(data: &ElementData, model: &Model) -> (Box<dyn ElementBeha
             Box::new(crate::panel::PanelZone::new(data, model)),
             ElemState::default(),
         ),
-        other => panic!("element kind {:?} not supported in P1", other),
+        ElementKind::Shell => (
+            Box::new(crate::shell::ShellElement::new(data, model)),
+            ElemState::default(),
+        ),
+        other => panic!("element kind {:?} not supported", other),
     }
 }

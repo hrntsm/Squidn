@@ -93,6 +93,7 @@ fn get_section(model: &Model, sid: Option<sc_core::ids::SectionId>) -> Section {
         as_y: 0.0,
         as_z: 0.0,
         panel_thickness: None,
+        thickness: None,
     })
 }
 
@@ -811,6 +812,7 @@ mod tests {
             as_y: 0.0,
             as_z: 0.0,
             panel_thickness: None,
+            thickness: None,
         };
         let beam_sec = Section {
             id: SectionId(1),
@@ -824,6 +826,7 @@ mod tests {
             as_y: 0.0,
             as_z: 0.0,
             panel_thickness: None,
+            thickness: None,
         };
         let mat = Material {
             id: MaterialId(0),

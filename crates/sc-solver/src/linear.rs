@@ -57,16 +57,16 @@ pub fn linear_static_once(model: &Model, lc: LoadCaseId) -> Result<StaticOnce, S
             }
         }
 
-        // Recover forces for each element
         let mut member_forces = Vec::new();
         let _ctx = sc_element::behavior::Ctx { model };
         for elem in &model.elements {
             let (behavior, _state) = build_behavior(elem, model);
             let gdofs = behavior.global_dofs(&dofmap);
-            let mut u_elem = [0.0_f64; 12];
+            let n_gdofs = gdofs.len();
+            let mut u_elem = vec![0.0; n_gdofs];
 
             for (k, &g) in gdofs.iter().enumerate() {
-                if g != usize::MAX && g < u_free.len() && k < 12 {
+                if g != usize::MAX && g < u_free.len() {
                     u_elem[k] = u_free[g];
                 }
             }
@@ -141,6 +141,7 @@ mod tests {
                 as_y: 83.33,
                 as_z: 83.33,
                 panel_thickness: None,
+                thickness: None,
             }],
             materials: vec![Material {
                 id: MaterialId(0),
@@ -166,7 +167,6 @@ mod tests {
     fn test_linear_static_axial_cantilever() {
         let model = make_axial_cantilever();
         let result = linear_static_once(&model, LoadCaseId(1)).unwrap();
-        // u = F L / (E A) = 1000 * 1000 / (1000 * 100) = 10
         assert!(
             (result.disp[1][0] - 10.0).abs() < 1e-6,
             "ux={}",
@@ -174,8 +174,101 @@ mod tests {
         );
         assert!(result.member_forces.len() == 1);
         let forces = &result.member_forces[0].1;
-        // 部材力: i端反力 ≈ -1000
         let fx_i = forces.at[0].1[0];
         assert!((fx_i + 1000.0).abs() < 1e-6, "fx_i={}", fx_i);
+    }
+
+    #[test]
+    fn test_linear_static_shell_element() {
+        // Cantilever plate: bottom edge fixed (nodes 0,1), top edge free (nodes 2,3)
+        let model = Model {
+            nodes: vec![
+                Node {
+                    id: NodeId(0),
+                    coord: [0.0, 0.0, 0.0],
+                    restraint: Dof6Mask::FIXED,
+                    mass: None,
+                    story: None,
+                },
+                Node {
+                    id: NodeId(1),
+                    coord: [100.0, 0.0, 0.0],
+                    restraint: Dof6Mask::FIXED,
+                    mass: None,
+                    story: None,
+                },
+                Node {
+                    id: NodeId(2),
+                    coord: [100.0, 100.0, 0.0],
+                    restraint: Dof6Mask::FREE,
+                    mass: None,
+                    story: None,
+                },
+                Node {
+                    id: NodeId(3),
+                    coord: [0.0, 100.0, 0.0],
+                    restraint: Dof6Mask::FREE,
+                    mass: None,
+                    story: None,
+                },
+            ],
+            elements: vec![ElementData {
+                id: ElemId(1),
+                kind: ElementKind::Shell,
+                nodes: smallvec::smallvec![NodeId(0), NodeId(1), NodeId(2), NodeId(3)],
+                section: Some(SectionId(0)),
+                material: Some(MaterialId(0)),
+                local_axis: LocalAxis {
+                    ref_vector: [0.0, 0.0, 1.0],
+                },
+                end_cond: [EndCondition::Fixed, EndCondition::Fixed],
+                force_regime: ForceRegime::Auto,
+            }],
+            sections: vec![Section {
+                id: SectionId(0),
+                name: "shell".to_string(),
+                area: 0.0,
+                iy: 0.0,
+                iz: 0.0,
+                j: 0.0,
+                depth: 0.0,
+                width: 0.0,
+                as_y: 0.0,
+                as_z: 0.0,
+                panel_thickness: None,
+                thickness: Some(10.0),
+            }],
+            materials: vec![Material {
+                id: MaterialId(0),
+                name: "mat".to_string(),
+                young: 1000.0,
+                poisson: 0.3,
+                density: 0.0,
+                shear: None,
+            }],
+            load_cases: vec![LoadCase {
+                id: LoadCaseId(1),
+                name: "shell_load".to_string(),
+                nodal: vec![NodalLoad {
+                    node: NodeId(2),
+                    values: [0.0, 0.0, 1.0, 0.0, 0.0, 0.0],
+                }],
+            }],
+            ..Default::default()
+        };
+        let result = linear_static_once(&model, LoadCaseId(1));
+        assert!(result.is_ok(), "solver failed: {:?}", result.err());
+        let result = result.unwrap();
+        // Top edge should displace upward (positive z) under positive z point load
+        assert!(
+            result.disp[2][2] > 0.0,
+            "loaded node should displace upward: {}",
+            result.disp[2][2]
+        );
+        assert!(
+            result.disp[3][2] > 0.0,
+            "free node should also displace upward: {}",
+            result.disp[3][2]
+        );
     }
 }
