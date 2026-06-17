@@ -1362,6 +1362,12 @@ version = "0.0.1"
 [[package]]
 name = "sc-section"
 version = "0.0.1"
+dependencies = [
+ "approx",
+ "sc-core",
+ "serde",
+ "serde_json",
+]
 
 [[package]]
 name = "sc-skeleton"

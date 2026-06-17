@@ -8,7 +8,7 @@ pub struct Triplet {
 }
 
 pub fn assemble_csc(n: usize, mut triplets: Vec<Triplet>) -> SparseColMat<usize, f64> {
-    triplets.sort_by(|a, b| (a.col, a.row).cmp(&(b.col, b.row)));
+    triplets.sort_by_key(|a| (a.col, a.row));
     let mut merged: Vec<faer::sparse::Triplet<usize, usize, f64>> =
         Vec::with_capacity(triplets.len());
     for t in triplets {

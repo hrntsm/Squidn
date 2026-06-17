@@ -4,3 +4,9 @@ version = "0.0.1"
 edition = "2021"
 
 [dependencies]
+sc-core = { path = "../sc-core" }
+serde = { workspace = true }
+approx = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
