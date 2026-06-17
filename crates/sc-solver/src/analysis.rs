@@ -8,9 +8,9 @@ use sc_core::model::{LoadCombination, Model};
 use sc_element::factory::build_behavior;
 use sc_math::solver::{make_solver, LinearSolver, SolveError, SolverBackend};
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub enum SeismicDir { X, Y }
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub enum AiMode { Approx, SemiPrecise }
 
 pub struct Analysis<'m> {

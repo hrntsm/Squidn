@@ -4,3 +4,6 @@ version = "0.0.1"
 edition = "2021"
 
 [dependencies]
+sc-core = { path = "../sc-core" }
+sc-section = { path = "../sc-section" }
+sc-material = { path = "../sc-material" }
