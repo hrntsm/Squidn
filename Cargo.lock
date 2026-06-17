@@ -2051,6 +2051,7 @@ dependencies = [
  "approx",
  "sc-core",
  "sc-math",
+ "sc-skeleton",
  "serde",
  "smallvec",
  "thiserror 1.0.69",
