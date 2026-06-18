@@ -4848,7 +4848,9 @@ version = "0.0.1"
 dependencies = [
  "approx",
  "sc-core",
+ "sc-material",
  "sc-math",
+ "sc-section",
  "sc-skeleton",
  "serde",
  "smallvec",

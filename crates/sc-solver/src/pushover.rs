@@ -1,6 +1,6 @@
 use crate::analysis::{AiMode, Analysis, SeismicDir};
 use sc_core::ids::{ElemId, StoryId};
-use sc_math::solver::SolveError;
+use sc_core::model::Model;
 
 /// 性能曲線の1点（P5 §7.4）
 pub struct CapacityPoint {
@@ -50,14 +50,28 @@ pub struct PushoverStep {
     pub story_drifts: Vec<f64>,
 }
 
-/// プッシュオーバー解析（現在は弾性1ステップのスタブ）
+/// プッシュオーバー解析（P5 §7）
+/// 現在は弾性1ステップのスタブから拡張中。
+/// TODO: 増分NRループ（荷重制御→変位制御）、降伏追跡、崩壊機構判定、弧長法
 pub fn pushover_analysis(
     analysis: &Analysis,
+    _model: &mut Model,
     dir: SeismicDir,
     _max_steps: usize,
     _max_disp: f64,
-) -> Result<PushoverResult, SolveError> {
-    let result = analysis.seismic_static(dir, AiMode::Approx)?;
+) -> Result<PushoverResult, String> {
+    // TODO: behaviors を作成し、増分NR反復で非線形解析
+    //   let mut behaviors: Vec<Box<dyn ElementBehavior>> = Vec::new();
+    //   for elem in &_model.elements {
+    //       let (b, _) = sc_element::factory::build_behavior(elem, _model);
+    //       behaviors.push(b);
+    //   }
+    //   let snap = StateSnapshot::capture(&behaviors);
+    //   loop { NR反復 → commit_all / revert_all }
+
+    let result = analysis
+        .seismic_static(dir, AiMode::Approx)
+        .map_err(|e| format!("solver: {:?}", e))?;
     let top_disp = result
         .disp
         .last()
@@ -66,7 +80,7 @@ pub fn pushover_analysis(
             SeismicDir::Y => d[1],
         })
         .unwrap_or(0.0);
-    let base_shear = result
+    let base_shear: f64 = result
         .member_forces
         .iter()
         .flat_map(|(_, f)| f.at.first())
@@ -80,15 +94,9 @@ pub fn pushover_analysis(
             base_shear,
             story_drifts: vec![],
         }],
-        capacity_curve: vec![CapacityPoint {
-            step: 0,
-            roof_disp: top_disp,
-            base_shear,
-            story_shear: vec![],
-            story_drift: vec![],
-        }],
+        capacity_curve: vec![],
         hinges: vec![],
-        mechanism: crate::pushover::MechanismType::Partial,
+        mechanism: MechanismType::Partial,
         qu: base_shear,
     })
 }

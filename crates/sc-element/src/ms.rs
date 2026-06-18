@@ -39,7 +39,12 @@ impl MsElement {
             .collect();
 
         let elastic_mid = BeamElement::new(data, model);
-        let shear = ShearSpring::new(data, model);
+        let shear = ShearSpring::new(
+            elastic_mid.length,
+            elastic_mid.g,
+            elastic_mid.as_y,
+            elastic_mid.as_z,
+        );
 
         MsElement {
             springs,

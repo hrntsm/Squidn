@@ -48,17 +48,49 @@ fn is_vertical_member(data: &ElementData, model: &Model) -> bool {
     }
 }
 
-fn is_on_rigid_diaphragm(_data: &ElementData, model: &Model) -> bool {
-    // 現在は簡易判定：モデルに剛床制約があれば true
-    !model.constraints.is_empty()
+fn is_on_rigid_diaphragm(data: &ElementData, model: &Model) -> bool {
+    let elem_nodes: Vec<sc_core::ids::NodeId> = data.nodes.iter().copied().collect();
+    for story in &model.stories {
+        for dia in &story.diaphragms {
+            if elem_nodes
+                .iter()
+                .any(|n| *n == dia.master || dia.slaves.contains(n))
+            {
+                return true;
+            }
+        }
+    }
+    for c in &model.constraints {
+        if let sc_core::model::Constraint::RigidDiaphragm { master, slaves, .. } = c {
+            if elem_nodes
+                .iter()
+                .any(|n| *n == *master || slaves.contains(n))
+            {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 pub fn build_behavior(data: &ElementData, model: &Model) -> (Box<dyn ElementBehavior>, ElemState) {
     match data.kind {
-        ElementKind::Beam => (
-            Box::new(crate::beam::BeamElement::new(data, model)),
-            ElemState::default(),
-        ),
+        ElementKind::Beam => {
+            // ForceRegime に基づいて要素種別を選択（P5 §5）
+            let regime = resolve_force_regime(data, model);
+            match regime {
+                ResolvedRegime::ConcentratedSpring => {
+                    // T1: ConcentratedSpringBeam が実装されるまでの暫定 BeamElement
+                    let elem = crate::beam::BeamElement::new(data, model);
+                    (Box::new(elem), ElemState::default())
+                }
+                ResolvedRegime::Fiber => {
+                    // T2: FiberBeam が実装されるまでの暫定 BeamElement
+                    let elem = crate::beam::BeamElement::new(data, model);
+                    (Box::new(elem), ElemState::default())
+                }
+            }
+        }
         ElementKind::PanelZone => (
             Box::new(crate::panel::PanelZone::new(data, model)),
             ElemState::default(),
