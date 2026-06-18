@@ -3,6 +3,7 @@
 #![allow(clippy::identity_op)]
 
 pub mod analysis;
+pub mod arc_length;
 pub mod assemble;
 pub mod constraint;
 pub mod damping;
@@ -10,3 +11,4 @@ pub mod eigen;
 pub mod linear;
 pub mod pushover;
 pub mod timehistory;
+pub mod transaction;

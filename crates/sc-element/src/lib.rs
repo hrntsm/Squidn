@@ -2,7 +2,9 @@
 
 pub mod beam;
 pub mod behavior;
+pub mod concentrated;
 pub mod factory;
+pub mod fiber_elem;
 pub mod ms;
 pub mod panel;
 pub mod shear_spring;

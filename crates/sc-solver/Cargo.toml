@@ -9,8 +9,8 @@ sc-math   = { path = "../sc-math" }
 sc-element = { path = "../sc-element" }
 sc-load   = { path = "../sc-load" }
 faer      = { workspace = true }
+smallvec  = { workspace = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]
 approx = { workspace = true }
-smallvec = { workspace = true }

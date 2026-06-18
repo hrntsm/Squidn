@@ -1,6 +1,7 @@
 use sc_core::dof::DofMap;
 use sc_core::model::Model;
 use smallvec::SmallVec;
+use std::any::Any;
 
 pub struct LocalMat {
     pub n: usize,
@@ -75,4 +76,18 @@ pub trait ElementBehavior {
     fn recover_forces(&self, _u_elem: &[f64]) -> Option<crate::beam::MemberForces> {
         None
     }
+    /// T7: 線形化幾何剛性 Kg（P-Δ）。軸力 N（引張正）。デフォルトはゼロ。
+    fn geometric_stiffness(&self, _n: f64) -> LocalMat {
+        LocalMat::zeros(12)
+    }
+    /// T4: 全材料の committed 状態をスナップショット
+    fn snapshot_state(&self) -> Box<dyn Any> {
+        Box::new(())
+    }
+    /// T4: スナップショットから状態を復元
+    fn restore_state(&mut self, _state: &dyn Any) {}
+    /// T4: 全材料の trial を committed に確定
+    fn commit_state(&mut self) {}
+    /// T4: 全材料の trial を committed に戻す（rollback）
+    fn revert_state(&mut self) {}
 }

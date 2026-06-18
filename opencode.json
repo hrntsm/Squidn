@@ -1,0 +1,12 @@
+{
+  "agent": {
+    "name": "PrimaryAgent",
+    "model": "opencode/glm-5.2",
+    "sub_agents": [
+      {
+        "name": "CoderAgent",
+        "model": "opencode/deepseek-v4-flash"
+      }
+    ]
+  }
+}

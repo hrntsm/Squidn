@@ -240,7 +240,12 @@ impl BeamElement {
         k
     }
 
-    fn apply_rigid_zone_transform(&self, k_flex: &LocalMat, li: f64, lj: f64) -> LocalMat {
+    pub(crate) fn apply_rigid_zone_transform(
+        &self,
+        k_flex: &LocalMat,
+        li: f64,
+        lj: f64,
+    ) -> LocalMat {
         if li.abs() < 1e-12 && lj.abs() < 1e-12 {
             return LocalMat {
                 n: k_flex.n,
@@ -453,8 +458,7 @@ impl BeamElement {
     }
 }
 
-#[allow(dead_code)]
-fn invert_small(a: &[f64], n: usize) -> Vec<f64> {
+pub(crate) fn invert_small(a: &[f64], n: usize) -> Vec<f64> {
     let mut aug = vec![0.0; n * n * 2];
     for i in 0..n {
         for j in 0..n {
@@ -649,6 +653,41 @@ impl ElementBehavior for BeamElement {
 
     fn tangent_stiffness(&self, _state: &ElemState, _ctx: &Ctx) -> LocalMat {
         self.local_stiffness()
+    }
+
+    fn geometric_stiffness(&self, n: f64) -> LocalMat {
+        let l = self.length;
+        let c = n / l;
+        let mut kg = LocalMat::zeros(12);
+        let mut s = |i: usize, j: usize, v: f64| {
+            kg.set(i, j, v);
+            if i != j {
+                kg.set(j, i, v);
+            }
+        };
+        // xy面（uy=1,rz=5 / uy_j=7,rz_j=11）
+        s(1, 1, c * 6.0 / 5.0);
+        s(7, 7, c * 6.0 / 5.0);
+        s(1, 7, -c * 6.0 / 5.0);
+        s(1, 5, c * l / 10.0);
+        s(1, 11, c * l / 10.0);
+        s(5, 7, -c * l / 10.0);
+        s(7, 11, -c * l / 10.0);
+        s(5, 5, c * 2.0 * l * l / 15.0);
+        s(11, 11, c * 2.0 * l * l / 15.0);
+        s(5, 11, -c * l * l / 30.0);
+        // xz面（uz=2,ry=4 / uz_j=8,ry_j=10）§4.1 規約で並進-回転結合項の符号が逆（ry の向き）
+        s(2, 2, c * 6.0 / 5.0);
+        s(8, 8, c * 6.0 / 5.0);
+        s(2, 8, -c * 6.0 / 5.0);
+        s(2, 4, -c * l / 10.0);
+        s(2, 10, -c * l / 10.0);
+        s(4, 8, c * l / 10.0);
+        s(8, 10, c * l / 10.0);
+        s(4, 4, c * 2.0 * l * l / 15.0);
+        s(10, 10, c * 2.0 * l * l / 15.0);
+        s(4, 10, -c * l * l / 30.0);
+        kg
     }
 
     fn internal_force(&self, _state: &ElemState, _ctx: &Ctx) -> LocalVec {
