@@ -2,35 +2,8 @@ use crate::behavior::{Ctx, ElemState, ElementBehavior, LocalMat, LocalVec, MassO
 use crate::transform::LocalFrame;
 use sc_core::dof::{DofMap, DOF_PER_NODE};
 use sc_core::ids::{ElemId, NodeId};
-use sc_core::model::{EndCondition, Material, Model, Section};
+use sc_core::model::{EndCondition, Material, Model, RigidZone, Section, ZoneSource};
 use smallvec::SmallVec;
-
-#[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize)]
-pub enum ZoneSource {
-    Auto,
-    Manual,
-}
-
-#[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize)]
-pub struct RigidZone {
-    pub length_i: f64,
-    pub length_j: f64,
-    pub source_i: ZoneSource,
-    pub source_j: ZoneSource,
-    pub reduction: f64,
-}
-
-impl Default for RigidZone {
-    fn default() -> Self {
-        Self {
-            length_i: 0.0,
-            length_j: 0.0,
-            source_i: ZoneSource::Auto,
-            source_j: ZoneSource::Auto,
-            reduction: 1.0,
-        }
-    }
-}
 
 pub struct RigidZoneRule {
     pub reduction: f64,
@@ -173,7 +146,7 @@ impl BeamElement {
             density: mat.density,
             nodes: [n0, n1],
             axis,
-            rigid: RigidZone::default(),
+            rigid: data.rigid_zone,
             end_cond: data.end_cond,
             eval_sections: vec![0.0, 0.5, 1.0],
             section: data.section,
@@ -318,9 +291,15 @@ impl BeamElement {
         }
 
         // 回転ばね: 外部回転 ↔ 内部回転
+        // 剛接ペナルティは「部材回転剛性 E·I/L のスケールに対する倍率」で与える。
+        // 係数 1e8 なら剛性比 ~1e8（剛接を 8 桁の精度で再現＝結果への影響 ~1e-8<1e-6）
+        // でありながら、静縮約 K*=Kaa−Kab·Kbb⁻¹·Kba の丸め誤差（~ペナルティ·eps）が
+        // 他剛性成分を下回るため、現実的な大断面（iz≥1e7）でも全体 K が
+        // 非正定値化しない。1e12 だと iz が大きいとき誤差が並進剛性を超えて破綻する。
+        let rot_scale = self.e * self.iz.max(self.iy) / self.length.max(1.0);
         let spring_stiffness = |cond: &EndCondition| -> f64 {
             match cond {
-                EndCondition::Fixed => 1e12 * self.e * self.iz / self.length.max(1.0),
+                EndCondition::Fixed => 1e8 * rot_scale,
                 EndCondition::Pinned => 0.0,
                 EndCondition::SemiRigid { k_theta } => *k_theta,
             }
@@ -630,6 +609,32 @@ pub fn recompute_auto_zones(zone: &mut RigidZone, recomputed: &RigidZone) {
     }
 }
 
+/// モデル全要素の剛域を自動算定し、`ElementData::rigid_zone` を更新する前処理。
+/// `source` が `Auto` の端のみ更新し、`Manual` 端は保護する（設計書 §6.2.1）。
+/// 解析前に1回呼ぶことで剛域が組立に反映される（既定では剛域長 0 のまま
+/// ＝呼ばなければ従来挙動。明示的に有効化する設計）。
+///
+/// `auto_rigid_zones` を要素ごとに呼ぶと隣接マップ構築が O(E²) になるため、
+/// ここでは梁要素の集合に対し各端の剛域を算定して一括反映する。
+pub fn apply_auto_rigid_zones(model: &mut Model, rule: &RigidZoneRule) {
+    // 要素 id ごとに算定（auto_rigid_zones は内部で隣接を構築するが、
+    // 呼び出しは「解析前1回」を想定。大規模最適化は将来）。
+    let recomputed: Vec<(usize, RigidZone)> = model
+        .elements
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| matches!(e.kind, sc_core::model::ElementKind::Beam))
+        .map(|(i, e)| (i, auto_rigid_zones(model, e.id, rule)))
+        .collect();
+
+    for (i, rz) in recomputed {
+        let zone = &mut model.elements[i].rigid_zone;
+        recompute_auto_zones(zone, &rz);
+        // reduction も Auto 算定値を反映（手動端の length は保持済み）。
+        zone.reduction = rz.reduction;
+    }
+}
+
 impl ElementBehavior for BeamElement {
     fn n_dof(&self) -> usize {
         12
@@ -652,7 +657,11 @@ impl ElementBehavior for BeamElement {
     }
 
     fn tangent_stiffness(&self, _state: &ElemState, _ctx: &Ctx) -> LocalMat {
-        self.local_stiffness()
+        // 要素ローカルの 12×12 を全体系へ回す（K_global = Rᵀ K_local R）。
+        // ElementBehavior::tangent_stiffness は全体系を返す契約（シェルと同じ）。
+        // これを欠くと、ローカル系とグローバル系が一致しない部材（鉛直柱・
+        // 任意方向材・非対称断面 iy≠iz）で組立 K が誤る。
+        self.axis.to_global(&self.local_stiffness())
     }
 
     fn geometric_stiffness(&self, n: f64) -> LocalMat {
@@ -993,6 +1002,7 @@ mod tests {
                     },
                     end_cond: [EndCondition::Fixed, EndCondition::Fixed],
                     force_regime: sc_core::model::ForceRegime::Auto,
+                    rigid_zone: Default::default(),
                 },
                 ElementData {
                     id: ElemId(1),
@@ -1005,6 +1015,7 @@ mod tests {
                     },
                     end_cond: [EndCondition::Fixed, EndCondition::Fixed],
                     force_regime: sc_core::model::ForceRegime::Auto,
+                    rigid_zone: Default::default(),
                 },
             ],
             sections: vec![col_sec, beam_sec],
@@ -1014,5 +1025,88 @@ mod tests {
 
         let zone = auto_rigid_zones(&model, ElemId(1), &RigidZoneRule::default());
         assert!((zone.length_i - 125.0).abs() < 1e-9);
+    }
+
+    /// apply_auto_rigid_zones が ElementData::rigid_zone に反映され、
+    /// Manual 端が保護されることを確認する（剛域がモデル→解析へ接続されたこと）。
+    #[test]
+    fn test_apply_auto_rigid_zones_and_manual_protection() {
+        use sc_core::ids::{ElemId, MaterialId, NodeId, SectionId};
+        use sc_core::model::{ElementKind, ZoneSource};
+
+        let mk_sec = |id: u32, depth: f64| Section {
+            id: SectionId(id),
+            name: String::new(),
+            area: 0.0,
+            iy: 0.0,
+            iz: 0.0,
+            j: 0.0,
+            depth,
+            width: 0.0,
+            as_y: 0.0,
+            as_z: 0.0,
+            panel_thickness: None,
+            thickness: None,
+        };
+        let mk_node = |id: u32, c: [f64; 3]| Node {
+            id: NodeId(id),
+            coord: c,
+            restraint: Default::default(),
+            mass: None,
+            story: None,
+        };
+        let mk_beam = |id: u32, a: u32, b: u32, sec: u32| ElementData {
+            id: ElemId(id),
+            kind: ElementKind::Beam,
+            nodes: smallvec::smallvec![NodeId(a), NodeId(b)],
+            section: Some(SectionId(sec)),
+            material: Some(MaterialId(0)),
+            local_axis: LocalAxis {
+                ref_vector: [0.0, 0.0, 1.0],
+            },
+            end_cond: [EndCondition::Fixed, EndCondition::Fixed],
+            force_regime: sc_core::model::ForceRegime::Auto,
+            rigid_zone: Default::default(),
+        };
+
+        let mut model = Model {
+            nodes: vec![
+                mk_node(0, [0.0, 0.0, 0.0]),
+                mk_node(1, [0.0, 0.0, 3000.0]),
+                mk_node(2, [4000.0, 0.0, 3000.0]),
+            ],
+            elements: vec![mk_beam(0, 0, 1, 0), mk_beam(1, 1, 2, 1)], // 柱(せい600)・梁(せい700)
+            sections: vec![mk_sec(0, 600.0), mk_sec(1, 700.0)],
+            materials: vec![Material {
+                id: MaterialId(0),
+                name: String::new(),
+                young: 205000.0,
+                poisson: 0.3,
+                density: 0.0,
+                shear: None,
+                fc: None,
+            }],
+            ..Default::default()
+        };
+
+        // 既定では剛域長 0（未適用）。
+        assert_eq!(model.elements[1].rigid_zone.length_i, 0.0);
+
+        apply_auto_rigid_zones(&mut model, &RigidZoneRule::default());
+        // 梁端（接合部側）に λ = 柱せい/2 − 梁せい/4 = 300 − 175 = 125 が入る。
+        assert!(
+            (model.elements[1].rigid_zone.length_i - 125.0).abs() < 1e-9,
+            "λ_i={}",
+            model.elements[1].rigid_zone.length_i
+        );
+
+        // 手動端は再適用で保護される。
+        model.elements[1].rigid_zone.source_i = ZoneSource::Manual;
+        model.elements[1].rigid_zone.length_i = 999.0;
+        apply_auto_rigid_zones(&mut model, &RigidZoneRule::default());
+        assert_eq!(
+            model.elements[1].rigid_zone.length_i, 999.0,
+            "Manual 端が上書きされた"
+        );
     }
 }

@@ -128,6 +128,7 @@ mod tests {
                 },
                 end_cond: [EndCondition::Fixed, EndCondition::Fixed],
                 force_regime: ForceRegime::Auto,
+                rigid_zone: Default::default(),
             }],
             sections: vec![Section {
                 id: SectionId(0),
@@ -179,6 +180,77 @@ mod tests {
         assert!((fx_i + 1000.0).abs() < 1e-6, "fx_i={}", fx_i);
     }
 
+    /// X 軸上の片持ち梁に「グローバル Y 方向」の先端荷重をかける。
+    /// 参照ベクトル [0,0,1] では local z = global −y となるので、たわみは
+    /// **iy** で決まる（iz ではない）。to_global を欠くと iz を使ってしまい誤る。
+    /// よって iy≠iz の断面で、δ = PL³/(3E·iy) に一致することを確認する。
+    #[test]
+    fn test_beam_to_global_transverse_uses_correct_inertia() {
+        // 現実的な鋼材大断面（iz=1e9 級）を用いる：to_global 修正の検証に加え、
+        // 端ばね静縮約のペナルティが大断面でも非正定値化しないこと（堅牢性）も同時に確認。
+        let e = 205000.0_f64;
+        let l = 1000.0_f64; // make_axial_cantilever の節点間距離
+        let iy = 2.0e9_f64;
+        let iz = 1.0e9_f64; // iy≠iz：取り違えが顕在化する
+        let p = 10000.0_f64;
+        let mut model = make_axial_cantilever();
+        model.materials[0].young = e;
+        model.sections[0].iy = iy;
+        model.sections[0].iz = iz;
+        model.sections[0].as_y = 1.0e9; // せん断たわみを十分小さく
+        model.sections[0].as_z = 1.0e9;
+        model.load_cases[0].nodal[0].values = [0.0, p, 0.0, 0.0, 0.0, 0.0];
+
+        let result = linear_static_once(&model, LoadCaseId(1)).unwrap();
+        let uy = result.disp[1][1];
+        let expected = p * l.powi(3) / (3.0 * e * iy); // 曲げ支配（iy 使用）
+        let buggy = p * l.powi(3) / (3.0 * e * iz); // 誤った値=iz 使用（2倍）
+                                                    // iy ベースの値に一致し、iz ベース(2倍)を明確に排除する。
+        assert!(
+            (uy - expected).abs() / expected < 1e-3,
+            "uy={} expected(iy)={} buggy(iz)={}",
+            uy,
+            expected,
+            buggy
+        );
+    }
+
+    /// 剛域がモデル→解析へ接続され、結果に効くことのエンドツーエンド確認。
+    /// 同一片持ち梁で、基部に大きな剛域（可とう長を短縮）を入れると、
+    /// 先端たわみが明確に小さく（剛く）なる。
+    #[test]
+    fn test_rigid_zone_affects_analysis() {
+        let mut base = make_axial_cantilever();
+        base.sections[0].iy = 1.0e7;
+        base.sections[0].iz = 1.0e7;
+        base.sections[0].as_y = 1.0e8;
+        base.sections[0].as_z = 1.0e8;
+        base.load_cases[0].nodal[0].values = [0.0, 0.0, 1000.0, 0.0, 0.0, 0.0]; // global Z 載荷
+
+        // 剛域なし
+        let r0 = linear_static_once(&base, LoadCaseId(1)).unwrap();
+        let uz0 = r0.disp[1][2];
+
+        // 基部に剛域 λ_i=800（可とう長 200）
+        let mut rigid = base.clone();
+        rigid.elements[0].rigid_zone.length_i = 800.0;
+        let r1 = linear_static_once(&rigid, LoadCaseId(1)).unwrap();
+        let uz1 = r1.disp[1][2];
+
+        assert!(
+            uz0.abs() > 0.0 && uz1.abs() > 0.0,
+            "uz0={} uz1={}",
+            uz0,
+            uz1
+        );
+        assert!(
+            uz1.abs() < 0.5 * uz0.abs(),
+            "剛域で剛くなるはず: uz_norigid={} uz_rigid={}",
+            uz0,
+            uz1
+        );
+    }
+
     #[test]
     fn test_linear_static_shell_element() {
         // Cantilever plate: bottom edge fixed (nodes 0,1), top edge free (nodes 2,3)
@@ -224,6 +296,7 @@ mod tests {
                 },
                 end_cond: [EndCondition::Fixed, EndCondition::Fixed],
                 force_regime: ForceRegime::Auto,
+                rigid_zone: Default::default(),
             }],
             sections: vec![Section {
                 id: SectionId(0),
@@ -396,6 +469,7 @@ mod tests {
                     },
                     end_cond: [EndCondition::Fixed, EndCondition::Fixed],
                     force_regime: ForceRegime::Auto,
+                    rigid_zone: Default::default(),
                 },
                 ElementData {
                     id: ElemId(1),
@@ -408,6 +482,7 @@ mod tests {
                     },
                     end_cond: [EndCondition::Fixed, EndCondition::Fixed],
                     force_regime: ForceRegime::Auto,
+                    rigid_zone: Default::default(),
                 },
                 ElementData {
                     id: ElemId(2),
@@ -420,6 +495,7 @@ mod tests {
                     },
                     end_cond: [EndCondition::Fixed, EndCondition::Fixed],
                     force_regime: ForceRegime::Auto,
+                    rigid_zone: Default::default(),
                 },
                 ElementData {
                     id: ElemId(3),
@@ -432,6 +508,7 @@ mod tests {
                     },
                     end_cond: [EndCondition::Fixed, EndCondition::Fixed],
                     force_regime: ForceRegime::Auto,
+                    rigid_zone: Default::default(),
                 },
             ],
             sections: vec![Section {
@@ -517,6 +594,7 @@ mod tests {
                 },
                 end_cond: [EndCondition::Fixed, EndCondition::Fixed],
                 force_regime: ForceRegime::Auto,
+                rigid_zone: Default::default(),
             }],
             sections: vec![Section {
                 id: SectionId(0),
@@ -618,6 +696,7 @@ mod tests {
                 },
                 end_cond: [EndCondition::Fixed, EndCondition::Fixed],
                 force_regime: ForceRegime::Auto,
+                rigid_zone: Default::default(),
             }],
             sections: vec![Section {
                 id: SectionId(0),
@@ -682,6 +761,181 @@ mod tests {
             res.disp[2][2].abs() > 1e-12,
             "shell should deflect vertically: {}",
             res.disp[2][2]
+        );
+    }
+
+    /// 単純支持正方形板（等分布荷重）の N×N メッシュモデルを作る。
+    /// 周辺=単純支持（Uz=0, 縁回転自由）。面内は全節点で固定（平板曲げ＝面内変位0）。
+    fn make_ss_plate(n: usize, a: f64, t: f64, e: f64, nu: f64, q: f64, clamped: bool) -> Model {
+        let h = a / n as f64;
+        let nn = n + 1;
+        let idx = |ix: usize, iy: usize| (iy * nn + ix) as u32;
+        let mut nodes = Vec::new();
+        for iy in 0..nn {
+            for ix in 0..nn {
+                let on_boundary = ix == 0 || ix == n || iy == 0 || iy == n;
+                // 常に Ux,Uy,Rz を固定（面内＋ドリリング）。周辺は Uz も固定。
+                let mut mask = 0b100011u8; // bits 0(Ux),1(Uy),5(Rz)
+                if on_boundary {
+                    mask |= 1 << 2; // Uz
+                    if clamped {
+                        mask |= 1 << 3; // Rx
+                        mask |= 1 << 4; // Ry
+                    }
+                }
+                nodes.push(Node {
+                    id: NodeId(idx(ix, iy)),
+                    coord: [ix as f64 * h, iy as f64 * h, 0.0],
+                    restraint: Dof6Mask(mask),
+                    mass: None,
+                    story: None,
+                });
+            }
+        }
+        let mut elements = Vec::new();
+        let mut eid = 0u32;
+        for iy in 0..n {
+            for ix in 0..n {
+                elements.push(ElementData {
+                    id: ElemId(eid),
+                    kind: ElementKind::Shell,
+                    nodes: smallvec::smallvec![
+                        NodeId(idx(ix, iy)),
+                        NodeId(idx(ix + 1, iy)),
+                        NodeId(idx(ix + 1, iy + 1)),
+                        NodeId(idx(ix, iy + 1)),
+                    ],
+                    section: Some(SectionId(0)),
+                    material: Some(MaterialId(0)),
+                    local_axis: LocalAxis {
+                        ref_vector: [0.0, 0.0, 1.0],
+                    },
+                    end_cond: [EndCondition::Fixed, EndCondition::Fixed],
+                    force_regime: ForceRegime::Auto,
+                    rigid_zone: Default::default(),
+                });
+                eid += 1;
+            }
+        }
+        // 等分布荷重 q を負担面積で節点 Fz へ（周辺節点の荷重は支点が負担）。
+        let mut nodal = Vec::new();
+        for iy in 0..nn {
+            for ix in 0..nn {
+                let wx = if ix == 0 || ix == n { 0.5 } else { 1.0 };
+                let wy = if iy == 0 || iy == n { 0.5 } else { 1.0 };
+                let fz = q * (wx * h) * (wy * h);
+                nodal.push(NodalLoad {
+                    node: NodeId(idx(ix, iy)),
+                    values: [0.0, 0.0, fz, 0.0, 0.0, 0.0],
+                });
+            }
+        }
+        Model {
+            nodes,
+            elements,
+            sections: vec![Section {
+                id: SectionId(0),
+                name: "plate".into(),
+                area: 0.0,
+                iy: 0.0,
+                iz: 0.0,
+                j: 0.0,
+                depth: 0.0,
+                width: 0.0,
+                as_y: 0.0,
+                as_z: 0.0,
+                panel_thickness: None,
+                thickness: Some(t),
+            }],
+            materials: vec![Material {
+                id: MaterialId(0),
+                name: "m".into(),
+                young: e,
+                poisson: nu,
+                density: 0.0,
+                shear: None,
+                fc: None,
+            }],
+            load_cases: vec![LoadCase {
+                id: LoadCaseId(1),
+                name: "q".into(),
+                nodal,
+            }],
+            ..Default::default()
+        }
+    }
+
+    /// 単純支持正方形板の中央たわみが参照解（α·q·a⁴/D, α=0.00406）へ
+    /// 細分化収束する（仕様 §9.3）。粗→密で誤差が単調減少し、16×16 で ±2%。
+    #[test]
+    fn test_ss_plate_convergence() {
+        let (a, t, e, nu, q) = (1000.0_f64, 10.0_f64, 200000.0_f64, 0.3_f64, 0.01_f64);
+        let d = e * t.powi(3) / (12.0 * (1.0 - nu * nu));
+        let ref_w = 0.00406 * q * a.powi(4) / d; // ≈ 2.217 mm
+
+        let center_w = |n: usize| -> f64 {
+            let model = make_ss_plate(n, a, t, e, nu, q, false);
+            let res = linear_static_once(&model, LoadCaseId(1)).unwrap();
+            let nn = n + 1;
+            let c = (n / 2) * nn + (n / 2);
+            res.disp[c][2].abs()
+        };
+
+        let w4 = center_w(4);
+        let w8 = center_w(8);
+        let w16 = center_w(16);
+        let e4 = (w4 - ref_w).abs();
+        let e8 = (w8 - ref_w).abs();
+        let e16 = (w16 - ref_w).abs();
+
+        // 細分化で誤差が単調減少して参照解へ近づく
+        assert!(
+            e8 < e4 && e16 < e8,
+            "誤差が単調減少しない: e4={e4} e8={e8} e16={e16} (w4={w4} w8={w8} w16={w16} ref={ref_w})"
+        );
+        // 16×16 で参照解の ±2% 以内
+        assert!(
+            e16 / ref_w < 0.02,
+            "16x16 誤差 {:.2}% > 2% (w16={} ref={})",
+            e16 / ref_w * 100.0,
+            w16,
+            ref_w
+        );
+    }
+
+    /// クランプ（四辺固定）正方形板の中央たわみ（α=0.00126, 参照解≈0.688mm）の収束。
+    #[test]
+    fn test_clamped_plate_convergence() {
+        let (a, t, e, nu, q) = (1000.0_f64, 10.0_f64, 200000.0_f64, 0.3_f64, 0.01_f64);
+        let d = e * t.powi(3) / (12.0 * (1.0 - nu * nu));
+        let ref_w = 0.00126 * q * a.powi(4) / d; // ≈ 0.688 mm
+
+        let center_w = |n: usize| -> f64 {
+            let model = make_ss_plate(n, a, t, e, nu, q, true);
+            let res = linear_static_once(&model, LoadCaseId(1)).unwrap();
+            let nn = n + 1;
+            let c = (n / 2) * nn + (n / 2);
+            res.disp[c][2].abs()
+        };
+
+        let w4 = center_w(4);
+        let w8 = center_w(8);
+        let w16 = center_w(16);
+        let e4 = (w4 - ref_w).abs();
+        let e8 = (w8 - ref_w).abs();
+        let e16 = (w16 - ref_w).abs();
+
+        assert!(
+            e8 < e4 && e16 < e8,
+            "誤差が単調減少しない: e4={e4} e8={e8} e16={e16} (w4={w4} w8={w8} w16={w16} ref={ref_w})"
+        );
+        // 16×16 で参照解の ±2% 以内（仕様 §9.3）。
+        assert!(
+            e16 / ref_w < 0.02,
+            "16x16 誤差 {:.2}% > 2% (w16={} ref={})",
+            e16 / ref_w * 100.0,
+            w16,
+            ref_w
         );
     }
 }

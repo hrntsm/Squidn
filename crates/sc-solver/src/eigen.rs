@@ -25,6 +25,8 @@ pub fn solve_eigen(
     let m_free = assemble_global_m(model, dofmap, MassOption::Consistent);
     let m_red = reducer.reduce_k(&m_free);
     let n = m_red.nrows();
+    // 自由度数（縮約後）を超えるモードは存在しないので上限で抑える。
+    let n_modes = n_modes.min(n);
     if n == 0 || n_modes == 0 {
         return Ok(ModalResult {
             omega2: vec![],
@@ -41,7 +43,8 @@ pub fn solve_eigen(
     let mut solver = make_solver(SolverBackend::DirectSparseCholesky);
     solver.factorize(&k_red)?;
 
-    let q = (2 * n_modes).min(n).max(n_modes + 2);
+    // 部分空間サイズ q ≈ min(2n_modes, n_modes+8)。ただし行列次元 n を超えない。
+    let q = (2 * n_modes).max(n_modes + 2).min(n);
 
     let mut x = init_subspace(n, q);
 
@@ -409,6 +412,12 @@ mod tests {
         Section,
     };
 
+    /// Ux のみ自由（並進1方向）にするマスク。
+    const FREE_UX: Dof6Mask = Dof6Mask(0b111110);
+
+    /// 軸ばね 1 本（剛性 k=EA/L）＋先端質量 m の 1 自由度モデル。
+    /// node0 固定、node1 は Ux のみ自由で質量 m を持つ。
+    /// 理論固有周期 T = 2π√(m/k)。
     fn make_1dof_spring_model() -> Model {
         let k = 1000.0_f64;
         let m = 1.0_f64;
@@ -418,14 +427,14 @@ mod tests {
                     id: NodeId(0),
                     coord: [0.0, 0.0, 0.0],
                     restraint: Dof6Mask::FIXED,
-                    mass: Some([m, 0.0, 0.0, 0.0, 0.0, 0.0]),
+                    mass: None,
                     story: None,
                 },
                 Node {
                     id: NodeId(1),
                     coord: [1000.0, 0.0, 0.0],
-                    restraint: Dof6Mask::FIXED,
-                    mass: None,
+                    restraint: FREE_UX,
+                    mass: Some([m, 0.0, 0.0, 0.0, 0.0, 0.0]),
                     story: None,
                 },
             ],
@@ -440,6 +449,7 @@ mod tests {
                 },
                 end_cond: [EndCondition::Fixed, EndCondition::Fixed],
                 force_regime: ForceRegime::Auto,
+                rigid_zone: Default::default(),
             }],
             sections: vec![Section {
                 id: SectionId(0),
@@ -458,7 +468,68 @@ mod tests {
             materials: vec![Material {
                 id: MaterialId(0),
                 name: "mat".into(),
-                young: k * 1000.0 / 1.0,
+                young: k * 1000.0 / 1.0, // EA/L = young*1/1000 = k
+                poisson: 0.0,
+                density: 0.0,
+                shear: None,
+                fc: None,
+            }],
+            ..Default::default()
+        }
+    }
+
+    /// 2層等質量等剛性せん断モデル（軸ばね2本の直列）。
+    /// node0 固定、node1/node2 は Ux のみ自由で各質量 m。
+    /// K=[[2k,-k],[-k,k]], M=mI。λ=(k/m)(3∓√5)/2。
+    fn make_shear_2dof_model() -> Model {
+        let k = 1000.0_f64;
+        let m = 1.0_f64;
+        let young = k * 1000.0; // EA/L = young*1/1000 = k
+        let node = |id: u32, x: f64, restraint: Dof6Mask, mass: Option<[f64; 6]>| Node {
+            id: NodeId(id),
+            coord: [x, 0.0, 0.0],
+            restraint,
+            mass,
+            story: None,
+        };
+        let beam = |id: u32, a: u32, b: u32| ElementData {
+            id: ElemId(id),
+            kind: ElementKind::Beam,
+            nodes: smallvec::smallvec![NodeId(a), NodeId(b)],
+            section: Some(SectionId(0)),
+            material: Some(MaterialId(0)),
+            local_axis: LocalAxis {
+                ref_vector: [0.0, 0.0, 1.0],
+            },
+            end_cond: [EndCondition::Fixed, EndCondition::Fixed],
+            force_regime: ForceRegime::Auto,
+            rigid_zone: Default::default(),
+        };
+        Model {
+            nodes: vec![
+                node(0, 0.0, Dof6Mask::FIXED, None),
+                node(1, 1000.0, FREE_UX, Some([m, 0.0, 0.0, 0.0, 0.0, 0.0])),
+                node(2, 2000.0, FREE_UX, Some([m, 0.0, 0.0, 0.0, 0.0, 0.0])),
+            ],
+            elements: vec![beam(1, 0, 1), beam(2, 1, 2)],
+            sections: vec![Section {
+                id: SectionId(0),
+                name: "spring".into(),
+                area: 1.0,
+                iy: 1.0,
+                iz: 1.0,
+                j: 1.0,
+                depth: 1.0,
+                width: 1.0,
+                as_y: 1.0,
+                as_z: 1.0,
+                panel_thickness: None,
+                thickness: None,
+            }],
+            materials: vec![Material {
+                id: MaterialId(0),
+                name: "mat".into(),
+                young,
                 poisson: 0.0,
                 density: 0.0,
                 shear: None,
@@ -499,20 +570,83 @@ mod tests {
         let reducer = Reducer::build(&model, &dofmap);
         let result = solve_eigen(&model, &dofmap, &reducer, 1).unwrap();
 
-        if !result.omega2.is_empty() && result.omega2[0] > 0.0 {
-            assert!(
-                (result.omega2[0] - expected_omega2).abs() / expected_omega2 < 0.05,
-                "omega2={} expected={}",
-                result.omega2[0],
-                expected_omega2
-            );
-            assert!(
-                (result.period[0] - expected_t).abs() / expected_t < 0.05,
-                "T={} expected={}",
-                result.period[0],
-                expected_t
-            );
-        }
+        // 質量・自由度が正しく組まれていれば 1 モードが得られる。
+        assert_eq!(result.omega2.len(), 1, "1 モードが解けていない");
+        assert!(result.omega2[0] > 0.0, "omega2={}", result.omega2[0]);
+        // 反復解法だが SPD 1 自由度なので高精度に収束する（理論一致・許容差）。
+        assert!(
+            (result.omega2[0] - expected_omega2).abs() / expected_omega2 < 1e-8,
+            "omega2={} expected={}",
+            result.omega2[0],
+            expected_omega2
+        );
+        // 設計書 §7.2 の例: T = 0.198692 s
+        assert!(
+            (result.period[0] - expected_t).abs() / expected_t < 1e-8,
+            "T={} expected={}",
+            result.period[0],
+            expected_t
+        );
+        assert!(
+            (result.period[0] - 0.198692).abs() < 1e-5,
+            "T={} 設計書例 0.198692 と不一致",
+            result.period[0]
+        );
+    }
+
+    /// 2層せん断モデル: T1=0.32150, T2=0.12280 へ収束し、
+    /// 2 モードで有効質量比合計 ≈100%（設計書 §7.2）。
+    #[test]
+    fn test_2dof_shear_period_and_mass() {
+        let model = make_shear_2dof_model();
+        let dofmap = DofMap::build(&model);
+        let reducer = Reducer::build(&model, &dofmap);
+        let result = solve_eigen(&model, &dofmap, &reducer, 2).unwrap();
+
+        assert_eq!(result.omega2.len(), 2);
+        let k = 1000.0_f64;
+        let m = 1.0_f64;
+        let lam1 = (k / m) * (3.0 - 5.0_f64.sqrt()) / 2.0; // ≈382.0
+        let lam2 = (k / m) * (3.0 + 5.0_f64.sqrt()) / 2.0; // ≈2618.0
+
+        assert!(
+            (result.omega2[0] - lam1).abs() / lam1 < 1e-6,
+            "λ1={} expected={}",
+            result.omega2[0],
+            lam1
+        );
+        assert!(
+            (result.omega2[1] - lam2).abs() / lam2 < 1e-6,
+            "λ2={} expected={}",
+            result.omega2[1],
+            lam2
+        );
+
+        let t1 = 2.0 * std::f64::consts::PI / result.omega2[0].sqrt();
+        let t2 = 2.0 * std::f64::consts::PI / result.omega2[1].sqrt();
+        assert!((t1 - 0.32150).abs() < 1e-4, "T1={}", t1);
+        assert!((t2 - 0.12280).abs() < 1e-4, "T2={}", t2);
+
+        // X 方向有効質量の合計が全質量 2m に一致（有効質量比合計 ≈100%）。
+        let total_mass = 2.0 * m;
+        let eff_sum: f64 = result.effective_mass.iter().map(|e| e[0]).sum();
+        assert!(
+            (eff_sum - total_mass).abs() / total_mass < 1e-6,
+            "有効質量合計={} 全質量={}",
+            eff_sum,
+            total_mass
+        );
+        // モード1 が支配的。理論値は閉形式から求める（このKでは ≈94.7%）。
+        // 1次モード形 φ=[1, k/(k−λ1)] より Meff1 = (Σφ)²/(Σφ²)。
+        let s = k / (k - lam1); // φ2/φ1
+        let meff1_theory = (1.0 + s).powi(2) / (1.0 + s * s);
+        let ratio1 = result.effective_mass[0][0] / total_mass;
+        assert!(
+            (ratio1 - meff1_theory / total_mass).abs() < 1e-6,
+            "mode1 有効質量比={} 理論={}",
+            ratio1,
+            meff1_theory / total_mass
+        );
     }
 
     /// 決定性テスト: 固有値解析を10回実行しビット一致を確認

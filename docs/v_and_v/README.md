@@ -43,14 +43,14 @@
 
 | # | 対象 | クレート | ソースファイル | テスト関数 | フェーズ | 状態 |
 |---|------|----------|---------------|-----------|---------|------|
-| 1 | ティモシェンコ梁 | sc-element | beam.rs | `test_cantilever_*` 他 | P1 | ✅ |
-| 2 | 剛域あり梁 | sc-element | beam.rs | `test_rigid_zone*` | P1 | ✅ |
-| 3 | 端部ばね（ピン・半剛） | sc-element | beam.rs | `test_end_release_*` | P1 | ✅ |
-| 4 | MITC4 シェル（膜） | sc-element | shell.rs | `test_patch_membrane*` | P1.5 | ✅ |
-| 5 | MITC4 シェル（曲げ） | sc-element | shell.rs | `test_patch_bending*` | P1.5 | ✅ |
-| 6 | MITC4 シェル（せん断） | sc-element | shell.rs | `test_patch_shear_test*` | P1.5 | ✅ |
-| 7 | パネルゾーン弾性 | sc-element | panel.rs | `test_panel_zone_reference_case1` | P1 | ✅ |
-| 8 | 線形静的解析 | sc-solver | linear.rs | `test_*` | P2 | ✅ |
+| 1 | ティモシェンコ梁 | sc-element | beam.rs | `test_phi_zero_converges_to_bernoulli`, `test_beam_axial_stiffness`, `test_beam_torsion_stiffness` | P1 | ✅ |
+| 2 | 剛域あり梁 | sc-element | beam.rs | `test_auto_rigid_zone_standard_formula` | P1 | 🔶 |
+| 3 | 端部ばね（ピン・半剛） | sc-element | beam.rs | `test_pinned_end_releases_moment` | P1 | 🔶 |
+| 4 | MITC4 シェル（膜） | sc-element | shell.rs | `test_patch_membrane_distorted`（歪みメッシュ・機械精度） | P1.5 | ✅ |
+| 5 | MITC4 シェル（曲げ） | sc-element | shell.rs | `test_patch_bending_distorted`（歪みメッシュ定曲率・機械精度） | P1.5 | ✅ |
+| 6 | MITC4 シェル（せん断/収束） | sc-solver | linear.rs | `test_ss_plate_convergence`, `test_clamped_plate_convergence`（板たわみ ±2% 収束＝ロッキングなし） | P1.5 | ✅ |
+| 7 | パネルゾーン弾性 | sc-element | panel.rs | `test_panel_zone_reference_case1`（pQc=851.135kN 等）, `test_panel_zone_reference_case2_t_joint`（ト型） | P1 | ✅ |
+| 8 | 線形静的解析 | sc-solver | linear.rs | `test_*`（座標変換回帰 `test_beam_to_global_transverse_uses_correct_inertia` 含む） | P2 | ✅ |
 | 9 | 固有値解析 | sc-solver | eigen.rs | `test_1dof_period` | P2 | ✅ |
 | 10 | Ai分布 | sc-load | ai.rs | `test_*` | P2 | ✅ |
 | 11 | 床荷重分割 | sc-load | floor.rs | `test_*` | P2 | ✅ |

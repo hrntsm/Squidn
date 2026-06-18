@@ -3,7 +3,7 @@ use sc_core::dof::{DofMap, DOF_PER_NODE};
 use sc_core::ids::LoadCaseId;
 use sc_core::model::Model;
 use sc_element::factory::build_behavior;
-use sc_math::sparse::assemble_csc;
+use sc_math::sparse::{assemble_csc, Triplet};
 
 pub fn assemble_global_k(model: &Model, dofmap: &DofMap) -> SparseColMat<usize, f64> {
     let ctx = sc_element::behavior::Ctx { model };
@@ -33,6 +33,28 @@ pub fn assemble_global_m(
         let triplets = m_local.to_triplets(&gdofs);
         all_triplets.extend(triplets);
     }
+
+    // 節点集中質量（Node.mass）を対角へ加算する。
+    // 床荷重→質量化した層質量や、集中質量モデルの質量はここで反映される。
+    // これを欠くと固有値・有効質量比（P2 DoD #2）が物理的に誤る。
+    for (ni, node) in model.nodes.iter().enumerate() {
+        if let Some(mass) = node.mass {
+            for (d, &mval) in mass.iter().enumerate() {
+                if mval == 0.0 {
+                    continue;
+                }
+                let g = ni * DOF_PER_NODE + d;
+                if let Some(active) = dofmap.active(g) {
+                    all_triplets.push(Triplet {
+                        row: active as usize,
+                        col: active as usize,
+                        val: mval,
+                    });
+                }
+            }
+        }
+    }
+
     assemble_csc(dofmap.n_active(), all_triplets)
 }
 

@@ -156,12 +156,14 @@ impl ShellFrame {
                 }
             }
         }
+        // 標準規約: R=[e1 e2 n]（列＝ローカル基底）が local→global。
+        // K_global = R · K_local · Rᵀ。
         let mut tmp = vec![0.0; n * n];
         for i in 0..n {
             for j in 0..n {
                 let mut s = 0.0;
                 for k in 0..n {
-                    s += k_local.get(i, k) * r_block[k * n + j];
+                    s += k_local.get(i, k) * rt_block[k * n + j];
                 }
                 tmp[i * n + j] = s;
             }
@@ -171,7 +173,7 @@ impl ShellFrame {
             for j in 0..n {
                 let mut s = 0.0;
                 for k in 0..n {
-                    s += rt_block[i * n + k] * tmp[k * n + j];
+                    s += r_block[i * n + k] * tmp[k * n + j];
                 }
                 kg.set(i, j, s);
             }
@@ -179,32 +181,8 @@ impl ShellFrame {
         kg
     }
 
-    /// Rotate a 24-vector from local to global.
+    /// Rotate a 24-vector from local to global: v_g = R v_l（R=[e1 e2 n]列）。
     pub fn rotate_to_global_24(&self, v_local: &[f64; 24]) -> [f64; 24] {
-        let rt = self.rot_6x6_transpose();
-        let n = 24;
-        let mut rt_block = vec![0.0; n * n];
-        for b in 0..4 {
-            let bo = b * 6;
-            for i in 0..6 {
-                for j in 0..6 {
-                    rt_block[(bo + i) * n + (bo + j)] = rt[i * 6 + j];
-                }
-            }
-        }
-        let mut vg = [0.0; 24];
-        for i in 0..24 {
-            let mut s = 0.0;
-            for j in 0..24 {
-                s += rt_block[i * 24 + j] * v_local[j];
-            }
-            vg[i] = s;
-        }
-        vg
-    }
-
-    /// Rotate a 24-vector from global to local.
-    pub fn rotate_to_local_24(&self, v_global: &[f64; 24]) -> [f64; 24] {
         let r = self.rot_6x6();
         let n = 24;
         let mut r_block = vec![0.0; n * n];
@@ -216,11 +194,35 @@ impl ShellFrame {
                 }
             }
         }
+        let mut vg = [0.0; 24];
+        for i in 0..24 {
+            let mut s = 0.0;
+            for j in 0..24 {
+                s += r_block[i * 24 + j] * v_local[j];
+            }
+            vg[i] = s;
+        }
+        vg
+    }
+
+    /// Rotate a 24-vector from global to local: v_l = Rᵀ v_g。
+    pub fn rotate_to_local_24(&self, v_global: &[f64; 24]) -> [f64; 24] {
+        let rt = self.rot_6x6_transpose();
+        let n = 24;
+        let mut rt_block = vec![0.0; n * n];
+        for b in 0..4 {
+            let bo = b * 6;
+            for i in 0..6 {
+                for j in 0..6 {
+                    rt_block[(bo + i) * n + (bo + j)] = rt[i * 6 + j];
+                }
+            }
+        }
         let mut vl = [0.0; 24];
         for i in 0..24 {
             let mut s = 0.0;
             for j in 0..24 {
-                s += r_block[i * 24 + j] * v_global[j];
+                s += rt_block[i * 24 + j] * v_global[j];
             }
             vl[i] = s;
         }
@@ -546,10 +548,28 @@ impl ShellElement {
         }
     }
 
+    /// 節点座標を要素ローカル面内 2D 座標（e1,e2 への射影）へ変換する。
+    /// B 行列・ヤコビアンはこのローカル座標で評価しなければならない
+    /// （`to_global` でフレーム回転を掛けるため、座標も同じフレームに揃える）。
+    /// グローバル x,y を直接使うと、第1辺がグローバル x に沿わない要素で
+    /// 二重回転になりパッチテストが破綻する。
+    fn local_coords(&self) -> [[f64; 3]; 4] {
+        let f = &self.frame;
+        let mut lc = [[0.0; 3]; 4];
+        for i in 0..4 {
+            let c = self.coords[i];
+            lc[i][0] = c[0] * f.e1[0] + c[1] * f.e1[1] + c[2] * f.e1[2];
+            lc[i][1] = c[0] * f.e2[0] + c[1] * f.e2[1] + c[2] * f.e2[2];
+            lc[i][2] = 0.0;
+        }
+        lc
+    }
+
     #[allow(non_snake_case)]
     pub fn local_stiffness(&self) -> LocalMat {
         let n = 24;
         let mut k = LocalMat::zeros(n);
+        let lc = self.local_coords();
 
         // Proper Gauss integration:
         for gi in 0..2 {
@@ -557,13 +577,13 @@ impl ShellElement {
                 let gp = gi * 2 + gj;
                 let xi = GAUSS_PTS_2[gp].0;
                 let eta = GAUSS_PTS_2[gp].1;
-                let det_j = jacobian_det(&jacobian(xi, eta, &self.coords));
+                let det_j = jacobian_det(&jacobian(xi, eta, &lc));
                 if det_j.abs() < 1e-30 {
                     continue;
                 }
                 let weight = det_j; // product of weights = 1*1 = 1
 
-                let dNc = dshape_cart(xi, eta, &self.coords);
+                let dNc = dshape_cart(xi, eta, &lc);
 
                 // Membrane contribution
                 if self.membrane_active {
@@ -618,7 +638,7 @@ impl ShellElement {
 
                 // MITC4 shear contribution
                 {
-                    let bs = self.shear_b_mitc4(xi, eta, &self.coords);
+                    let bs = self.shear_b_mitc4(xi, eta, &lc);
                     let ds = d_shear(self.e, self.nu, self.t);
                     let mut btd = vec![0.0; 24 * 2];
                     for i in 0..24 {
@@ -678,6 +698,7 @@ impl ShellElement {
         u_elem_global: &[f64; 24],
     ) -> Vec<([f64; 2], ShellResultants)> {
         let u_local = self.frame.rotate_to_local_24(u_elem_global);
+        let lc = self.local_coords();
         let mut results = Vec::with_capacity(4);
 
         for gi in 0..2 {
@@ -685,11 +706,11 @@ impl ShellElement {
                 let gp = gi * 2 + gj;
                 let xi = GAUSS_PTS_2[gp].0;
                 let eta = GAUSS_PTS_2[gp].1;
-                let dNc = dshape_cart(xi, eta, &self.coords);
+                let dNc = dshape_cart(xi, eta, &lc);
 
                 let bm = self.membrane_b(xi, eta, &dNc);
                 let bb = self.bending_b(xi, eta, &dNc);
-                let bs = self.shear_b_mitc4(xi, eta, &self.coords);
+                let bs = self.shear_b_mitc4(xi, eta, &lc);
 
                 let mut eps_m = [0.0; 3];
                 let mut eps_b = [0.0; 3];
@@ -722,8 +743,8 @@ impl ShellElement {
                 let mut x = 0.0;
                 let mut y = 0.0;
                 for i in 0..4 {
-                    x += N[i] * self.coords[i][0];
-                    y += N[i] * self.coords[i][1];
+                    x += N[i] * lc[i][0];
+                    y += N[i] * lc[i][1];
                 }
 
                 results.push((
@@ -912,12 +933,13 @@ impl crate::behavior::ElementBehavior for ShellElement {
             }
             MassOption::Consistent => {
                 // Consistent mass uses 2×2 Gauss integration of NᵀρtN
+                let lc = self.local_coords();
                 for gi in 0..2 {
                     for gj in 0..2 {
                         let gp = gi * 2 + gj;
                         let xi = GAUSS_PTS_2[gp].0;
                         let eta = GAUSS_PTS_2[gp].1;
-                        let det_j = jacobian_det(&jacobian(xi, eta, &self.coords));
+                        let det_j = jacobian_det(&jacobian(xi, eta, &lc));
                         let weight = det_j;
                         let n = shape_2d(xi, eta);
                         let rho_t = self.density * self.t;
@@ -1365,5 +1387,202 @@ mod tests {
         assert!((strain[0] - eps_x).abs() < 1e-12, "ε_x={}", strain[0]);
         assert!((strain[1] - eps_y).abs() < 1e-12, "ε_y={}", strain[1]);
         assert!((strain[2] - gam_xy).abs() < 1e-12, "γ_xy={}", strain[2]);
+    }
+
+    // -----------------------------------------------------------------------
+    // 真のパッチテスト（歪みメッシュ・機械精度）— 仕様 §9.2（唯一の厳密ゲート）
+    // -----------------------------------------------------------------------
+    fn distorted_patch() -> (Vec<[f64; 3]>, Vec<[usize; 4]>) {
+        // 中央節点を非対称に歪ませた 9 節点・4 要素パッチ。内部=節点4。
+        let coords = vec![
+            [0.0, 0.0, 0.0],
+            [100.0, 0.0, 0.0],
+            [200.0, 0.0, 0.0],
+            [0.0, 100.0, 0.0],
+            [115.0, 88.0, 0.0],
+            [200.0, 100.0, 0.0],
+            [0.0, 200.0, 0.0],
+            [100.0, 200.0, 0.0],
+            [200.0, 200.0, 0.0],
+        ];
+        let elems = vec![[0, 1, 4, 3], [1, 2, 5, 4], [3, 4, 7, 6], [4, 5, 8, 7]];
+        (coords, elems)
+    }
+
+    fn make_shell_on(coords4: [[f64; 3]; 4], nids: [usize; 4]) -> ShellElement {
+        ShellElement {
+            nodes: [
+                NodeId(nids[0] as u32),
+                NodeId(nids[1] as u32),
+                NodeId(nids[2] as u32),
+                NodeId(nids[3] as u32),
+            ],
+            coords: coords4,
+            t: 10.0,
+            e: 200000.0,
+            nu: 0.3,
+            density: 0.0,
+            frame: ShellFrame::from_nodes(coords4),
+            drilling_factor: DEFAULT_DRILLING_FACTOR,
+            membrane_active: true,
+        }
+    }
+
+    fn assemble_dense(coords: &[[f64; 3]], elems: &[[usize; 4]]) -> (Vec<f64>, usize) {
+        let nn = coords.len();
+        let ndof = nn * 6;
+        let mut k = vec![0.0; ndof * ndof];
+        for e in elems {
+            let c4 = [coords[e[0]], coords[e[1]], coords[e[2]], coords[e[3]]];
+            let shell = make_shell_on(c4, *e);
+            let kl = shell.frame.to_global(&shell.local_stiffness());
+            let gdof = |loc: usize| e[loc / 6] * 6 + (loc % 6);
+            for a in 0..24 {
+                let ga = gdof(a);
+                for b in 0..24 {
+                    k[ga * ndof + gdof(b)] += kl.get(a, b);
+                }
+            }
+        }
+        (k, ndof)
+    }
+
+    fn solve_prescribed(k: &[f64], ndof: usize, free: &[usize], g: &[f64]) -> Vec<f64> {
+        let nf = free.len();
+        let mut a = vec![0.0; nf * nf];
+        let mut rhs = vec![0.0; nf];
+        let mut is_free = vec![false; ndof];
+        for &f in free {
+            is_free[f] = true;
+        }
+        for (i, &fi) in free.iter().enumerate() {
+            for (j, &fj) in free.iter().enumerate() {
+                a[i * nf + j] = k[fi * ndof + fj];
+            }
+            let mut s = 0.0;
+            for (b, &gb) in g.iter().enumerate() {
+                if !is_free[b] {
+                    s += k[fi * ndof + b] * gb;
+                }
+            }
+            rhs[i] = -s;
+        }
+        let uf = dense_solve(&mut a, &mut rhs, nf);
+        let mut u = g.to_vec();
+        for (i, &fi) in free.iter().enumerate() {
+            u[fi] = uf[i];
+        }
+        u
+    }
+
+    fn dense_solve(a: &mut [f64], b: &mut [f64], n: usize) -> Vec<f64> {
+        for col in 0..n {
+            let mut piv = col;
+            let mut best = a[col * n + col].abs();
+            for r in (col + 1)..n {
+                let v = a[r * n + col].abs();
+                if v > best {
+                    best = v;
+                    piv = r;
+                }
+            }
+            if piv != col {
+                for j in 0..n {
+                    a.swap(col * n + j, piv * n + j);
+                }
+                b.swap(col, piv);
+            }
+            let d = a[col * n + col];
+            for r in (col + 1)..n {
+                let f = a[r * n + col] / d;
+                if f != 0.0 {
+                    for j in col..n {
+                        a[r * n + j] -= f * a[col * n + j];
+                    }
+                    b[r] -= f * b[col];
+                }
+            }
+        }
+        let mut x = vec![0.0; n];
+        for i in (0..n).rev() {
+            let mut s = b[i];
+            for j in (i + 1)..n {
+                s -= a[i * n + j] * x[j];
+            }
+            x[i] = s / a[i * n + i];
+        }
+        x
+    }
+
+    /// 膜パッチ：歪みメッシュで線形変位場 → 内部節点が場を機械精度で再現。
+    #[test]
+    fn test_patch_membrane_distorted() {
+        let (coords, elems) = distorted_patch();
+        let (k, ndof) = assemble_dense(&coords, &elems);
+        let field = |c: &[f64; 3]| [1.0e-3 * c[0] + 0.5e-3 * c[1], 0.3e-3 * c[0] + 2.0e-3 * c[1]];
+        let mut g = vec![0.0; ndof];
+        for (i, c) in coords.iter().enumerate() {
+            let f = field(c);
+            g[i * 6] = f[0];
+            g[i * 6 + 1] = f[1];
+        }
+        let free: Vec<usize> = (0..6).map(|d| 4 * 6 + d).collect();
+        let u = solve_prescribed(&k, ndof, &free, &g);
+        let exact = field(&coords[4]);
+        assert!(
+            (u[4 * 6] - exact[0]).abs() < 1e-9 && (u[4 * 6 + 1] - exact[1]).abs() < 1e-9,
+            "膜パッチ不一致: Ux={} (exp {}), Uy={} (exp {})",
+            u[4 * 6],
+            exact[0],
+            u[4 * 6 + 1],
+            exact[1]
+        );
+    }
+
+    /// 曲げパッチ：歪みメッシュで定曲率場 → 内部節点が場を機械精度で再現。
+    /// MITC4 の合否ゲート（薄板でロッキングしないことの根拠）。
+    #[test]
+    fn test_patch_bending_distorted() {
+        let (coords, elems) = distorted_patch();
+        let (k, ndof) = assemble_dense(&coords, &elems);
+        let (kx, ky, kxy) = (1.0e-6, 2.0e-6, 0.5e-6);
+        // w = ½κx x² + ½κy y² + κxy xy、Kirchhoff: θy=−∂w/∂x, θx=∂w/∂y
+        let field = |c: &[f64; 3]| -> [f64; 3] {
+            let (x, y) = (c[0], c[1]);
+            [
+                0.5 * kx * x * x + 0.5 * ky * y * y + kxy * x * y, // w (Uz)
+                ky * y + kxy * x,                                  // θx (Rx)
+                -(kx * x + kxy * y),                               // θy (Ry)
+            ]
+        };
+        let mut g = vec![0.0; ndof];
+        for (i, c) in coords.iter().enumerate() {
+            let f = field(c);
+            g[i * 6 + 2] = f[0];
+            g[i * 6 + 3] = f[1];
+            g[i * 6 + 4] = f[2];
+        }
+        let free: Vec<usize> = (0..6).map(|d| 4 * 6 + d).collect();
+        let u = solve_prescribed(&k, ndof, &free, &g);
+        let exact = field(&coords[4]);
+        let scale = 0.5 * kx * 200.0 * 200.0; // 代表変位スケール
+        assert!(
+            (u[4 * 6 + 2] - exact[0]).abs() < 1e-8 * scale,
+            "曲げパッチ Uz={} exp {}",
+            u[4 * 6 + 2],
+            exact[0]
+        );
+        assert!(
+            (u[4 * 6 + 3] - exact[1]).abs() < 1e-8 * (exact[1].abs().max(1e-4)),
+            "曲げパッチ Rx={} exp {}",
+            u[4 * 6 + 3],
+            exact[1]
+        );
+        assert!(
+            (u[4 * 6 + 4] - exact[2]).abs() < 1e-8 * (exact[2].abs().max(1e-4)),
+            "曲げパッチ Ry={} exp {}",
+            u[4 * 6 + 4],
+            exact[2]
+        );
     }
 }

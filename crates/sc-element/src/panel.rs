@@ -247,6 +247,111 @@ mod tests {
         assert!((res.c_mu - (mu_c - conn.cqu * db2)).abs() < 1e-9);
     }
 
+    /// 添付資料『パネルゾーンの力学』(小野瀬, 2009) ケース1 の数値例照合（仕様 §11.5）。
+    /// 単位系は資料に合わせ kN, m, kN·m。確定値:
+    ///   pQc = 851.135 kN, pQb = 1702.273 kN, τc = τb（整合）。
+    /// 入力（資料 図18 のM図より）:
+    ///   柱せい方向 dc=0.2m, 梁せい方向 db=0.4m。
+    ///   梁: ML*b=218.182, MR*b=181.818 kNm, bQL=bQR=72.727 kN。
+    ///   柱: ML*c=150, MU*c=250 kNm, cQL=100, cQU=125 kN。
+    #[test]
+    fn test_panel_zone_reference_case1() {
+        let dc = 0.2_f64; // 柱せい [m]
+        let db = 0.4_f64; // 梁せい [m]
+        let tp = 1.0_f64; // 板厚（pQ には無関係。τ 整合確認用）
+        let pz = PanelZone {
+            dc,
+            db,
+            tp,
+            g: 0.0,
+            kind: PanelStiffnessModel::RigidZoneApprox,
+            center_node: NodeId(0),
+            connected_nodes: vec![NodeId(1), NodeId(2), NodeId(3), NodeId(4)],
+        };
+        let conn = PanelConnection {
+            ml_b: 218.182,
+            mr_b: 181.818,
+            bql: 72.727,
+            bqr: 72.727,
+            bnl: 0.0,
+            bnr: 0.0,
+            ml_c: 150.0,
+            mu_c: 250.0,
+            cql: 100.0,
+            cqu: 125.0,
+        };
+        let res = pz.evaluate(&conn);
+
+        // フェースモーメント（資料: bML=210.909, bMR=174.545, cML=130.0, cMU=225.0）
+        assert!((res.b_ml - 210.909).abs() < 1e-3, "bML={}", res.b_ml);
+        assert!((res.b_mr - 174.545).abs() < 1e-3, "bMR={}", res.b_mr);
+        assert!((res.c_ml - 130.0).abs() < 1e-9, "cML={}", res.c_ml);
+        assert!((res.c_mu - 225.0).abs() < 1e-9, "cMU={}", res.c_mu);
+
+        // パネルせん断（資料の確定値）
+        assert!(
+            (res.pqc - 851.135).abs() < 0.05,
+            "pQc={} (期待 851.135)",
+            res.pqc
+        );
+        assert!(
+            (res.pqb - 1702.273).abs() < 0.05,
+            "pQb={} (期待 1702.273)",
+            res.pqb
+        );
+
+        // 整合条件 τc = τb（= pQc/(dc·tp) = pQb/(db·tp)、資料 "c=b o.k"）
+        let tau_b = res.pqb / (db * tp);
+        assert!(
+            (res.tau - tau_b).abs() / res.tau.abs() < 1e-4,
+            "τc={} != τb={}",
+            res.tau,
+            tau_b
+        );
+    }
+
+    /// 添付資料 ケース2（ト型＝梁が片側のみ）。欠落部材の項を 0 として同一式で
+    /// 計算できることの数値照合（仕様 §7.3 / §7.5 / 資料 図23）。
+    /// 確定値: pQc=854.168 kN, pQb=1708.334 kN。
+    /// 入力: ML*b=400, MR*b=0（欠落）, bQL=133.333, bQR=0;
+    ///       ML*c=150, MU*c=250, cQL=100, cQU=125。
+    #[test]
+    fn test_panel_zone_reference_case2_t_joint() {
+        let (dc, db, tp) = (0.2_f64, 0.4_f64, 1.0_f64);
+        let pz = PanelZone {
+            dc,
+            db,
+            tp,
+            g: 0.0,
+            kind: PanelStiffnessModel::RigidZoneApprox,
+            center_node: NodeId(0),
+            connected_nodes: vec![NodeId(1), NodeId(2), NodeId(3)],
+        };
+        let conn = PanelConnection {
+            ml_b: 400.0,
+            mr_b: 0.0, // 欠落部材 → 0
+            bql: 133.333,
+            bqr: 0.0,
+            bnl: 0.0,
+            bnr: 0.0,
+            ml_c: 150.0,
+            mu_c: 250.0,
+            cql: 100.0,
+            cqu: 125.0,
+        };
+        let res = pz.evaluate(&conn);
+        assert!(
+            (res.pqc - 854.168).abs() < 0.05,
+            "pQc={} (期待 854.168)",
+            res.pqc
+        );
+        assert!(
+            (res.pqb - 1708.334).abs() < 0.05,
+            "pQb={} (期待 1708.334)",
+            res.pqb
+        );
+    }
+
     /// 方式A（剛域近似）は tangent_stiffness がゼロを返す（二重計上防止）
     #[test]
     fn test_panel_rigid_zone_approx_zero_stiffness() {

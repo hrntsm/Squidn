@@ -146,6 +146,98 @@ pub fn nodal_disp_batch(node_ids: &[u32], disp: &[[f64; 6]]) -> arrow::error::Re
     )
 }
 
+pub fn member_force_schema() -> Arc<Schema> {
+    Arc::new(Schema::new(vec![
+        Field::new("elem_id", DataType::UInt32, false),
+        Field::new("pos", DataType::Float64, false), // 評価位置 0..1
+        Field::new("n", DataType::Float64, false),
+        Field::new("qy", DataType::Float64, false),
+        Field::new("qz", DataType::Float64, false),
+        Field::new("mx", DataType::Float64, false),
+        Field::new("my", DataType::Float64, false),
+        Field::new("mz", DataType::Float64, false),
+    ]))
+}
+
+/// 部材内力（評価位置別）を RecordBatch 化する。
+/// `rows`: (要素ID, 評価位置 0..1, [N,Qy,Qz,Mx,My,Mz])
+pub fn member_force_batch(rows: &[(u32, f64, [f64; 6])]) -> arrow::error::Result<RecordBatch> {
+    let n = rows.len();
+    let mut elem = Vec::with_capacity(n);
+    let mut pos = Vec::with_capacity(n);
+    let mut cols: [Vec<f64>; 6] = Default::default();
+    for (e, p, f) in rows {
+        elem.push(*e);
+        pos.push(*p);
+        for (c, v) in cols.iter_mut().zip(f.iter()) {
+            c.push(*v);
+        }
+    }
+    let [n_, qy, qz, mx, my, mz] = cols;
+    RecordBatch::try_new(
+        member_force_schema(),
+        vec![
+            Arc::new(UInt32Array::from(elem)),
+            Arc::new(Float64Array::from(pos)),
+            Arc::new(Float64Array::from(n_)),
+            Arc::new(Float64Array::from(qy)),
+            Arc::new(Float64Array::from(qz)),
+            Arc::new(Float64Array::from(mx)),
+            Arc::new(Float64Array::from(my)),
+            Arc::new(Float64Array::from(mz)),
+        ],
+    )
+}
+
+pub fn modal_schema() -> Arc<Schema> {
+    Arc::new(Schema::new(vec![
+        Field::new("mode", DataType::UInt32, false),
+        Field::new("period", DataType::Float64, false),
+        Field::new("omega2", DataType::Float64, false),
+        Field::new("part_x", DataType::Float64, false),
+        Field::new("part_y", DataType::Float64, false),
+        Field::new("part_z", DataType::Float64, false),
+        Field::new("eff_x", DataType::Float64, false),
+        Field::new("eff_y", DataType::Float64, false),
+        Field::new("eff_z", DataType::Float64, false),
+    ]))
+}
+
+/// モーダル結果（固有周期・刺激係数・有効質量）を RecordBatch 化する。
+pub fn modal_batch(
+    period: &[f64],
+    omega2: &[f64],
+    participation: &[[f64; 3]],
+    effective_mass: &[[f64; 3]],
+) -> arrow::error::Result<RecordBatch> {
+    let n = period.len();
+    let mode: Vec<u32> = (0..n as u32).collect();
+    let mut part: [Vec<f64>; 3] = Default::default();
+    let mut eff: [Vec<f64>; 3] = Default::default();
+    for i in 0..n {
+        for d in 0..3 {
+            part[d].push(participation.get(i).map(|p| p[d]).unwrap_or(0.0));
+            eff[d].push(effective_mass.get(i).map(|e| e[d]).unwrap_or(0.0));
+        }
+    }
+    let [px, py, pz] = part;
+    let [ex, ey, ez] = eff;
+    RecordBatch::try_new(
+        modal_schema(),
+        vec![
+            Arc::new(UInt32Array::from(mode)),
+            Arc::new(Float64Array::from(period.to_vec())),
+            Arc::new(Float64Array::from(omega2.to_vec())),
+            Arc::new(Float64Array::from(px)),
+            Arc::new(Float64Array::from(py)),
+            Arc::new(Float64Array::from(pz)),
+            Arc::new(Float64Array::from(ex)),
+            Arc::new(Float64Array::from(ey)),
+            Arc::new(Float64Array::from(ez)),
+        ],
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -176,5 +268,49 @@ mod tests {
         let batch = &batches[0];
         assert_eq!(batch.num_rows(), 3);
         assert_eq!(batch.num_columns(), 7);
+    }
+
+    #[test]
+    fn test_modal_roundtrip_partial() {
+        let dir = std::env::temp_dir();
+        let path = dir.join("p2_test_modal.parquet");
+        let path_str = path.to_str().unwrap();
+        {
+            let mut writer = ParquetWriter::create(path_str, modal_schema()).unwrap();
+            let batch = modal_batch(
+                &[0.3215, 0.1228],
+                &[382.0, 2618.0],
+                &[[1.0, 0.0, 0.0], [0.5, 0.0, 0.0]],
+                &[[1.894, 0.0, 0.0], [0.106, 0.0, 0.0]],
+            )
+            .unwrap();
+            writer.write_rows(&batch);
+            Box::new(writer).finish();
+        }
+        // 部分読出し: period 列(=1)のみ射影
+        let batches = read_partial(path_str, vec![1]).unwrap();
+        let b = &batches[0];
+        assert_eq!(b.num_columns(), 1);
+        assert_eq!(b.num_rows(), 2);
+    }
+
+    #[test]
+    fn test_member_force_roundtrip() {
+        let dir = std::env::temp_dir();
+        let path = dir.join("p2_test_member.parquet");
+        let path_str = path.to_str().unwrap();
+        {
+            let mut writer = ParquetWriter::create(path_str, member_force_schema()).unwrap();
+            let batch = member_force_batch(&[
+                (1, 0.0, [100.0, 5.0, 0.0, 0.0, 0.0, 200.0]),
+                (1, 1.0, [100.0, 5.0, 0.0, 0.0, 0.0, -200.0]),
+            ])
+            .unwrap();
+            writer.write_rows(&batch);
+            Box::new(writer).finish();
+        }
+        let batches = read_all(path_str).unwrap();
+        assert_eq!(batches[0].num_rows(), 2);
+        assert_eq!(batches[0].num_columns(), 8);
     }
 }

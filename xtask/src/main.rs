@@ -8,13 +8,15 @@ fn main() -> anyhow::Result<()> {
         std::process::exit(1);
     }
 
+    // レイヤ順（下が下流＝依存される側）。実依存グラフ（DAG）に一致させる。
+    // 上位→下位（dep_layer < layer_idx）のみ許可。同層・下位→上位は不許可。
     let layers: &[&[&str]] = &[
-        &["sc-core", "sc-math"],
-        &["sc-material", "sc-edit"],
-        &["sc-section"],
+        &["sc-core", "sc-math", "sc-material", "sc-ml"],
+        &["sc-edit", "sc-section", "sc-load", "sc-gpu"],
+        &["sc-skeleton"],
         &["sc-element"],
-        &["sc-skeleton", "sc-load", "sc-solver"],
-        &["sc-design-jp", "sc-io"],
+        &["sc-solver", "sc-io"],
+        &["sc-design-jp"],
         &["sc-mcp", "sc-app"],
     ];
 
@@ -44,7 +46,7 @@ fn main() -> anyhow::Result<()> {
         if let Some(deps) = parsed.get("dependencies").and_then(|d| d.as_table()) {
             for (dep_name, _) in deps {
                 if let Some(&dep_layer) = layer_map.get(dep_name.as_str()) {
-                    if dep_layer <= layer_idx {
+                    if dep_layer < layer_idx {
                         errors.push(format!(
                             "OK: {} (layer {}) depends on {} (layer {})",
                             name, layer_idx, dep_name, dep_layer
@@ -62,7 +64,7 @@ fn main() -> anyhow::Result<()> {
         if let Some(deps) = parsed.get("dev-dependencies").and_then(|d| d.as_table()) {
             for (dep_name, _) in deps {
                 if let Some(&dep_layer) = layer_map.get(dep_name.as_str()) {
-                    if dep_layer <= layer_idx {
+                    if dep_layer < layer_idx {
                         errors.push(format!(
                             "OK: {} (layer {}) dev-depends on {} (layer {})",
                             name, layer_idx, dep_name, dep_layer
