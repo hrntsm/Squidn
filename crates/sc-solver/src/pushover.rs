@@ -434,7 +434,6 @@ pub fn pushover_analysis(
             let snap = StateSnapshot::capture(&behaviors);
             let k_free = assemble_k(model, dofmap, &behaviors, use_kg, None);
             let k_red = reducer.reduce_k(&k_free);
-            let f_int = compute_f_int(model, dofmap, &behaviors);
 
             let mut solver = make_solver(SolverBackend::DirectSparseCholesky);
             if solver.factorize(&k_red).is_err() {
@@ -442,36 +441,42 @@ pub fn pushover_analysis(
                 break;
             }
 
-            let result = arc_solver.step(
-                &q,
-                &mut |r: &[f64]| -> Result<Vec<f64>, String> {
-                    let r_red = reducer.reduce_f(r);
-                    let du_red = solver.solve(&r_red).map_err(|e| format!("{:?}", e))?;
-                    Ok(reducer.expand_u(&du_red))
-                },
-                &f_int,
-                &prev_du,
-                arc_lambda,
-            );
+            // 弧長修正子の各反復で内力を再評価するため、変位増分 δu を要素状態へ
+            // 反映して更新後 f_int を返すクロージャを渡す（接線 K はステップ開始時で固定＝修正 Newton）。
+            let result = {
+                let model_ref: &Model = &*model;
+                let behaviors_ref = &mut behaviors;
+                arc_solver.step(
+                    &q,
+                    &mut |r: &[f64]| -> Result<Vec<f64>, String> {
+                        let r_red = reducer.reduce_f(r);
+                        let du_red = solver.solve(&r_red).map_err(|e| format!("{:?}", e))?;
+                        Ok(reducer.expand_u(&du_red))
+                    },
+                    &mut |delta_u: &[f64]| -> Result<Vec<f64>, String> {
+                        let ctx = Ctx { model: model_ref };
+                        for b in behaviors_ref.iter_mut() {
+                            let gdofs = b.global_dofs(dofmap);
+                            let mut du_elem = LocalVec {
+                                data: SmallVec::from_elem(0.0, 12),
+                            };
+                            for (i, &g) in gdofs.iter().enumerate() {
+                                if g != usize::MAX && g < delta_u.len() {
+                                    du_elem.data[i] = delta_u[g];
+                                }
+                            }
+                            b.update_state(&du_elem, false, &ctx);
+                        }
+                        Ok(compute_f_int(model_ref, dofmap, behaviors_ref))
+                    },
+                    &prev_du,
+                    arc_lambda,
+                )
+            };
 
             match result {
                 Ok(step_result) if step_result.converged => {
-                    let model_ptr = std::ptr::addr_of_mut!(*model) as *const Model;
-                    for (_elem, b) in model.elements.iter_mut().zip(behaviors.iter_mut()) {
-                        let gdofs = b.global_dofs(dofmap);
-                        let mut du_elem = LocalVec {
-                            data: SmallVec::from_elem(0.0, 12),
-                        };
-                        for (i, &g) in gdofs.iter().enumerate() {
-                            if g != usize::MAX && g < step_result.du.len() {
-                                du_elem.data[i] = step_result.du[g];
-                            }
-                        }
-                        let dummy_ctx = Ctx {
-                            model: unsafe { &*model_ptr },
-                        };
-                        b.update_state(&du_elem, false, &dummy_ctx);
-                    }
+                    // 要素状態は eval_fint で既に δu 反映済み。ここでは確定のみ。
                     for b in behaviors.iter_mut() {
                         b.commit_state();
                     }
@@ -482,10 +487,12 @@ pub fn pushover_analysis(
                     prev_du = step_result.du;
 
                     let roof = get_roof_disp(&total_disp, model, dofmap, dir);
+                    let f_int_now = compute_f_int(model, dofmap, &behaviors);
+                    let base_shear = compute_base_shear(model, dofmap, &f_int_now, dir);
                     capacity_curve.push(CapacityPoint {
                         step: (n_steps + 1 + _step) as u32,
                         roof_disp: roof,
-                        base_shear: arc_lambda,
+                        base_shear,
                         story_shear: vec![],
                         story_drift: vec![],
                     });
@@ -819,6 +826,28 @@ mod tests {
             &mut model, &dofmap, &reducer, SeismicDir::X, 10, 0.0, false, false, 0.0,
         );
         assert!(result.is_err(), "should error when no seismic weight defined");
+    }
+
+    #[test]
+    fn test_pushover_arc_length_path_runs() {
+        // 弧長法フェーズ（f_int 反復再評価版）がエンドツーエンドで動作すること。
+        let mut model = single_column_model(235.0, 80_000.0);
+        let dofmap = DofMap::build(&model);
+        let reducer = Reducer::build(&model, &dofmap);
+        let result = pushover_analysis(
+            &mut model,
+            &dofmap,
+            &reducer,
+            SeismicDir::X,
+            10,    // max_steps（荷重制御）
+            0.0,   // max_disp
+            false, // use_kg
+            true,  // use_arc_length
+            1.0,   // arc_length_dl [mm]
+        )
+        .expect("arc-length pushover should run end-to-end");
+        assert!(!result.capacity_curve.is_empty());
+        assert!(result.qu > 0.0);
     }
 
     /// determine_mechanism / hinge_story 用の2層・柱通り（基礎-1F-2F）モデル。
