@@ -116,6 +116,37 @@ pub fn build_behavior(data: &ElementData, model: &Model) -> (Box<dyn ElementBeha
     }
 }
 
+/// 非線形解析（pushover）用の要素生成。`ForceRegime` に基づき非線形要素を構築する（P5 §5）。
+///
+/// 線形弾性解析は従来どおり [`build_behavior`]（弾性 `BeamElement`）を使う。両者を分けるのは、
+/// `resolve_force_regime` が剛床に乗らない梁も Fiber へ振り分けるため、共通化すると
+/// 線形解析の弾性梁まで非線形要素に置き換わってしまうため。
+///
+/// 注意（既知の制約）: `ConcentratedSpringBeam` は端ばねスケルトン（降伏モーメント）が必要だが、
+/// 現状 `Model` に降伏応力／スケルトン供給経路が無いため、軸-曲げ連成を扱う `FiberBeam` に
+/// フォールバックしている（P5 §5 の本来意図は集中ばね梁）。また鋼材はファイバ材料が
+/// `Bilinear(My=1e20)` で実質弾性のため、真の降伏は `fc` を持つコンクリート断面でのみ生じる。
+/// 鋼材の降伏・集中ばね梁の実体化には Model への降伏応力／スケルトン追加が前提（follow-up）。
+pub fn build_nonlinear_behavior(
+    data: &ElementData,
+    model: &Model,
+) -> (Box<dyn ElementBehavior>, ElemState) {
+    match data.kind {
+        ElementKind::Beam => match resolve_force_regime(data, model) {
+            ResolvedRegime::ConcentratedSpring | ResolvedRegime::Fiber => (
+                Box::new(crate::fiber_elem::FiberBeam::new(data, model)),
+                ElemState::default(),
+            ),
+        },
+        ElementKind::Fiber => (
+            Box::new(crate::fiber_elem::FiberBeam::new(data, model)),
+            ElemState::default(),
+        ),
+        // PanelZone / Shell / Ms / Wall は現状の挙動（弾性ベース）を踏襲。
+        _ => build_behavior(data, model),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -175,6 +206,7 @@ mod tests {
                 density: 0.0,
                 shear: None,
                 fc: None,
+                fy: None,
             }],
             ..Default::default()
         }

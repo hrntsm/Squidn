@@ -661,6 +661,7 @@ mod tests {
             density: 7.85e-9,
             shear: None,
             fc: None,
+            fy: None,
         };
         let fibers = rect_fiber_section(100.0, 200.0, 10, 20, 0);
         let reinforcement = Reinforcement {

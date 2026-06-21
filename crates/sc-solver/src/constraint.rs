@@ -317,6 +317,7 @@ mod tests {
                 density: 0.0,
                 shear: None,
                 fc: None,
+                fy: None,
             }],
             ..Default::default()
         }

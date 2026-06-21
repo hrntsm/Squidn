@@ -307,6 +307,7 @@ mod tests {
             density: 7.85e-9,
             shear: None,
             fc: None,
+            fy: None,
         };
         let forces = MemberForcesAt {
             pos: 0.5,
@@ -370,6 +371,7 @@ mod tests {
             density: 7.85e-9,
             shear: None,
             fc: None,
+            fy: None,
         };
         let forces = MemberForcesAt {
             pos: 0.5,
@@ -451,6 +453,7 @@ mod tests {
             density: 2.4e-9,
             shear: None,
             fc: Some(24.0),
+            fy: None,
         };
         let forces = MemberForcesAt {
             pos: 0.5,
@@ -496,6 +499,7 @@ mod tests {
             density: 2.4e-9,
             shear: None,
             fc: None,
+            fy: None,
         };
         let forces = MemberForcesAt {
             pos: 0.5,

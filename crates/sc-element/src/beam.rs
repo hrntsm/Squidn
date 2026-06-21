@@ -94,6 +94,7 @@ fn get_material(model: &Model, mid: Option<sc_core::ids::MaterialId>) -> Materia
         density: 0.0,
         shear: None,
         fc: None,
+        fy: None,
     })
 }
 
@@ -696,11 +697,14 @@ impl ElementBehavior for BeamElement {
         s(4, 4, c * 2.0 * l * l / 15.0);
         s(10, 10, c * 2.0 * l * l / 15.0);
         s(4, 10, -c * l * l / 30.0);
-        kg
+        // 幾何剛性もグローバル系へ回転（P-Δ を組立系で正しく加算するため）
+        self.axis.to_global(&kg)
     }
 
     fn internal_force(&self, _state: &ElemState, _ctx: &Ctx) -> LocalVec {
-        let k = self.local_stiffness();
+        // committed_disp はグローバル系で蓄積されるため、グローバル剛性で内力を評価する。
+        // f_global = (R^T·K_local·R)·u_global
+        let k = self.axis.to_global(&self.local_stiffness());
         let mut f = LocalVec {
             data: SmallVec::from_elem(0.0, 12),
         };
@@ -964,6 +968,7 @@ mod tests {
             density: 0.0,
             shear: None,
             fc: None,
+            fy: None,
         };
 
         let model = Model {
@@ -1085,6 +1090,7 @@ mod tests {
                 density: 0.0,
                 shear: None,
                 fc: None,
+                fy: None,
             }],
             ..Default::default()
         };

@@ -164,6 +164,10 @@ pub struct Material {
     /// 鋼材では `None`。RC 設計（令91条）の許容圧縮・せん断に用いる。
     #[serde(default)]
     pub fc: Option<f64>,
+    /// 降伏応力 fy [N/mm²]。鋼材の弾塑性挙動（ファイバ材料・端ばねスケルトン）に用いる。
+    /// `None` の場合、ファイバ材料は弾性（降伏しない）として扱う（P5 非線形）。
+    #[serde(default)]
+    pub fy: Option<f64>,
 }
 
 impl Material {
@@ -475,6 +479,7 @@ mod tests {
             density: 0.0,
             shear: Some(80000.0),
             fc: None,
+            fy: None,
         };
         assert_eq!(mat.shear_modulus(), 80000.0);
     }
@@ -489,6 +494,7 @@ mod tests {
             density: 0.0,
             shear: None,
             fc: None,
+            fy: None,
         };
         let expected = 205000.0 / (2.0 * (1.0 + 0.3));
         assert!((mat.shear_modulus() - expected).abs() < 1e-9);
