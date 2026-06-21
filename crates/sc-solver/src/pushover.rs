@@ -6,7 +6,7 @@ use sc_core::dof::DofMap;
 use sc_core::ids::{ElemId, StoryId};
 use sc_core::model::Model;
 use sc_element::behavior::{Ctx, ElemState, ElementBehavior, LocalVec};
-use sc_element::factory::build_behavior;
+use sc_element::factory::build_nonlinear_behavior;
 use sc_math::solver::{make_solver, SolverBackend};
 use smallvec::SmallVec;
 
@@ -156,7 +156,7 @@ pub fn pushover_analysis(
 
     let mut behaviors: Vec<Box<dyn ElementBehavior>> = Vec::new();
     for elem in &model.elements {
-        let (b, _) = build_behavior(elem, model);
+        let (b, _) = build_nonlinear_behavior(elem, model);
         behaviors.push(b);
     }
 
@@ -510,7 +510,12 @@ fn compute_hinge_thresholds(model: &Model) -> Vec<HingeThreshold> {
                     let depth = sec.depth.max(sec.width);
                     let i = sec.iz.max(sec.iy);
                     let z = if depth > 0.0 { i / (depth / 2.0) } else { 0.0 };
-                    let sigma_y = 235.0;
+                    // 降伏応力は部材材料の fy を優先。未設定なら鋼材既定 235 N/mm²（SN400 級）。
+                    let sigma_y = elem
+                        .material
+                        .and_then(|mid| model.materials.get(mid.index()))
+                        .and_then(|m| m.fy)
+                        .unwrap_or(235.0);
                     let my = sigma_y * z;
                     (my, my * 1.2)
                 } else {

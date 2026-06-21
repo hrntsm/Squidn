@@ -39,6 +39,10 @@ pub struct FiberBeam {
     pub nodes: [NodeId; 2],
     pub gauss_points: Vec<GaussPoint>,
     pub shear: crate::shear_spring::ShearSpring,
+    pub density: f64,
+    /// 要素ローカル系→グローバル系の回転（柱・斜材で必須）。
+    /// 内部状態（trial_disp 等）はローカル系で保持し、トレイト境界で回転する。
+    pub axis: crate::transform::LocalFrame,
     pub committed_disp: [f64; 12],
     pub trial_disp: [f64; 12],
 }
@@ -53,37 +57,60 @@ impl FiberBeam {
         let length = (dx * dx + dy * dy + dz * dz).sqrt();
 
         let sec = data.section.and_then(|sid| model.sections.get(sid.index()));
-        let mat = data
+        let mat_ref = data
             .material
             .and_then(|mid| model.materials.get(mid.index()));
-        let _e = mat.map(|m| m.young).unwrap_or(205000.0);
-        let g = mat.map(|m| m.shear_modulus()).unwrap_or(78846.0);
+        let density = mat_ref.map(|m| m.density).unwrap_or(0.0);
+        let e = mat_ref.map(|m| m.young).unwrap_or(205000.0);
+        let g = mat_ref.map(|m| m.shear_modulus()).unwrap_or(78846.0);
         let area = sec.map(|s| s.area).unwrap_or(0.0);
+        let width = sec.map(|s| s.width).unwrap_or(100.0);
+        let depth = sec.map(|s| s.depth).unwrap_or(200.0);
         let as_y = sec.map(|s| s.as_y).unwrap_or(area * 5.0 / 6.0);
         let as_z = sec.map(|s| s.as_z).unwrap_or(area * 5.0 / 6.0);
 
         let shear = crate::shear_spring::ShearSpring::new(length, g, as_y, as_z);
 
-        let gauss = vec![
+        let nw = 12;
+        let nd = 20;
+        let n_fibers = nw * nd;
+
+        let template: Box<dyn UniaxialMaterial> = if let Some(fc) = mat_ref.and_then(|m| m.fc) {
+            Box::new(sc_material::uniaxial::Concrete::new(fc, 2.0))
+        } else {
+            // 鋼材：降伏応力 fy が与えられれば弾塑性、無ければ実質弾性（fy=1e20）。
+            let fy = mat_ref.and_then(|m| m.fy).unwrap_or(1e20);
+            Box::new(sc_material::uniaxial::Bilinear::new(e, fy, 0.01))
+        };
+
+        let gauss_points = vec![
             GaussPoint::new(
                 -0.5773502691896257,
                 1.0,
-                FiberSection { fibers: vec![] },
-                vec![],
+                sc_section::fiber::rect_fiber_section(width, depth, nw, nd, 0),
+                sc_section::fiber::uniform_fiber_mats(&*template, n_fibers),
             ),
             GaussPoint::new(
                 0.5773502691896257,
                 1.0,
-                FiberSection { fibers: vec![] },
-                vec![],
+                sc_section::fiber::rect_fiber_section(width, depth, nw, nd, 0),
+                sc_section::fiber::uniform_fiber_mats(&*template, n_fibers),
             ),
         ];
+
+        let axis = crate::transform::LocalFrame::from_nodes(
+            n0.coord,
+            n1.coord,
+            data.local_axis.ref_vector,
+        );
 
         FiberBeam {
             length,
             nodes: [data.nodes[0], data.nodes[1]],
-            gauss_points: gauss,
+            gauss_points,
             shear,
+            density,
+            axis,
             committed_disp: [0.0; 12],
             trial_disp: [0.0; 12],
         }
@@ -123,6 +150,23 @@ impl FiberBeam {
         stiff[2][1] = stiff[1][2];
         (force, stiff)
     }
+
+    fn compute_b_matrix(xi: f64, l: f64) -> [[f64; 12]; 3] {
+        let inv_l = 1.0 / l;
+        let inv_l2 = 1.0 / (l * l);
+        let mut b = [[0.0; 12]; 3];
+        b[0][0] = -inv_l;
+        b[0][6] = inv_l;
+        b[1][2] = 6.0 * xi * inv_l2;
+        b[1][4] = (1.0 - 3.0 * xi) * inv_l;
+        b[1][8] = -6.0 * xi * inv_l2;
+        b[1][10] = -(1.0 + 3.0 * xi) * inv_l;
+        b[2][1] = -6.0 * xi * inv_l2;
+        b[2][5] = (1.0 - 3.0 * xi) * inv_l;
+        b[2][7] = 6.0 * xi * inv_l2;
+        b[2][11] = -(1.0 + 3.0 * xi) * inv_l;
+        b
+    }
 }
 
 impl ElementBehavior for FiberBeam {
@@ -145,59 +189,26 @@ impl ElementBehavior for FiberBeam {
         for gp in &self.gauss_points {
             let (_, d) = Self::section_response_from_cache(gp);
             let w = gp.weight * half;
+            let b = Self::compute_b_matrix(gp.xi, l);
 
-            let b00 = -1.0 / l;
-            let b06 = 1.0 / l;
-            let b14 = -1.0 / l;
-            let b110 = 1.0 / l;
-            let b25 = -1.0 / l;
-            let b211 = 1.0 / l;
-
-            let d00 = d[0][0];
-            let d01 = d[0][1];
-            let d02 = d[0][2];
-            let d11 = d[1][1];
-            let d12 = d[1][2];
-            let d22 = d[2][2];
-
-            let add = |k: &mut LocalMat, i: usize, j: usize, v: f64| {
-                let old = k.get(i, j);
-                k.set(i, j, old + v);
-            };
-
-            let s = |k: &mut LocalMat, i: usize, j: usize, v: f64| {
-                add(k, i, j, v);
-                if i != j {
-                    add(k, j, i, v);
+            for i in 0..12 {
+                for p in 0..3 {
+                    let bpi = b[p][i];
+                    if bpi == 0.0 {
+                        continue;
+                    }
+                    for j in 0..12 {
+                        let mut val = 0.0;
+                        for q in 0..3 {
+                            val += d[p][q] * b[q][j];
+                        }
+                        if val != 0.0 {
+                            let old = k.get(i, j);
+                            k.set(i, j, old + bpi * val * w);
+                        }
+                    }
                 }
-            };
-
-            s(&mut k, 0, 0, b00 * d00 * b00 * w);
-            s(&mut k, 0, 6, b00 * d00 * b06 * w);
-            s(&mut k, 6, 6, b06 * d00 * b06 * w);
-
-            s(&mut k, 0, 4, b00 * d01 * b14 * w);
-            s(&mut k, 0, 10, b00 * d01 * b110 * w);
-            s(&mut k, 6, 4, b06 * d01 * b14 * w);
-            s(&mut k, 6, 10, b06 * d01 * b110 * w);
-
-            s(&mut k, 0, 5, b00 * d02 * b25 * w);
-            s(&mut k, 0, 11, b00 * d02 * b211 * w);
-            s(&mut k, 6, 5, b06 * d02 * b25 * w);
-            s(&mut k, 6, 11, b06 * d02 * b211 * w);
-
-            s(&mut k, 4, 4, b14 * d11 * b14 * w);
-            s(&mut k, 4, 10, b14 * d11 * b110 * w);
-            s(&mut k, 10, 10, b110 * d11 * b110 * w);
-
-            s(&mut k, 4, 5, b14 * d12 * b25 * w);
-            s(&mut k, 4, 11, b14 * d12 * b211 * w);
-            s(&mut k, 10, 5, b110 * d12 * b25 * w);
-            s(&mut k, 10, 11, b110 * d12 * b211 * w);
-
-            s(&mut k, 5, 5, b25 * d22 * b25 * w);
-            s(&mut k, 5, 11, b25 * d22 * b211 * w);
-            s(&mut k, 11, 11, b211 * d22 * b211 * w);
+            }
         }
 
         let ks = self.shear.tangent_stiffness(&ElemState::default());
@@ -207,7 +218,8 @@ impl ElementBehavior for FiberBeam {
                 k.set(i, j, old + ks.get(i, j));
             }
         }
-        k
+        // ローカル接線剛性をグローバル節点系へ回転（R^T·K·R）
+        self.axis.to_global(&k)
     }
 
     fn internal_force(&self, _state: &ElemState, _ctx: &Ctx) -> LocalVec {
@@ -223,40 +235,57 @@ impl ElementBehavior for FiberBeam {
         for gp in &self.gauss_points {
             let (force, _) = Self::section_response_from_cache(gp);
             let w = gp.weight * half;
+            let b = Self::compute_b_matrix(gp.xi, l);
             let n = force[0];
             let my = force[1];
             let mz = force[2];
 
-            let b00 = -1.0 / l;
-            let b06 = 1.0 / l;
-            let b14 = -1.0 / l;
-            let b110 = 1.0 / l;
-            let b25 = -1.0 / l;
-            let b211 = 1.0 / l;
-
-            f.data[0] += b00 * n * w;
-            f.data[6] += b06 * n * w;
-            f.data[4] += b14 * my * w;
-            f.data[10] += b110 * my * w;
-            f.data[5] += b25 * mz * w;
-            f.data[11] += b211 * mz * w;
+            for i in 0..12 {
+                let val = b[0][i] * n + b[1][i] * my + b[2][i] * mz;
+                f.data[i] += val * w;
+            }
         }
-        f
+
+        let ks = self.shear.tangent_stiffness(&ElemState::default());
+        for i in 0..12 {
+            let mut si = 0.0;
+            for j in 0..12 {
+                si += ks.get(i, j) * self.trial_disp[j];
+            }
+            f.data[i] += si;
+        }
+        // ローカル内力をグローバル系へ回転（committed/trial はローカル保持のため）
+        let f_local: [f64; 12] = std::array::from_fn(|i| f.data[i]);
+        let f_global = self.axis.rotate_to_global(&f_local);
+        LocalVec {
+            data: SmallVec::from_slice(&f_global),
+        }
     }
 
     fn update_state(&mut self, du: &LocalVec, commit: bool, _ctx: &Ctx) {
+        // 入力 du はグローバル系。内部状態（trial_disp, B行列ひずみ）はローカル系で
+        // 扱うため、まずローカル系へ回転してから累積する。
+        let du_global: [f64; 12] = std::array::from_fn(|i| du.data[i]);
+        let du_local = self.axis.rotate_to_local(&du_global);
         for i in 0..12 {
-            self.trial_disp[i] += du.data[i];
+            self.trial_disp[i] += du_local[i];
         }
         let l = self.length;
         if l <= 0.0 {
             return;
         }
-        let eps0 = (self.trial_disp[6] - self.trial_disp[0]) / l;
-        let ky = (self.trial_disp[10] - self.trial_disp[4]) / l;
-        let kz = (self.trial_disp[11] - self.trial_disp[5]) / l;
 
         for gp in &mut self.gauss_points {
+            let b = Self::compute_b_matrix(gp.xi, l);
+            let eps0 = b[0][0] * self.trial_disp[0] + b[0][6] * self.trial_disp[6];
+            let ky = b[1][2] * self.trial_disp[2]
+                + b[1][4] * self.trial_disp[4]
+                + b[1][8] * self.trial_disp[8]
+                + b[1][10] * self.trial_disp[10];
+            let kz = b[2][1] * self.trial_disp[1]
+                + b[2][5] * self.trial_disp[5]
+                + b[2][7] * self.trial_disp[7]
+                + b[2][11] * self.trial_disp[11];
             for (i, fiber) in gp.section.fibers.iter().enumerate() {
                 let eps = eps0 - kz * fiber.y + ky * fiber.z;
                 let (sigma, et) = gp.mats[i].trial(eps);
@@ -275,38 +304,85 @@ impl ElementBehavior for FiberBeam {
     }
 
     fn mass_matrix(&self, opt: MassOption) -> LocalMat {
-        let m = self
+        let total_area: f64 = self
             .gauss_points
-            .iter()
-            .map(|gp| gp.section.fibers.iter().map(|f| f.area).sum::<f64>() * gp.weight)
-            .sum::<f64>()
-            * self.length
-            / 2.0;
-
-        let density = 1.0;
-        let total_mass = density * m;
+            .first()
+            .map(|gp| gp.section.fibers.iter().map(|f| f.area).sum())
+            .unwrap_or(0.0);
+        let total_mass = self.density * total_area * self.length;
         let mut mm = LocalMat::zeros(12);
         match opt {
             MassOption::Lumped => {
                 for d in [0, 1, 2, 6, 7, 8] {
-                    mm.set(d, d, total_mass / 6.0);
+                    mm.set(d, d, total_mass / 2.0);
                 }
             }
             MassOption::Consistent => {
-                let c2 = total_mass / 2.0;
-                mm.set(0, 0, c2);
-                mm.set(0, 6, total_mass / 6.0);
-                mm.set(6, 6, c2);
-                for d in [1, 2, 7, 8] {
-                    mm.set(d, d, c2);
-                }
+                let c1 = total_mass / 6.0;
+                let c2 = total_mass / 420.0;
+                let l = self.length;
+                let l2 = l * l;
+                mm.set(0, 0, 2.0 * c1);
+                mm.set(0, 6, 1.0 * c1);
+                mm.set(6, 0, 1.0 * c1);
+                mm.set(6, 6, 2.0 * c1);
+                let b4 = |mm: &mut LocalMat, i0: usize, j0: usize, sign: f64| {
+                    mm.set(i0, j0, 156.0 * c2);
+                    mm.set(i0, j0 + 1, 22.0 * l * c2 * sign);
+                    mm.set(i0, j0 + 2, 54.0 * c2);
+                    mm.set(i0, j0 + 3, -13.0 * l * c2 * sign);
+                    mm.set(i0 + 1, j0, 22.0 * l * c2 * sign);
+                    mm.set(i0 + 1, j0 + 1, 4.0 * l2 * c2);
+                    mm.set(i0 + 1, j0 + 2, 13.0 * l * c2 * sign);
+                    mm.set(i0 + 1, j0 + 3, -3.0 * l2 * c2);
+                    mm.set(i0 + 2, j0, 54.0 * c2);
+                    mm.set(i0 + 2, j0 + 1, 13.0 * l * c2 * sign);
+                    mm.set(i0 + 2, j0 + 2, 156.0 * c2);
+                    mm.set(i0 + 2, j0 + 3, -22.0 * l * c2 * sign);
+                    mm.set(i0 + 3, j0, -13.0 * l * c2 * sign);
+                    mm.set(i0 + 3, j0 + 1, -3.0 * l2 * c2);
+                    mm.set(i0 + 3, j0 + 2, -22.0 * l * c2 * sign);
+                    mm.set(i0 + 3, j0 + 3, 4.0 * l2 * c2);
+                };
+                b4(&mut mm, 1, 1, 1.0);
+                b4(&mut mm, 2, 2, -1.0);
             }
         }
         mm
     }
 
-    fn geometric_stiffness(&self, _n: f64) -> LocalMat {
-        LocalMat::zeros(12)
+    fn geometric_stiffness(&self, n: f64) -> LocalMat {
+        let l = self.length;
+        let c = n / l;
+        let mut kg = LocalMat::zeros(12);
+        let mut s = |i: usize, j: usize, v: f64| {
+            kg.set(i, j, v);
+            if i != j {
+                kg.set(j, i, v);
+            }
+        };
+        s(1, 1, c * 6.0 / 5.0);
+        s(7, 7, c * 6.0 / 5.0);
+        s(1, 7, -c * 6.0 / 5.0);
+        s(1, 5, c * l / 10.0);
+        s(1, 11, c * l / 10.0);
+        s(5, 7, -c * l / 10.0);
+        s(7, 11, -c * l / 10.0);
+        s(5, 5, c * 2.0 * l * l / 15.0);
+        s(11, 11, c * 2.0 * l * l / 15.0);
+        s(5, 11, -c * l * l / 30.0);
+        s(2, 2, c * 6.0 / 5.0);
+        s(8, 8, c * 6.0 / 5.0);
+        s(2, 8, -c * 6.0 / 5.0);
+        s(2, 4, -c * l / 10.0);
+        s(2, 10, -c * l / 10.0);
+        s(4, 8, c * l / 10.0);
+        s(8, 10, c * l / 10.0);
+        s(4, 4, c * 2.0 * l * l / 15.0);
+        s(10, 10, c * 2.0 * l * l / 15.0);
+        s(4, 10, -c * l * l / 30.0);
+        // 幾何剛性もグローバル系へ回転
+        self.axis.to_global(&kg)
     }
 
     fn snapshot_state(&self) -> Box<dyn Any> {
@@ -348,5 +424,738 @@ impl ElementBehavior for FiberBeam {
             }
         }
         self.trial_disp = self.committed_disp;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::behavior::Ctx;
+    use approx::assert_relative_eq;
+    use sc_core::ids::{ElemId, MaterialId, NodeId, SectionId};
+    use sc_core::model::{
+        ElementData, ElementKind, EndCondition, ForceRegime, LocalAxis, Material, Model, Node,
+        Section,
+    };
+
+    fn make_test_fiber_beam(shear_mod: Option<f64>) -> FiberBeam {
+        let model = build_test_model(shear_mod);
+        FiberBeam::new(&model.elements[0], &model)
+    }
+
+    fn make_test_beam_element(as_val: f64) -> crate::beam::BeamElement {
+        crate::beam::BeamElement {
+            id: ElemId(0),
+            e: 205000.0,
+            g: 78846.15,
+            a: 20000.0,
+            iy: 66666666.66666667,
+            iz: 16666666.66666667,
+            j: 0.0,
+            as_y: as_val,
+            as_z: as_val,
+            length: 3000.0,
+            density: 0.0,
+            nodes: [NodeId(0), NodeId(1)],
+            axis: crate::transform::LocalFrame {
+                rot: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+            },
+            rigid: crate::beam::RigidZone::default(),
+            end_cond: [EndCondition::Fixed, EndCondition::Fixed],
+            eval_sections: vec![],
+            section: None,
+            material: None,
+            committed_disp: [0.0; 12],
+        }
+    }
+
+    fn build_test_model(shear_mod: Option<f64>) -> Model {
+        Model {
+            nodes: vec![
+                Node {
+                    id: NodeId(0),
+                    coord: [0.0, 0.0, 0.0],
+                    restraint: Default::default(),
+                    mass: None,
+                    story: None,
+                },
+                Node {
+                    id: NodeId(1),
+                    coord: [3000.0, 0.0, 0.0],
+                    restraint: Default::default(),
+                    mass: None,
+                    story: None,
+                },
+            ],
+            elements: vec![ElementData {
+                id: ElemId(0),
+                kind: ElementKind::Fiber,
+                nodes: smallvec::smallvec![NodeId(0), NodeId(1)],
+                section: Some(SectionId(0)),
+                material: Some(MaterialId(0)),
+                local_axis: LocalAxis {
+                    ref_vector: [0.0, 1.0, 0.0],
+                },
+                end_cond: [EndCondition::Fixed, EndCondition::Fixed],
+                force_regime: ForceRegime::Auto,
+            }],
+            sections: vec![Section {
+                id: SectionId(0),
+                name: "test".to_string(),
+                area: 20000.0,
+                iy: 66666666.66666667,
+                iz: 16666666.66666667,
+                j: 0.0,
+                depth: 200.0,
+                width: 100.0,
+                as_y: 0.0,
+                as_z: 0.0,
+                panel_thickness: None,
+                thickness: None,
+            }],
+            materials: vec![Material {
+                id: MaterialId(0),
+                name: "steel".to_string(),
+                young: 205000.0,
+                poisson: 0.3,
+                density: 0.0,
+                shear: shear_mod,
+                fc: None,
+                fy: None,
+            }],
+            ..Default::default()
+        }
+    }
+
+    /// 指定した2節点座標・参照ベクトルで FiberBeam を生成するヘルパ（座標変換テスト用）。
+    fn make_oriented_fiber(p0: [f64; 3], p1: [f64; 3], ref_vec: [f64; 3]) -> FiberBeam {
+        let model = Model {
+            nodes: vec![
+                Node {
+                    id: NodeId(0),
+                    coord: p0,
+                    restraint: Default::default(),
+                    mass: None,
+                    story: None,
+                },
+                Node {
+                    id: NodeId(1),
+                    coord: p1,
+                    restraint: Default::default(),
+                    mass: None,
+                    story: None,
+                },
+            ],
+            elements: vec![ElementData {
+                id: ElemId(0),
+                kind: ElementKind::Fiber,
+                nodes: smallvec::smallvec![NodeId(0), NodeId(1)],
+                section: Some(SectionId(0)),
+                material: Some(MaterialId(0)),
+                local_axis: LocalAxis { ref_vector: ref_vec },
+                end_cond: [EndCondition::Fixed, EndCondition::Fixed],
+                force_regime: ForceRegime::Auto,
+            }],
+            sections: vec![Section {
+                id: SectionId(0),
+                name: "s".to_string(),
+                area: 20000.0,
+                iy: 66666666.66666667,
+                iz: 16666666.66666667,
+                j: 0.0,
+                depth: 200.0,
+                width: 100.0,
+                as_y: 0.0,
+                as_z: 0.0,
+                panel_thickness: None,
+                thickness: None,
+            }],
+            materials: vec![Material {
+                id: MaterialId(0),
+                name: "steel".to_string(),
+                young: 205000.0,
+                poisson: 0.3,
+                density: 0.0,
+                shear: Some(0.0),
+                fc: None,
+                fy: None,
+            }],
+            ..Default::default()
+        };
+        FiberBeam::new(&model.elements[0], &model)
+    }
+
+    /// 降伏応力 fy を指定した鋼材ファイバ梁（X 整列・恒等フレーム）を生成するヘルパ。
+    fn make_steel_fiber_with_fy(fy: Option<f64>) -> FiberBeam {
+        let model = Model {
+            nodes: vec![
+                Node {
+                    id: NodeId(0),
+                    coord: [0.0, 0.0, 0.0],
+                    restraint: Default::default(),
+                    mass: None,
+                    story: None,
+                },
+                Node {
+                    id: NodeId(1),
+                    coord: [3000.0, 0.0, 0.0],
+                    restraint: Default::default(),
+                    mass: None,
+                    story: None,
+                },
+            ],
+            elements: vec![ElementData {
+                id: ElemId(0),
+                kind: ElementKind::Fiber,
+                nodes: smallvec::smallvec![NodeId(0), NodeId(1)],
+                section: Some(SectionId(0)),
+                material: Some(MaterialId(0)),
+                local_axis: LocalAxis {
+                    ref_vector: [0.0, 1.0, 0.0],
+                },
+                end_cond: [EndCondition::Fixed, EndCondition::Fixed],
+                force_regime: ForceRegime::Auto,
+            }],
+            sections: vec![Section {
+                id: SectionId(0),
+                name: "s".to_string(),
+                area: 20000.0,
+                iy: 66666666.66666667,
+                iz: 16666666.66666667,
+                j: 0.0,
+                depth: 200.0,
+                width: 100.0,
+                as_y: 0.0,
+                as_z: 0.0,
+                panel_thickness: None,
+                thickness: None,
+            }],
+            materials: vec![Material {
+                id: MaterialId(0),
+                name: "steel".to_string(),
+                young: 205000.0,
+                poisson: 0.3,
+                density: 0.0,
+                shear: Some(0.0),
+                fc: None,
+                fy,
+            }],
+            ..Default::default()
+        };
+        FiberBeam::new(&model.elements[0], &model)
+    }
+
+    /// 降伏データ検証: Material.fy を与えた鋼材ファイバは、同一の大曲率変形に対して
+    /// 弾性材（fy 無し＝1e20）より小さい曲げ内力を示す（＝実際に降伏している）。
+    #[test]
+    fn test_fiber_steel_yields_with_fy() {
+        let ctx = Ctx {
+            model: &Model::default(),
+        };
+        // 端部 ry に十分大きな逆対称回転を与え、曲げで降伏させる。
+        let big = 0.1;
+        let du = LocalVec {
+            data: smallvec::smallvec![
+                0.0, 0.0, 0.0, 0.0, big, 0.0, 0.0, 0.0, 0.0, 0.0, -big, 0.0
+            ],
+        };
+
+        let mut yielding = make_steel_fiber_with_fy(Some(235.0));
+        yielding.update_state(&du, true, &ctx);
+        let f_y = yielding.internal_force(&ElemState::default(), &ctx);
+
+        let mut elastic = make_steel_fiber_with_fy(None);
+        elastic.update_state(&du, true, &ctx);
+        let f_e = elastic.internal_force(&ElemState::default(), &ctx);
+
+        // 曲げモーメント DOF(ry_i = index 4) で比較。降伏材は弾性材より明確に小さいこと。
+        assert!(
+            f_e.data[4].abs() > 1.0,
+            "elastic bending moment must be non-trivial (test sanity): {}",
+            f_e.data[4]
+        );
+        assert!(
+            f_y.data[4].abs() < f_e.data[4].abs() * 0.5,
+            "yielding moment {} should be well below elastic {} (fy plumbing inactive?)",
+            f_y.data[4],
+            f_e.data[4]
+        );
+    }
+
+    /// 座標変換の検証: 軸方向（X 整列）と鉛直柱（Z 整列）でグローバル接線剛性を比較し、
+    /// 軸剛性・曲げ剛性が正しいグローバル DOF へ写像されることを確認する。
+    /// 回転変換が欠落していると鉛直柱の水平 DOF に軸剛性が誤って現れる。
+    #[test]
+    fn test_global_rotation_vertical_column() {
+        let l = 3000.0;
+        let ctx = Ctx {
+            model: &Model::default(),
+        };
+        let zero_du = LocalVec {
+            data: SmallVec::from_elem(0.0, 12),
+        };
+        // X 整列（ref [0,1,0] で恒等フレーム）: local x = global X(軸), local y = global Y(曲げ)
+        let mut fx = make_oriented_fiber([0.0, 0.0, 0.0], [l, 0.0, 0.0], [0.0, 1.0, 0.0]);
+        fx.update_state(&zero_du, false, &ctx); // 初期接線（弾性係数）をキャッシュへ
+        let kx = fx.tangent_stiffness(&ElemState::default(), &ctx);
+        // Z 整列（鉛直柱, ref [1,0,0]）: local x = global Z(軸), local y = global X(曲げ)
+        let mut fz = make_oriented_fiber([0.0, 0.0, 0.0], [0.0, 0.0, l], [1.0, 0.0, 0.0]);
+        fz.update_state(&zero_du, false, &ctx);
+        let kz = fz.tangent_stiffness(&ElemState::default(), &ctx);
+
+        // 軸剛性: X 整列の ux_i (DOF0) == Z 整列の uz_i (DOF2)
+        assert_relative_eq!(kz.get(2, 2), kx.get(0, 0), epsilon = 1.0);
+        // 曲げ剛性: X 整列の uy_i (DOF1, local 曲げ) == Z 整列の ux_i (DOF0, local 曲げ)
+        assert_relative_eq!(kz.get(0, 0), kx.get(1, 1), epsilon = 1.0);
+        // 鉛直柱の水平 DOF は曲げ剛性（小）であって軸剛性（大）ではないこと
+        assert!(
+            kz.get(0, 0) < kz.get(2, 2),
+            "vertical column horizontal DOF must be bending (small), not axial (large): ux={}, uz={}",
+            kz.get(0, 0),
+            kz.get(2, 2)
+        );
+    }
+
+    #[test]
+    fn test_elastic_stiffness_matches_beam() {
+        let mut fiber = make_test_fiber_beam(Some(0.0));
+        let beam = make_test_beam_element(1e30);
+
+        let ctx = Ctx {
+            model: &build_test_model(Some(0.0)),
+        };
+        let state = ElemState::default();
+
+        let u = [
+            1.0, 0.5, 0.3, 0.0, 0.001, 0.002, -0.5, 0.2, -0.1, 0.0, 0.003, -0.001,
+        ];
+        let du = LocalVec {
+            data: SmallVec::from_slice(&u),
+        };
+        fiber.update_state(&du, true, &ctx);
+
+        let k_fiber = fiber.tangent_stiffness(&state, &ctx);
+        let k_beam = beam.local_stiffness_raw();
+
+        for i in 0..12 {
+            for j in 0..12 {
+                let expected = k_beam.get(i, j);
+                let actual = k_fiber.get(i, j);
+                if expected.abs() > 1e-6 {
+                    assert_relative_eq!(actual, expected, max_relative = 0.01);
+                } else {
+                    assert!(
+                        actual.abs() < 1e-3,
+                        "K[{i}][{j}] zero expected, got {actual}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_elastic_stiffness_symmetric() {
+        let mut fiber = make_test_fiber_beam(Some(0.0));
+        let ctx = Ctx {
+            model: &build_test_model(Some(0.0)),
+        };
+        let state = ElemState::default();
+
+        let u = [
+            1.0, 0.5, 0.3, 0.0, 0.001, 0.002, -0.5, 0.2, -0.1, 0.0, 0.003, -0.001,
+        ];
+        let du = LocalVec {
+            data: SmallVec::from_slice(&u),
+        };
+        fiber.update_state(&du, true, &ctx);
+
+        let k = fiber.tangent_stiffness(&state, &ctx);
+        for i in 0..12 {
+            for j in 0..12 {
+                assert!(
+                    (k.get(i, j) - k.get(j, i)).abs() < 1e-9,
+                    "K[{i}][{j}] != K[{j}][{i}]: {} vs {}",
+                    k.get(i, j),
+                    k.get(j, i)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_axial_response() {
+        let mut fiber = make_test_fiber_beam(Some(0.0));
+        let ctx = Ctx {
+            model: &build_test_model(Some(0.0)),
+        };
+        let state = ElemState::default();
+
+        let eps0 = 0.001;
+        let du = LocalVec {
+            data: SmallVec::from_slice(&[
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                eps0 * 3000.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+            ]),
+        };
+        fiber.update_state(&du, true, &ctx);
+
+        let f = fiber.internal_force(&state, &ctx);
+        let a_disc: f64 = fiber.gauss_points[0]
+            .section
+            .fibers
+            .iter()
+            .map(|f| f.area)
+            .sum();
+        let expected_n = eps0 * 205000.0 * a_disc;
+        assert_relative_eq!(f.data[0], -expected_n, epsilon = 1.0);
+        assert_relative_eq!(f.data[6], expected_n, epsilon = 1.0);
+    }
+
+    #[test]
+    fn test_pure_bending_mphi() {
+        let mut fiber = make_test_fiber_beam(Some(0.0));
+        let ctx = Ctx {
+            model: &build_test_model(Some(0.0)),
+        };
+        let state = ElemState::default();
+
+        let ky = 1e-6;
+        let du = LocalVec {
+            data: SmallVec::from_slice(&[
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                ky * 3000.0 / 2.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                -ky * 3000.0 / 2.0,
+                0.0,
+            ]),
+        };
+        fiber.update_state(&du, true, &ctx);
+
+        let f = fiber.internal_force(&state, &ctx);
+        let iy_disc: f64 = fiber.gauss_points[0]
+            .section
+            .fibers
+            .iter()
+            .map(|f| f.area * f.z * f.z)
+            .sum();
+        let expected_my = ky * 205000.0 * iy_disc;
+        assert_relative_eq!(f.data[4], expected_my, epsilon = 1.0);
+        assert_relative_eq!(f.data[10], -expected_my, epsilon = 1.0);
+    }
+
+    #[test]
+    fn test_n_m_interaction() {
+        let mut fiber = make_test_fiber_beam(Some(0.0));
+        let ctx = Ctx {
+            model: &build_test_model(Some(0.0)),
+        };
+        let state = ElemState::default();
+
+        let eps0 = 0.0005;
+        let ky = 1e-6;
+        let du = LocalVec {
+            data: SmallVec::from_slice(&[
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                ky * 3000.0 / 2.0,
+                0.0,
+                eps0 * 3000.0,
+                0.0,
+                0.0,
+                0.0,
+                -ky * 3000.0 / 2.0,
+                0.0,
+            ]),
+        };
+        fiber.update_state(&du, true, &ctx);
+
+        let f = fiber.internal_force(&state, &ctx);
+        let a_disc: f64 = fiber.gauss_points[0]
+            .section
+            .fibers
+            .iter()
+            .map(|f| f.area)
+            .sum();
+        let iy_disc: f64 = fiber.gauss_points[0]
+            .section
+            .fibers
+            .iter()
+            .map(|f| f.area * f.z * f.z)
+            .sum();
+        let expected_n = eps0 * 205000.0 * a_disc;
+        let expected_my = ky * 205000.0 * iy_disc;
+        assert_relative_eq!(f.data[0], -expected_n, epsilon = 1.0);
+        assert_relative_eq!(f.data[4], expected_my, epsilon = 1.0);
+    }
+
+    #[test]
+    fn test_yield_progression() {
+        let mut fiber = {
+            let model = Model {
+                nodes: vec![
+                    Node {
+                        id: NodeId(0),
+                        coord: [0.0, 0.0, 0.0],
+                        restraint: Default::default(),
+                        mass: None,
+                        story: None,
+                    },
+                    Node {
+                        id: NodeId(1),
+                        coord: [3000.0, 0.0, 0.0],
+                        restraint: Default::default(),
+                        mass: None,
+                        story: None,
+                    },
+                ],
+                elements: vec![ElementData {
+                    id: ElemId(0),
+                    kind: ElementKind::Fiber,
+                    nodes: smallvec::smallvec![NodeId(0), NodeId(1)],
+                    section: Some(SectionId(0)),
+                    material: Some(MaterialId(0)),
+                    local_axis: LocalAxis {
+                        ref_vector: [0.0, 1.0, 0.0],
+                    },
+                    end_cond: [EndCondition::Fixed, EndCondition::Fixed],
+                    force_regime: ForceRegime::Auto,
+                }],
+                sections: vec![Section {
+                    id: SectionId(0),
+                    name: "yield_test".to_string(),
+                    area: 20000.0,
+                    iy: 66666666.66666667,
+                    iz: 16666666.66666667,
+                    j: 0.0,
+                    depth: 200.0,
+                    width: 100.0,
+                    as_y: 0.0,
+                    as_z: 0.0,
+                    panel_thickness: None,
+                    thickness: None,
+                }],
+                materials: vec![Material {
+                    id: MaterialId(0),
+                    name: "steel".to_string(),
+                    young: 205000.0,
+                    poisson: 0.3,
+                    density: 0.0,
+                    shear: Some(0.0),
+                    fc: None,
+                    fy: None,
+                }],
+                ..Default::default()
+            };
+            FiberBeam::new(&model.elements[0], &model)
+        };
+
+        let ctx = Ctx {
+            model: &Model::default(),
+        };
+        let state = ElemState::default();
+
+        let eps_y = 235.0 / 205000.0;
+        let z_max = 100.0;
+        let ky_y = eps_y / z_max;
+        let ky_final = ky_y * 3.0;
+
+        let mut last_my = 0.0;
+        let n_steps = 50;
+        let mut prev_ky = 0.0;
+        for i in 1..=n_steps {
+            let ky_curr = ky_final * (i as f64) / (n_steps as f64);
+            let dky = ky_curr - prev_ky;
+            prev_ky = ky_curr;
+            let du = LocalVec {
+                data: SmallVec::from_slice(&[
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    dky * 3000.0 / 2.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    -dky * 3000.0 / 2.0,
+                    0.0,
+                ]),
+            };
+            fiber.update_state(&du, true, &ctx);
+
+            let f = fiber.internal_force(&state, &ctx);
+            last_my = f.data[4];
+        }
+
+        let iy_disc: f64 = fiber.gauss_points[0]
+            .section
+            .fibers
+            .iter()
+            .map(|f| f.area * f.z * f.z)
+            .sum();
+        let elastic_pred = ky_final * 205000.0 * iy_disc;
+        assert!(
+            last_my < elastic_pred,
+            "post-yield My ({}) must be below elastic prediction ({})",
+            last_my,
+            elastic_pred
+        );
+    }
+
+    #[test]
+    fn test_commit_revert() {
+        let mut fiber = make_test_fiber_beam(Some(0.0));
+        let ctx = Ctx {
+            model: &build_test_model(Some(0.0)),
+        };
+
+        let du = LocalVec {
+            data: SmallVec::from_slice(&[
+                0.0, 0.0, 0.0, 0.0, 0.001, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+            ]),
+        };
+
+        fiber.update_state(&du, false, &ctx);
+        assert_relative_eq!(fiber.trial_disp[4], 0.001, epsilon = 1e-12);
+        assert_relative_eq!(fiber.committed_disp[4], 0.0, epsilon = 1e-12);
+        fiber.revert_state();
+        assert_relative_eq!(fiber.trial_disp[4], 0.0, epsilon = 1e-12);
+        assert_relative_eq!(fiber.committed_disp[4], 0.0, epsilon = 1e-12);
+
+        fiber.update_state(&du, false, &ctx);
+        fiber.commit_state();
+        assert_relative_eq!(fiber.trial_disp[4], 0.001, epsilon = 1e-12);
+        assert_relative_eq!(fiber.committed_disp[4], 0.001, epsilon = 1e-12);
+
+        let du2 = LocalVec {
+            data: SmallVec::from_slice(&[
+                0.0, 0.0, 0.0, 0.0, 0.002, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+            ]),
+        };
+        fiber.update_state(&du2, false, &ctx);
+        assert_relative_eq!(fiber.trial_disp[4], 0.003, epsilon = 1e-12);
+        fiber.revert_state();
+        assert_relative_eq!(fiber.trial_disp[4], 0.001, epsilon = 1e-12);
+        assert_relative_eq!(fiber.committed_disp[4], 0.001, epsilon = 1e-12);
+    }
+
+    #[test]
+    fn test_snapshot_restore() {
+        let mut fiber = make_test_fiber_beam(Some(0.0));
+        let ctx = Ctx {
+            model: &build_test_model(Some(0.0)),
+        };
+
+        let du = LocalVec {
+            data: SmallVec::from_slice(&[
+                0.0, 0.0, 0.0, 0.0, 0.001, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+            ]),
+        };
+        fiber.update_state(&du, true, &ctx);
+        let snap = fiber.snapshot_state();
+
+        let du2 = LocalVec {
+            data: SmallVec::from_slice(&[
+                0.0, 0.0, 0.0, 0.0, 0.002, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+            ]),
+        };
+        fiber.update_state(&du2, false, &ctx);
+        assert_relative_eq!(fiber.trial_disp[4], 0.003, epsilon = 1e-12);
+
+        fiber.restore_state(&*snap);
+        assert_relative_eq!(fiber.trial_disp[4], 0.001, epsilon = 1e-12);
+        assert_relative_eq!(fiber.committed_disp[4], 0.001, epsilon = 1e-12);
+    }
+
+    #[test]
+    fn test_geometric_stiffness() {
+        let fiber = make_test_fiber_beam(Some(0.0));
+        let n = 100000.0;
+        let kg = fiber.geometric_stiffness(n);
+        let l = fiber.length;
+        let c = n / l;
+        assert_relative_eq!(kg.get(1, 1), c * 6.0 / 5.0, epsilon = 1e-9);
+        assert_relative_eq!(kg.get(5, 5), c * 2.0 * l * l / 15.0, epsilon = 1e-9);
+        assert_relative_eq!(kg.get(4, 4), c * 2.0 * l * l / 15.0, epsilon = 1e-9);
+        assert_relative_eq!(kg.get(2, 4), -c * l / 10.0, epsilon = 1e-9);
+    }
+
+    #[test]
+    fn test_internal_force_zero_at_zero_disp() {
+        let fiber = make_test_fiber_beam(None);
+        let f = fiber.internal_force(
+            &ElemState::default(),
+            &Ctx {
+                model: &Model::default(),
+            },
+        );
+        for v in f.data.iter() {
+            assert!(v.abs() < 1e-12, "zero disp should give zero force, got {v}");
+        }
+    }
+
+    #[test]
+    fn test_fiber_section_area_matches_section() {
+        let fiber = make_test_fiber_beam(None);
+        let a_disc: f64 = fiber.gauss_points[0]
+            .section
+            .fibers
+            .iter()
+            .map(|f| f.area)
+            .sum();
+        let expected = 100.0 * 200.0;
+        assert_relative_eq!(a_disc, expected, max_relative = 0.01);
+    }
+
+    #[test]
+    fn test_update_state_trial_stress_nonzero() {
+        let mut fiber = make_test_fiber_beam(Some(0.0));
+        let ctx = Ctx {
+            model: &build_test_model(Some(0.0)),
+        };
+
+        let du = LocalVec {
+            data: SmallVec::from_slice(&[
+                0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.1, 0.0, 0.0, 0.0, 0.0, 0.0,
+            ]),
+        };
+        fiber.update_state(&du, false, &ctx);
+
+        for gp in &fiber.gauss_points {
+            for &s in &gp.trial_stress {
+                assert!(
+                    s.abs() > 0.0,
+                    "trial_stress should be nonzero after axial disp"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_different_gp_have_independent_mats() {
+        let fiber = make_test_fiber_beam(Some(0.0));
+        let gp0_ptr = &fiber.gauss_points[0].mats[0] as *const _;
+        let gp1_ptr = &fiber.gauss_points[1].mats[0] as *const _;
+        assert_ne!(gp0_ptr, gp1_ptr, "GP mats must be independent instances");
     }
 }

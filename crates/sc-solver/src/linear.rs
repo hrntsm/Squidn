@@ -152,6 +152,7 @@ mod tests {
                 density: 0.0,
                 shear: None,
                 fc: None,
+                fy: None,
             }],
             load_cases: vec![LoadCase {
                 id: LoadCaseId(1),
@@ -252,6 +253,83 @@ mod tests {
     }
 
     #[test]
+    fn test_linear_static_vertical_cantilever_bending() {
+        // 鉛直柱: (0,0,0)固定 → (0,0,1000)自由。頂部に水平荷重 P=1000 (global X)。
+        // 座標変換が正しく適用されれば曲げ片持ち応答 δx ≈ PL³/3E·Iz + せん断 ≈ 333,364。
+        // 回転変換が欠落していると軸剛性を誤用して δx≈10 になる（回帰防止）。
+        let model = Model {
+            nodes: vec![
+                Node {
+                    id: NodeId(0),
+                    coord: [0.0, 0.0, 0.0],
+                    restraint: Dof6Mask::FIXED,
+                    mass: None,
+                    story: None,
+                },
+                Node {
+                    id: NodeId(1),
+                    coord: [0.0, 0.0, 1000.0],
+                    restraint: Dof6Mask::FREE,
+                    mass: None,
+                    story: None,
+                },
+            ],
+            elements: vec![ElementData {
+                id: ElemId(0),
+                kind: ElementKind::Beam,
+                nodes: smallvec::smallvec![NodeId(0), NodeId(1)],
+                section: Some(SectionId(0)),
+                material: Some(MaterialId(0)),
+                local_axis: LocalAxis {
+                    ref_vector: [1.0, 0.0, 0.0],
+                },
+                end_cond: [EndCondition::Fixed, EndCondition::Fixed],
+                force_regime: ForceRegime::Auto,
+            }],
+            sections: vec![Section {
+                id: SectionId(0),
+                name: "sec".to_string(),
+                area: 100.0,
+                iy: 1000.0,
+                iz: 1000.0,
+                j: 100.0,
+                depth: 100.0,
+                width: 100.0,
+                as_y: 83.33,
+                as_z: 83.33,
+                panel_thickness: None,
+                thickness: None,
+            }],
+            materials: vec![Material {
+                id: MaterialId(0),
+                name: "mat".to_string(),
+                young: 1000.0,
+                poisson: 0.3,
+                density: 0.0,
+                shear: None,
+                fc: None,
+                fy: None,
+            }],
+            load_cases: vec![LoadCase {
+                id: LoadCaseId(1),
+                name: "h".to_string(),
+                nodal: vec![NodalLoad {
+                    node: NodeId(1),
+                    values: [1000.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                }],
+            }],
+            ..Default::default()
+        };
+        let result = linear_static_once(&model, LoadCaseId(1)).unwrap();
+        let ux = result.disp[1][0];
+        // 曲げ主成分 333,333 + せん断 ~31。軸剛性誤用(=10)を確実に弾く帯域で判定。
+        assert!(
+            (333_000.0..=334_000.0).contains(&ux),
+            "vertical cantilever tip ux={ux} (expected ~333,364 bending; got axial ~10 means rotation missing)"
+        );
+    }
+
+    #[test]
     fn test_linear_static_shell_element() {
         // Cantilever plate: bottom edge fixed (nodes 0,1), top edge free (nodes 2,3)
         let model = Model {
@@ -320,6 +398,7 @@ mod tests {
                 density: 0.0,
                 shear: None,
                 fc: None,
+                fy: None,
             }],
             load_cases: vec![LoadCase {
                 id: LoadCaseId(1),
@@ -533,6 +612,7 @@ mod tests {
                 density: 0.0,
                 shear: None,
                 fc: None,
+                fy: None,
             }],
             load_cases: vec![LoadCase {
                 id: LoadCaseId(1),
@@ -618,6 +698,7 @@ mod tests {
                 density: 0.0,
                 shear: None,
                 fc: None,
+                fy: None,
             }],
             load_cases: vec![LoadCase {
                 id: LoadCaseId(1),
@@ -720,6 +801,7 @@ mod tests {
                 density: 0.0,
                 shear: None,
                 fc: None,
+                fy: None,
             }],
             stories: vec![Story {
                 id: StoryId(0),
