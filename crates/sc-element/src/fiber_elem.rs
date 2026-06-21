@@ -464,7 +464,7 @@ mod tests {
             axis: crate::transform::LocalFrame {
                 rot: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
             },
-            rigid: crate::beam::RigidZone::default(),
+            rigid: sc_core::model::RigidZone::default(),
             end_cond: [EndCondition::Fixed, EndCondition::Fixed],
             eval_sections: vec![],
             section: None,
@@ -502,6 +502,7 @@ mod tests {
                 },
                 end_cond: [EndCondition::Fixed, EndCondition::Fixed],
                 force_regime: ForceRegime::Auto,
+                rigid_zone: Default::default(),
             }],
             sections: vec![Section {
                 id: SectionId(0),
@@ -559,6 +560,7 @@ mod tests {
                 local_axis: LocalAxis { ref_vector: ref_vec },
                 end_cond: [EndCondition::Fixed, EndCondition::Fixed],
                 force_regime: ForceRegime::Auto,
+                rigid_zone: Default::default(),
             }],
             sections: vec![Section {
                 id: SectionId(0),
@@ -619,6 +621,7 @@ mod tests {
                 },
                 end_cond: [EndCondition::Fixed, EndCondition::Fixed],
                 force_regime: ForceRegime::Auto,
+                rigid_zone: Default::default(),
             }],
             sections: vec![Section {
                 id: SectionId(0),
@@ -942,6 +945,7 @@ mod tests {
                     },
                     end_cond: [EndCondition::Fixed, EndCondition::Fixed],
                     force_regime: ForceRegime::Auto,
+                    rigid_zone: Default::default(),
                 }],
                 sections: vec![Section {
                     id: SectionId(0),

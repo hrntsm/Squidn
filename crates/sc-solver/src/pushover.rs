@@ -734,6 +734,7 @@ mod tests {
                 },
                 end_cond: [EndCondition::Fixed, EndCondition::Fixed],
                 force_regime: ForceRegime::Auto,
+                rigid_zone: Default::default(),
             }],
             sections: vec![Section {
                 id: SectionId(0),
@@ -885,8 +886,8 @@ mod tests {
                 Node { id: NodeId(2), coord: [0.0, 0.0, 6000.0], restraint: Dof6Mask::FREE, mass: None, story: Some(StoryId(1)) },
             ],
             elements: vec![
-                ElementData { id: ElemId(0), kind: ElementKind::Fiber, nodes: smallvec::smallvec![NodeId(0), NodeId(1)], section: Some(SectionId(0)), material: Some(MaterialId(0)), local_axis: LocalAxis { ref_vector: [1.0, 0.0, 0.0] }, end_cond: [EndCondition::Fixed, EndCondition::Fixed], force_regime: ForceRegime::Auto },
-                ElementData { id: ElemId(1), kind: ElementKind::Fiber, nodes: smallvec::smallvec![NodeId(1), NodeId(2)], section: Some(SectionId(0)), material: Some(MaterialId(0)), local_axis: LocalAxis { ref_vector: [1.0, 0.0, 0.0] }, end_cond: [EndCondition::Fixed, EndCondition::Fixed], force_regime: ForceRegime::Auto },
+                ElementData { id: ElemId(0), kind: ElementKind::Fiber, nodes: smallvec::smallvec![NodeId(0), NodeId(1)], section: Some(SectionId(0)), material: Some(MaterialId(0)), local_axis: LocalAxis { ref_vector: [1.0, 0.0, 0.0] }, end_cond: [EndCondition::Fixed, EndCondition::Fixed], force_regime: ForceRegime::Auto, rigid_zone: Default::default() },
+                ElementData { id: ElemId(1), kind: ElementKind::Fiber, nodes: smallvec::smallvec![NodeId(1), NodeId(2)], section: Some(SectionId(0)), material: Some(MaterialId(0)), local_axis: LocalAxis { ref_vector: [1.0, 0.0, 0.0] }, end_cond: [EndCondition::Fixed, EndCondition::Fixed], force_regime: ForceRegime::Auto, rigid_zone: Default::default() },
             ],
             sections: vec![sec],
             materials: vec![mat],
