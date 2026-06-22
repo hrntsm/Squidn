@@ -65,6 +65,9 @@
 | 20 | 部材履歴則（武田・原点指向・スリップ） | sc-material | hysteresis.rs | `tests/hysteresis_snapshots.rs`/`tests/uniaxial_snapshots.rs` | P4 | ✅ |
 | 21 | ファイバ断面（M–φ 積分） | sc-section | fiber.rs | `test_section_*` | P4 | ✅ |
 | 22 | スケルトン自動算定（M–φ→M–θ） | sc-skeleton | lib.rs | `test_rc_skeleton_*` | P4 | ✅ |
+| 23 | MCP サーバ（rmcp） | sc-mcp | lib.rs | — | P8 | ❌ |
+| 24 | ST-Bridge 入出力 | sc-io | stbridge.rs | — | P8 | ❌ |
+| 25 | 編集トランザクション（EditCommand/Undo） | sc-edit | lib.rs | `test_*` | P3/P8 | ✅ |
 
 凡例: ✅ 実装済み・🔶 一部実装（要拡張）・❌ 未実装
 
@@ -74,6 +77,11 @@
 > `p7` を default feature 化（rot 再発防止）。残るは原典照合（RankCriteria 等）と偏心率精算のため 🔶。
 > #10: Ai 層せん断 `qi` が `Ci·単層重量` の重大バグだった（正: `Ci·累積重量`）。地震荷重が最上層に
 > 偏り基部せん断が過小だった。P7 フォローアップで修正（`test_story_shear_uses_cumulative_weight`）。
+> P8（操作・連携）の監査結果は `docs/v_and_v/p8_review.md` を参照。
+> #23: MCP は「実装」コミット済みだが `--features mcp` で **13 エラーでコンパイル不能**（rmcp 1.7 API
+> rot＋`ResultStore`/`EditCommand` が Send でない）。ツールも `model_query` が常に空を返す等スタブ。❌。
+> #24: ST-Bridge は import/export とも "not yet implemented" を返すのみ。❌。
+> #25: `sc-edit` の EditCommand/UndoStack は P3 で実装済み・健全（MCP からの利用は未配線）。
 > P4（材料・断面）の監査結果は `docs/v_and_v/p4_review.md` を参照。
 > #19: 包絡線（軟化・接線符号・連続性）・ひび割れ判定・MP 反転検知/ξ 更新を修正し、単軸履歴則 insta スナップショット追加で ✅。
 > #20: 武田・原点指向・スリップに `UniaxialMaterial`(trial/commit/revert) を実装。武田内側ルール（ポリゴン則）・TakedaDegrading（ピーク劣化）を本格化。insta スナップショットでループ固定し ✅。
