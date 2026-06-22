@@ -457,6 +457,49 @@ impl ElementBehavior for FiberBeam {
         }
         self.trial_disp = self.committed_disp;
     }
+
+    fn serialize_checkpoint(&self) -> Vec<u8> {
+        #[derive(serde::Serialize, serde::Deserialize)]
+        struct FiberBeamCheckpoint {
+            trial_disp: [f64; 12],
+            committed_disp: [f64; 12],
+            gauss_points: Vec<Vec<Vec<u8>>>,
+        }
+        let gauss_points: Vec<Vec<Vec<u8>>> = self
+            .gauss_points
+            .iter()
+            .map(|gp| {
+                gp.mats
+                    .iter()
+                    .map(|m| m.serialize_state())
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        let cp = FiberBeamCheckpoint {
+            trial_disp: self.trial_disp,
+            committed_disp: self.committed_disp,
+            gauss_points,
+        };
+        bincode::serialize(&cp).expect("serialize checkpoint")
+    }
+
+    fn deserialize_checkpoint(&mut self, data: &[u8]) {
+        #[derive(serde::Serialize, serde::Deserialize)]
+        struct FiberBeamCheckpoint {
+            trial_disp: [f64; 12],
+            committed_disp: [f64; 12],
+            gauss_points: Vec<Vec<Vec<u8>>>,
+        }
+        if let Ok(cp) = bincode::deserialize::<FiberBeamCheckpoint>(data) {
+            self.trial_disp = cp.trial_disp;
+            self.committed_disp = cp.committed_disp;
+            for (gp, gp_mats) in self.gauss_points.iter_mut().zip(cp.gauss_points) {
+                for (mat, mat_bytes) in gp.mats.iter_mut().zip(gp_mats) {
+                    mat.deserialize_state(&mat_bytes);
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1377,5 +1420,37 @@ mod tests {
         );
         // ねじり剛性が回転後も正しく伝わっていることの緩い確認
         let _ = expected_kt;
+    }
+
+    #[test]
+    fn test_fiber_beam_checkpoint_roundtrip() {
+        let mut fiber = make_test_fiber_beam(Some(0.0));
+        let ctx = Ctx {
+            model: &build_test_model(Some(0.0)),
+        };
+        let du = LocalVec {
+            data: SmallVec::from_slice(&[
+                0.0, 0.0, 0.0, 0.0, 0.001, 0.0, 0.0, 0.0, 0.0, 0.0, -0.0005, 0.0,
+            ]),
+        };
+        fiber.update_state(&du, true, &ctx);
+
+        let snap_before = fiber.snapshot_state();
+        let checkpoint = fiber.serialize_checkpoint();
+
+        let mut restored = make_test_fiber_beam(Some(0.0));
+        restored.deserialize_checkpoint(&checkpoint);
+        let snap_after = restored.snapshot_state();
+
+        let before = snap_before
+            .downcast_ref::<([f64; 12], [f64; 12], Vec<Vec<Box<dyn UniaxialMaterial>>>)>()
+            .unwrap();
+        let after = snap_after
+            .downcast_ref::<([f64; 12], [f64; 12], Vec<Vec<Box<dyn UniaxialMaterial>>>)>()
+            .unwrap();
+        for i in 0..12 {
+            assert_relative_eq!(before.0[i], after.0[i], epsilon = 1e-12);
+            assert_relative_eq!(before.1[i], after.1[i], epsilon = 1e-12);
+        }
     }
 }

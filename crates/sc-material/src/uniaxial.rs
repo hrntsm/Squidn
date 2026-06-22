@@ -16,13 +16,17 @@ pub trait UniaxialMaterial: Send + Sync + Debug {
     /// 非線形履歴では各ファイバが独自の履歴変数を持つ必要があるため、
     /// 共有状態だと履歴が混入して破綮する（設計書 §6.3）。
     fn clone_box(&self) -> Box<dyn UniaxialMaterial>;
+    /// チェックポイント用: 材料の全状態をバイト列へ直列化
+    fn serialize_state(&self) -> Vec<u8>;
+    /// チェックポイント用: バイト列から材料状態を復元
+    fn deserialize_state(&mut self, data: &[u8]);
 }
 
 // ──────────────────────────── バイリニア鋼材 ────────────────────────────
 
 /// バイリニア鋼材（弾性＋線形硬化＝kinematic hardening）。
 /// 降伏点 fy [N/mm²]、ヤング率 e [N/mm²]、hardening = ひずみ硬化比（降伏後接線 = hardening·e）。
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct Bilinear {
     pub e: f64,
     pub fy: f64,
@@ -31,7 +35,7 @@ pub struct Bilinear {
     trial: BilinearState,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 #[allow(dead_code)]
 struct BilinearState {
     strain: f64,
@@ -117,13 +121,23 @@ impl UniaxialMaterial for Bilinear {
     fn clone_box(&self) -> Box<dyn UniaxialMaterial> {
         Box::new(self.clone())
     }
+
+    fn serialize_state(&self) -> Vec<u8> {
+        bincode::serialize(self).expect("material serialize")
+    }
+
+    fn deserialize_state(&mut self, data: &[u8]) {
+        if let Ok(de) = bincode::deserialize::<Self>(data) {
+            *self = de;
+        }
+    }
 }
 
 // ──────────────────────────── Menegotto–Pinto 鉄筋 ────────────────────────────
 
 /// Menegotto–Pinto モデル（バウシンガー効果を滑らかに表現）。
 /// 仕様書 §4 の正規化形。反転点 (εr,σr)・漸近線交点 (ε0,σ0)・ξ を状態に保持。
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct MenegottoPinto {
     pub e: f64,
     pub fy: f64,
@@ -135,7 +149,7 @@ pub struct MenegottoPinto {
     trial: MpState,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 struct MpState {
     strain: f64,
     stress: f64,
@@ -266,6 +280,16 @@ impl UniaxialMaterial for MenegottoPinto {
     fn clone_box(&self) -> Box<dyn UniaxialMaterial> {
         Box::new(self.clone())
     }
+
+    fn serialize_state(&self) -> Vec<u8> {
+        bincode::serialize(self).expect("material serialize")
+    }
+
+    fn deserialize_state(&mut self, data: &[u8]) {
+        if let Ok(de) = bincode::deserialize::<Self>(data) {
+            *self = de;
+        }
+    }
 }
 
 // ──────────────────────────── コンクリートモデル ────────────────────────────
@@ -276,7 +300,7 @@ impl UniaxialMaterial for MenegottoPinto {
 /// 除荷・再載荷は原点指向（最大経験ひずみへの割線）。
 ///
 /// 単位: fc/ft [N/mm²], ec0/ecu [ひずみ(負)], tension_stiffening/residual_ratio [無次元]。
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct Concrete {
     pub fc: f64,
     pub ec0: f64,
@@ -288,7 +312,7 @@ pub struct Concrete {
     trial: ConcreteState,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 #[allow(dead_code)]
 struct ConcreteState {
     strain: f64,
@@ -455,6 +479,16 @@ impl UniaxialMaterial for Concrete {
 
     fn clone_box(&self) -> Box<dyn UniaxialMaterial> {
         Box::new(self.clone())
+    }
+
+    fn serialize_state(&self) -> Vec<u8> {
+        bincode::serialize(self).expect("material serialize")
+    }
+
+    fn deserialize_state(&mut self, data: &[u8]) {
+        if let Ok(de) = bincode::deserialize::<Self>(data) {
+            *self = de;
+        }
     }
 }
 

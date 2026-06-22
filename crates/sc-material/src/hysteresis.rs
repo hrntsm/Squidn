@@ -213,7 +213,7 @@ fn bilinear_symmetric(theta: f64, ty: f64, my: f64, tu: f64, mu: f64) -> (f64, f
 }
 
 /// 履歴則の内部状態（runtime。シリアライズ対象外）。
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 struct HystState {
     theta: f64,
     m: f64,
@@ -240,7 +240,7 @@ impl HystState {
     }
 }
 
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 enum Branch {
     #[default]
     Skeleton,
@@ -264,7 +264,7 @@ enum Branch {
 
 /// 履歴則パラメータ + 状態を持つ `UniaxialMaterial`（設計書 §6.8 集中ばね用）。
 /// `trial(theta) -> (M, Kt)`。`theta` は M-θ では回転角[rad]、Q-δ では変位[mm]。
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct HysteresisMaterial {
     pub rule: HysteresisRule,
     committed: HystState,
@@ -558,6 +558,16 @@ impl UniaxialMaterial for HysteresisMaterial {
     }
     fn clone_box(&self) -> Box<dyn UniaxialMaterial> {
         Box::new(self.clone())
+    }
+
+    fn serialize_state(&self) -> Vec<u8> {
+        bincode::serialize(self).expect("material serialize")
+    }
+
+    fn deserialize_state(&mut self, data: &[u8]) {
+        if let Ok(de) = bincode::deserialize::<Self>(data) {
+            *self = de;
+        }
     }
 }
 

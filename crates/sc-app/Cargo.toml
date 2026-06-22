@@ -5,7 +5,7 @@ edition = "2021"
 
 [features]
 default = []
-gui = ["egui", "eframe", "egui_extras"]
+gui = ["egui", "eframe", "egui_extras", "egui_plot"]
 
 [[bin]]
 name = "structcalc"
@@ -22,4 +22,5 @@ sc-load = { path = "../sc-load" }
 egui = { workspace = true, optional = true }
 eframe = { workspace = true, optional = true }
 egui_extras = { workspace = true, optional = true }
+egui_plot = { workspace = true, optional = true }
 smallvec = { workspace = true }

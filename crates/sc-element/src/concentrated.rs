@@ -292,6 +292,47 @@ impl ElementBehavior for ConcentratedSpringBeam {
         self.trial_rot_i = self.rot_i;
         self.trial_rot_j = self.rot_j;
     }
+
+    fn serialize_checkpoint(&self) -> Vec<u8> {
+        #[derive(serde::Serialize, serde::Deserialize)]
+        struct ConcentratedSpringCheckpoint {
+            rot_i: f64,
+            rot_j: f64,
+            trial_rot_i: f64,
+            trial_rot_j: f64,
+            spring_i: Vec<u8>,
+            spring_j: Vec<u8>,
+        }
+        let cp = ConcentratedSpringCheckpoint {
+            rot_i: self.rot_i,
+            rot_j: self.rot_j,
+            trial_rot_i: self.trial_rot_i,
+            trial_rot_j: self.trial_rot_j,
+            spring_i: self.spring_i.serialize_state(),
+            spring_j: self.spring_j.serialize_state(),
+        };
+        bincode::serialize(&cp).expect("serialize checkpoint")
+    }
+
+    fn deserialize_checkpoint(&mut self, data: &[u8]) {
+        #[derive(serde::Serialize, serde::Deserialize)]
+        struct ConcentratedSpringCheckpoint {
+            rot_i: f64,
+            rot_j: f64,
+            trial_rot_i: f64,
+            trial_rot_j: f64,
+            spring_i: Vec<u8>,
+            spring_j: Vec<u8>,
+        }
+        if let Ok(cp) = bincode::deserialize::<ConcentratedSpringCheckpoint>(data) {
+            self.rot_i = cp.rot_i;
+            self.rot_j = cp.rot_j;
+            self.trial_rot_i = cp.trial_rot_i;
+            self.trial_rot_j = cp.trial_rot_j;
+            self.spring_i.deserialize_state(&cp.spring_i);
+            self.spring_j.deserialize_state(&cp.spring_j);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -570,5 +611,38 @@ mod tests {
         for &dof in &[3, 5, 9, 11] {
             assert_relative_eq!(k_soft.get(dof, dof), k_stiff.get(dof, dof), epsilon = 1.0);
         }
+    }
+
+    #[test]
+    fn test_concentrated_spring_checkpoint_roundtrip() {
+        let mut elem = make_test_element();
+        let ctx = Ctx {
+            model: &sc_core::model::Model::default(),
+        };
+        let du = LocalVec {
+            data: smallvec::smallvec![
+                0.0, 0.0, 0.0, 0.0, 0.001, 0.0, 0.0, 0.0, 0.0, 0.0, -0.0005, 0.0
+            ],
+        };
+        elem.update_state(&du, true, &ctx);
+
+        let snap_before = elem.snapshot_state();
+        let checkpoint = elem.serialize_checkpoint();
+
+        let mut restored = make_test_element();
+        restored.deserialize_checkpoint(&checkpoint);
+        let snap_after = restored.snapshot_state();
+
+        // スナップショットの型で比較（Vec<Box<dyn UniaxialMaterial>>, f64, f64, f64, f64）
+        let before = snap_before
+            .downcast_ref::<(Vec<Box<dyn UniaxialMaterial>>, f64, f64, f64, f64)>()
+            .unwrap();
+        let after = snap_after
+            .downcast_ref::<(Vec<Box<dyn UniaxialMaterial>>, f64, f64, f64, f64)>()
+            .unwrap();
+        assert_relative_eq!(before.1, after.1, epsilon = 1e-12);
+        assert_relative_eq!(before.2, after.2, epsilon = 1e-12);
+        assert_relative_eq!(before.3, after.3, epsilon = 1e-12);
+        assert_relative_eq!(before.4, after.4, epsilon = 1e-12);
     }
 }

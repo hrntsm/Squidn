@@ -90,4 +90,10 @@ pub trait ElementBehavior {
     fn commit_state(&mut self) {}
     /// T4: 全材料の trial を committed に戻す（rollback）
     fn revert_state(&mut self) {}
+    /// チェックポイント用: 要素の全状態をバイト列へ直列化
+    fn serialize_checkpoint(&self) -> Vec<u8> {
+        vec![]
+    }
+    /// チェックポイント用: バイト列から要素状態を復元
+    fn deserialize_checkpoint(&mut self, _data: &[u8]) {}
 }

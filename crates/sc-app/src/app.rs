@@ -10,6 +10,7 @@ pub enum Tab {
     Loads,
     Viewer,
     Design,
+    TimeHistory,
 }
 
 #[derive(Default)]
@@ -53,6 +54,12 @@ pub struct App {
     pub camera: crate::viewer::CameraState,
     /// 床荷重分配の CMQ 結果（P2 §5.1）。描画用。
     pub beam_loads: Vec<sc_load::floor::BeamLoad>,
+    /// 時刻歴応答データ（描画用）
+    #[cfg(feature = "gui")]
+    pub time_history_data: crate::time_history_view::TimeHistoryData,
+    /// 時刻歴グラフの表示項目選択
+    #[cfg(feature = "gui")]
+    pub time_history_source: crate::time_history_view::TimeHistorySource,
 }
 
 impl Default for App {
@@ -76,6 +83,10 @@ impl Default for App {
             #[cfg(feature = "gui")]
             camera: crate::viewer::CameraState::default(),
             beam_loads: Vec::new(),
+            #[cfg(feature = "gui")]
+            time_history_data: crate::time_history_view::dummy_time_history(),
+            #[cfg(feature = "gui")]
+            time_history_source: crate::time_history_view::TimeHistorySource::default(),
         }
     }
 }
@@ -244,6 +255,7 @@ impl eframe::App for App {
                 ("荷重", Tab::Loads),
                 ("3D", Tab::Viewer),
                 ("設計", Tab::Design),
+                ("時刻歴", Tab::TimeHistory),
             ];
             for (label, tab) in &tabs {
                 let selected =
@@ -332,6 +344,7 @@ impl eframe::App for App {
             Tab::Loads => crate::tables::loads::loads_table(ui, self),
             Tab::Viewer => crate::viewer::viewer_panel(ui, self),
             Tab::Design => crate::design_view::design_table(ui, self),
+            Tab::TimeHistory => crate::time_history_view::time_history_panel(ui, self),
         });
     }
 }
@@ -345,6 +358,7 @@ fn discriminant_to_tab(tab: &Tab) -> Tab {
         Tab::Loads => Tab::Loads,
         Tab::Viewer => Tab::Viewer,
         Tab::Design => Tab::Design,
+        Tab::TimeHistory => Tab::TimeHistory,
     }
 }
 
