@@ -106,6 +106,7 @@ pub fn sections_table(ui: &mut egui::Ui, app: &mut App) {
         });
 
     // 確定処理
+    let (had_name, had_field) = (!pending_name.is_empty(), !pending_field.is_empty());
     for (i, name) in pending_name {
         let sid = SectionId(app.model.sections[i].id.0);
         app.undo
@@ -121,5 +122,10 @@ pub fn sections_table(ui: &mut egui::Ui, app: &mut App) {
                 value: val,
             }),
         );
+    }
+
+    // 編集があった場合は下流（結果・設計）を stale にする（UI設計 §5）
+    if had_name || had_field {
+        app.staleness.mark_edited();
     }
 }

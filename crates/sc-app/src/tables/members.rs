@@ -25,8 +25,17 @@ pub fn members_table(ui: &mut egui::Ui, app: &mut App) {
             body.rows(22.0, n, |mut row| {
                 let i = row.index();
                 let elem = &app.model.elements[i];
+                let is_focus = app.nav.focus_member == Some(elem.id);
                 row.col(|ui| {
-                    ui.label(elem.id.0.to_string());
+                    let text = elem.id.0.to_string();
+                    let rich = egui::RichText::new(text).color(if is_focus {
+                        egui::Color32::from_rgb(40, 80, 200)
+                    } else {
+                        egui::Color32::PLACEHOLDER
+                    });
+                    if ui.selectable_label(is_focus, rich).clicked() {
+                        app.nav.focus_member = Some(elem.id);
+                    }
                 });
                 row.col(|ui| {
                     ui.label(format!("{:?}", elem.kind));
@@ -62,6 +71,7 @@ pub fn members_table(ui: &mut egui::Ui, app: &mut App) {
         });
 
     // 確定処理
+    let had_pending = !pending_section.is_empty();
     for (i, sec_id) in pending_section {
         let elem_id = app.model.elements[i].id;
         let section = if sec_id == u32::MAX {
@@ -82,5 +92,10 @@ pub fn members_table(ui: &mut egui::Ui, app: &mut App) {
                 section,
             }),
         );
+    }
+
+    // 編集があった場合は下流（結果・設計）を stale にする（UI設計 §5）
+    if had_pending {
+        app.staleness.mark_edited();
     }
 }

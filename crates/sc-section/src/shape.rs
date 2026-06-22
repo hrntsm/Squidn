@@ -1,6 +1,38 @@
 use sc_core::ids::SectionId;
 use sc_core::model::Section;
 
+/// RC 配筋の主筋セット（方向別）。
+///
+/// `count`: 本数, `dia`: 径 [mm], `layers`: 段数。
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct BarSet {
+    pub count: u32,
+    pub dia: f64,
+    pub layers: u32,
+}
+
+/// RC せん断補強筋。
+///
+/// `dia`: 径 [mm], `pitch`: ピッチ [mm], `legs`: 組数。
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct ShearBar {
+    pub dia: f64,
+    pub pitch: f64,
+    pub legs: u32,
+}
+
+/// RC 配筋情報。
+///
+/// `main_x`: せい方向（X）主筋, `main_y`: 幅方向（Y）主筋,
+/// `cover`: かぶり [mm], `shear`: せん断補強筋。
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct RcRebar {
+    pub main_x: BarSet,
+    pub main_y: BarSet,
+    pub cover: f64,
+    pub shear: ShearBar,
+}
+
 /// Parametric section shape definition.
 ///
 /// Each variant carries the minimal parameters needed to define the geometry.
@@ -36,22 +68,9 @@ pub enum SectionShape {
     /// Steel round pipe (鋼管).
     SteelPipe { outer_dia: f64, thick: f64 },
     /// Reinforced concrete rectangle (RC 矩形).
-    RcRect {
-        width: f64,
-        depth: f64,
-        cover: f64,
-        /// (bar diameter, number of bars) for top layer
-        top: (f64, u32),
-        /// (bar diameter, number of bars) for bottom layer
-        bottom: (f64, u32),
-    },
-    /// Reinforced concrete round column (RC 円形).
-    RcRound {
-        diameter: f64,
-        cover: f64,
-        /// (bar diameter, number of bars) equally spaced
-        bars: (f64, u32),
-    },
+    RcRect { b: f64, d: f64, rebar: RcRebar },
+    /// Reinforced concrete circle column (RC 円形).
+    RcCircle { d: f64, rebar: RcRebar },
 }
 
 impl SectionShape {
@@ -91,10 +110,8 @@ impl SectionShape {
                 let ri = r - thick;
                 std::f64::consts::PI * (r * r - ri * ri)
             }
-            SectionShape::RcRect { width, depth, .. } => width * depth,
-            SectionShape::RcRound { diameter, .. } => {
-                std::f64::consts::PI * diameter * diameter / 4.0
-            }
+            SectionShape::RcRect { b, d, .. } => b * d,
+            SectionShape::RcCircle { d, .. } => std::f64::consts::PI * d * d / 4.0,
         }
     }
 
@@ -161,10 +178,8 @@ impl SectionShape {
                 let ri = r - thick;
                 std::f64::consts::PI / 4.0 * (r.powi(4) - ri.powi(4))
             }
-            SectionShape::RcRect { width, depth, .. } => width * depth.powi(3) / 12.0,
-            SectionShape::RcRound { diameter, .. } => {
-                std::f64::consts::PI * diameter.powi(4) / 64.0
-            }
+            SectionShape::RcRect { b, d, .. } => b * d.powi(3) / 12.0,
+            SectionShape::RcCircle { d, .. } => std::f64::consts::PI * d.powi(4) / 64.0,
         }
     }
 
@@ -234,8 +249,8 @@ impl SectionShape {
                 iz + iz_w
             }
             SectionShape::SteelPipe { .. } => self.calc_iy(),
-            SectionShape::RcRect { width, depth, .. } => depth * width.powi(3) / 12.0,
-            SectionShape::RcRound { .. } => self.calc_iy(),
+            SectionShape::RcRect { b, d, .. } => d * b.powi(3) / 12.0,
+            SectionShape::RcCircle { .. } => self.calc_iy(),
         }
     }
 
@@ -287,20 +302,18 @@ impl SectionShape {
                 let ri = r - thick;
                 std::f64::consts::PI / 2.0 * (r.powi(4) - ri.powi(4))
             }
-            SectionShape::RcRect { width, depth, .. } => {
-                let b = width.min(depth);
-                let h = width.max(depth);
-                let r = h / b;
+            SectionShape::RcRect { b, d, .. } => {
+                let b_min = b.min(d);
+                let h = b.max(d);
+                let r = h / b_min;
                 let beta = if r < 10.0 {
                     (1.0 / 3.0) * (1.0 - 0.630 / r + 0.052 / r.powi(5))
                 } else {
                     1.0 / 3.0
                 };
-                beta * b.powi(3) * h
+                beta * b_min.powi(3) * h
             }
-            SectionShape::RcRound { diameter, .. } => {
-                std::f64::consts::PI * diameter.powi(4) / 32.0
-            }
+            SectionShape::RcCircle { d, .. } => std::f64::consts::PI * d.powi(4) / 32.0,
         }
     }
 
@@ -323,21 +336,16 @@ impl SectionShape {
             SectionShape::SteelTee { height, width, .. } => (height, width, 0.0, 0.0),
             SectionShape::SteelPipe { outer_dia, .. } => (outer_dia, outer_dia, 0.0, 0.0),
             SectionShape::RcRect {
-                width,
-                depth,
-                top,
-                bottom,
-                ..
+                b, d, ref rebar, ..
             } => {
-                let as_y = rebar_area(top) + rebar_area(bottom);
-                let as_z = 0.0;
-                (depth, width, as_y, as_z)
+                let as_y = bar_set_area(&rebar.main_x);
+                let as_z = bar_set_area(&rebar.main_y);
+                (d, b, as_y, as_z)
             }
-            SectionShape::RcRound { diameter, bars, .. } => {
-                let n_half = bars.1 / 2;
-                let as_y = rebar_area((bars.0, n_half));
-                let as_z = rebar_area((bars.0, n_half));
-                (diameter, diameter, as_y, as_z)
+            SectionShape::RcCircle { d, ref rebar, .. } => {
+                let as_y = bar_set_area(&rebar.main_x);
+                let as_z = bar_set_area(&rebar.main_y);
+                (d, d, as_y, as_z)
             }
         };
         Section {
@@ -357,9 +365,9 @@ impl SectionShape {
     }
 }
 
-fn rebar_area((dia, n): (f64, u32)) -> f64 {
-    let r = dia / 2.0;
-    n as f64 * std::f64::consts::PI * r * r
+fn bar_set_area(bs: &BarSet) -> f64 {
+    let r = bs.dia / 2.0;
+    bs.count as f64 * std::f64::consts::PI * r * r
 }
 
 fn angle_centroid(leg_a: f64, leg_b: f64, thick: f64) -> (f64, f64, f64) {
@@ -429,24 +437,55 @@ mod tests {
     #[test]
     fn test_rc_rect() {
         let shape = SectionShape::RcRect {
-            width: 500.0,
-            depth: 500.0,
-            cover: 40.0,
-            top: (16.0, 4),
-            bottom: (16.0, 4),
+            b: 500.0,
+            d: 500.0,
+            rebar: RcRebar {
+                main_x: BarSet {
+                    count: 8,
+                    dia: 16.0,
+                    layers: 2,
+                },
+                main_y: BarSet {
+                    count: 4,
+                    dia: 16.0,
+                    layers: 2,
+                },
+                cover: 40.0,
+                shear: ShearBar {
+                    dia: 10.0,
+                    pitch: 100.0,
+                    legs: 2,
+                },
+            },
         };
         let sec = shape.to_section(SectionId(0), "RC-500x500".into());
         assert!(sec.area > 0.0);
         assert!(sec.as_y > 0.0);
-        assert_eq!(sec.as_z, 0.0);
+        assert!(sec.iz > 0.0);
     }
 
     #[test]
-    fn test_rc_round() {
-        let shape = SectionShape::RcRound {
-            diameter: 600.0,
-            cover: 40.0,
-            bars: (22.0, 12),
+    fn test_rc_circle() {
+        let shape = SectionShape::RcCircle {
+            d: 600.0,
+            rebar: RcRebar {
+                main_x: BarSet {
+                    count: 12,
+                    dia: 22.0,
+                    layers: 1,
+                },
+                main_y: BarSet {
+                    count: 12,
+                    dia: 22.0,
+                    layers: 1,
+                },
+                cover: 40.0,
+                shear: ShearBar {
+                    dia: 6.0,
+                    pitch: 80.0,
+                    legs: 1,
+                },
+            },
         };
         let sec = shape.to_section(SectionId(0), "RC-600".into());
         assert!(sec.area > 0.0);
@@ -505,5 +544,95 @@ mod tests {
         let json = serde_json::to_string(&shape).unwrap();
         let restored: SectionShape = serde_json::from_str(&json).unwrap();
         assert_eq!(shape, restored);
+    }
+
+    #[test]
+    fn test_rc_rebar_serde_roundtrip() {
+        let shape = SectionShape::RcRect {
+            b: 500.0,
+            d: 600.0,
+            rebar: RcRebar {
+                main_x: BarSet {
+                    count: 6,
+                    dia: 22.0,
+                    layers: 2,
+                },
+                main_y: BarSet {
+                    count: 2,
+                    dia: 16.0,
+                    layers: 1,
+                },
+                cover: 50.0,
+                shear: ShearBar {
+                    dia: 10.0,
+                    pitch: 100.0,
+                    legs: 2,
+                },
+            },
+        };
+        let json = serde_json::to_string(&shape).unwrap();
+        let restored: SectionShape = serde_json::from_str(&json).unwrap();
+        assert_eq!(shape, restored);
+    }
+
+    #[test]
+    fn test_rc_rect_area() {
+        let shape = SectionShape::RcRect {
+            b: 400.0,
+            d: 600.0,
+            rebar: RcRebar {
+                main_x: BarSet {
+                    count: 6,
+                    dia: 19.0,
+                    layers: 2,
+                },
+                main_y: BarSet {
+                    count: 2,
+                    dia: 13.0,
+                    layers: 1,
+                },
+                cover: 40.0,
+                shear: ShearBar {
+                    dia: 10.0,
+                    pitch: 100.0,
+                    legs: 2,
+                },
+            },
+        };
+        assert!((shape.calc_area() - 240_000.0).abs() < 1e-9);
+        let iy = shape.calc_iy();
+        let iz = shape.calc_iz();
+        assert!((iy - 400.0 * 600.0_f64.powi(3) / 12.0).abs() < 1e-6);
+        assert!((iz - 600.0 * 400.0_f64.powi(3) / 12.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_rc_circle_area() {
+        let shape = SectionShape::RcCircle {
+            d: 800.0,
+            rebar: RcRebar {
+                main_x: BarSet {
+                    count: 16,
+                    dia: 25.0,
+                    layers: 1,
+                },
+                main_y: BarSet {
+                    count: 16,
+                    dia: 25.0,
+                    layers: 1,
+                },
+                cover: 50.0,
+                shear: ShearBar {
+                    dia: 10.0,
+                    pitch: 100.0,
+                    legs: 1,
+                },
+            },
+        };
+        let expected_area = std::f64::consts::PI * 800.0_f64.powi(2) / 4.0;
+        assert!((shape.calc_area() - expected_area).abs() < 1e-6);
+        let iy = shape.calc_iy();
+        assert!((iy - std::f64::consts::PI * 800.0_f64.powi(4) / 64.0).abs() < 1e-6);
+        assert!((shape.calc_iy() - shape.calc_iz()).abs() < 1e-6);
     }
 }

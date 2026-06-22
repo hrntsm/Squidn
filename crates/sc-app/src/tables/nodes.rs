@@ -30,8 +30,17 @@ pub fn nodes_table(ui: &mut egui::Ui, app: &mut App) {
             body.rows(22.0, n, |mut row| {
                 let i = row.index();
                 let node = &app.model.nodes[i];
+                let is_focus = app.nav.focus_node == Some(node.id);
                 row.col(|ui| {
-                    ui.label(node.id.0.to_string());
+                    let text = node.id.0.to_string();
+                    let rich = egui::RichText::new(text).color(if is_focus {
+                        egui::Color32::from_rgb(40, 80, 200)
+                    } else {
+                        egui::Color32::PLACEHOLDER
+                    });
+                    if ui.selectable_label(is_focus, rich).clicked() {
+                        app.nav.focus_node = Some(node.id);
+                    }
                 });
                 for (k, slot) in node_edit[i].iter_mut().enumerate().take(3) {
                     row.col(|ui| {
@@ -64,6 +73,7 @@ pub fn nodes_table(ui: &mut egui::Ui, app: &mut App) {
         });
 
     // 確定処理（クロージャ外で app.model と app.undo にアクセス）
+    let had_pending = !pending.is_empty();
     for (i, k, val) in pending {
         let node_id = NodeId(app.model.nodes[i].id.0);
         let mut new_coord = app.model.nodes[i].coord;
@@ -75,6 +85,11 @@ pub fn nodes_table(ui: &mut egui::Ui, app: &mut App) {
                 coord: new_coord,
             }),
         );
+    }
+
+    // 編集があった場合は下流（結果・設計）を stale にする（UI設計 §5）
+    if had_pending {
+        app.staleness.mark_edited();
     }
 
     // バッファを戻す

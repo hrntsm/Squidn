@@ -56,12 +56,16 @@ pub fn loads_table(ui: &mut egui::Ui, app: &mut App) {
             });
         });
 
+    let had_name = !pending_name.is_empty();
     for (i, name) in pending_name {
         let lc_id = LoadCaseId(app.model.load_cases[i].id.0);
         app.undo.run(
             &mut app.model,
             Box::new(SetLoadCaseName { id: lc_id, name }),
         );
+    }
+    if had_name {
+        app.staleness.mark_edited();
     }
 
     ui.add_space(8.0);
@@ -140,6 +144,7 @@ pub fn loads_table(ui: &mut egui::Ui, app: &mut App) {
             });
         });
 
+    let had_load = !pending_load.is_empty();
     for (node, values) in pending_load {
         app.undo.run(
             &mut app.model,
@@ -149,5 +154,8 @@ pub fn loads_table(ui: &mut egui::Ui, app: &mut App) {
                 values,
             }),
         );
+    }
+    if had_load {
+        app.staleness.mark_edited();
     }
 }

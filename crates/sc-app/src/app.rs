@@ -498,6 +498,45 @@ impl App {
                 }
             });
 
+            // 部材リスト（クリックで focus_member を更新 → テーブル/インスペクタに連動）
+            let header = egui::CollapsingHeader::new("部材一覧")
+                .default_open(false)
+                .id_salt("nav_members");
+            header.show(ui, |ui| {
+                use egui_extras::{Column, TableBuilder};
+                TableBuilder::new(ui)
+                    .striped(true)
+                    .column(Column::auto())
+                    .column(Column::remainder())
+                    .header(16.0, |mut h| {
+                        h.col(|ui| {
+                            ui.strong("ID");
+                        });
+                        h.col(|ui| {
+                            ui.strong("種別");
+                        });
+                    })
+                    .body(|body| {
+                        let n = self.model.elements.len();
+                        body.rows(18.0, n, |mut row| {
+                            let idx = row.index();
+                            let elem = self.model.elements[idx].clone();
+                            let is_focus = self.nav.focus_member == Some(elem.id);
+                            row.col(|ui| {
+                                if ui
+                                    .add(egui::Button::selectable(is_focus, elem.id.0.to_string()))
+                                    .clicked()
+                                {
+                                    self.nav.focus_member = Some(elem.id);
+                                }
+                            });
+                            row.col(|ui| {
+                                ui.label(format!("{:?}", elem.kind));
+                            });
+                        });
+                    });
+            });
+
             // 結果メモ（簡易：静的ケース数を列挙）
             let header = egui::CollapsingHeader::new("結果ケース")
                 .default_open(true)
