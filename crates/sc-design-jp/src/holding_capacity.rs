@@ -126,6 +126,20 @@ pub fn ds_value(frame: FrameType, rank: MemberRank) -> f64 {
     }
 }
 
+// ===== T2: Qud ヘルパー (§2) =====
+
+/// 二次設計の地震時層せん断 Qud（**C0 = 1.0** の Ai 分布層せん断 Qi）。仕様 §2。
+///
+/// - `story_weights_bottom_to_top`: 下→上の各層の地震用重量。
+/// - `z`: 地域係数。
+/// - `rt`: 振動特性係数 Rt。
+/// - `t`: 設計用一次固有周期 [s]。
+///
+/// 戻り値は層せん断 Qi（下→上インデックス）。
+pub fn qud_by_story(story_weights_bottom_to_top: &[f64], z: f64, rt: f64, t: f64) -> Vec<f64> {
+    sc_load::ai::ai_distribution(story_weights_bottom_to_top, z, rt, 1.0, t).qi
+}
+
 // ===== T6: Qun 比較・判定・統合 (§3) =====
 
 use sc_solver::pushover::PushoverResult;
@@ -390,6 +404,33 @@ mod tests {
             check_holding_capacity(&pushover, &qud, &ds, &fes, &rs, &re, &heights, vec![]);
         assert!((result.stories[0].qun - 50.0).abs() < 1e-9);
         assert!(result.stories[0].ok, "Qu=Qun は ok（≥）であるべき");
+    }
+
+    // ---- Qud ヘルパー ----
+
+    /// 等重量3層で qud_by_story の基部層せん断が C0=1.0 版 = C0=0.2 版の 5 倍であること。
+    #[test]
+    fn test_qud_by_story_linearity_in_c0() {
+        use sc_load::ai::ai_distribution;
+        let weights = &[1.0_f64, 1.0, 1.0];
+        let z = 1.0;
+        let rt = 1.0;
+        let t = 0.24;
+        let qud = qud_by_story(weights, z, rt, t);
+        let qi_c0_02 = ai_distribution(weights, z, rt, 0.2, t).qi;
+        // C0 に線形なので qud[0] = 5 · qi_c0_02[0]。
+        assert!(
+            (qud[0] - 5.0 * qi_c0_02[0]).abs() < 1e-9,
+            "qud[0]={} vs 5×qi0.2[0]={}",
+            qud[0],
+            5.0 * qi_c0_02[0]
+        );
+        // 基部層せん断 ≈ C0·Ai0·総重量 = 1.0·1.0·3.0 = 3.0。
+        assert!(
+            (qud[0] - 3.0).abs() < 1e-9,
+            "qud[0]={} (expected ≈3.0)",
+            qud[0]
+        );
     }
 
     /// 部材ランクが出力に格納される。

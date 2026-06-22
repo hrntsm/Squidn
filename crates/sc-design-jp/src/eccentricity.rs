@@ -11,7 +11,8 @@
 //! `Xs = Σ(Dy·x)/ΣDy`, `Ys = Σ(Dx·y)/ΣDx`。単一 D 値で済むのは対称架構のみ。
 
 use sc_core::ids::StoryId;
-use sc_core::model::Model;
+use sc_core::model::{ElementKind, Model};
+use sc_element::transform::LocalFrame;
 
 /// 1 本の柱（鉛直部材）の、平面位置と方向別水平剛性（D値）。
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -167,6 +168,185 @@ pub fn center_of_mass(model: &Model, story: StoryId) -> [f64; 2] {
         let yg = nodes.iter().map(|n| n.coord[1]).sum::<f64>() / n;
         [xg, yg]
     }
+}
+
+// ===== モデル自動算定層（column_stiffnesses / StoryCenters / story_centers / story_eccentricity）=====
+
+/// 当該層の各柱について方向別水平剛性（D値）と平面位置を算定して返す（仕様 §5.1）。
+///
+/// 柱の判定: `ElementKind::Beam` かつ 2節点、部材軸 ez[2].abs() > 0.707 で鉛直判定。
+/// 層帰属: 上端節点（z 大）の `story == Some(story)` を当該層とする。
+pub fn column_stiffnesses(model: &Model, story: StoryId) -> Vec<ColumnStiffness> {
+    // 最下層判定: 当該 story の elevation が全 stories 中で最小なら true。
+    let min_elev: f64 = model
+        .stories
+        .iter()
+        .map(|s| s.elevation)
+        .fold(f64::INFINITY, f64::min);
+    let this_elev = model
+        .stories
+        .get(story.index())
+        .map(|s| s.elevation)
+        .unwrap_or(f64::INFINITY);
+    let first_story = (this_elev - min_elev).abs() < 1e-9;
+
+    let mut result = Vec::new();
+
+    for elem in &model.elements {
+        // 2節点 Beam のみ対象。
+        if elem.kind != ElementKind::Beam || elem.nodes.len() != 2 {
+            continue;
+        }
+        let nid0 = elem.nodes[0];
+        let nid1 = elem.nodes[1];
+        let n0 = &model.nodes[nid0.index()];
+        let n1 = &model.nodes[nid1.index()];
+        let p0 = n0.coord;
+        let p1 = n1.coord;
+
+        // 部材軸単位ベクトル（i→j）。
+        let dx = p1[0] - p0[0];
+        let dy = p1[1] - p0[1];
+        let dz = p1[2] - p0[2];
+        let l = (dx * dx + dy * dy + dz * dz).sqrt();
+        if l < 1e-12 {
+            continue;
+        }
+        let ex_z = dz / l;
+
+        // 鉛直部材（柱）判定。
+        if ex_z.abs() <= 0.707 {
+            continue;
+        }
+
+        // 上端節点（z が大きい方）。
+        let (n_top, n_bot, p_top, p_bot) = if p0[2] < p1[2] {
+            (n1, n0, p1, p0)
+        } else {
+            (n0, n1, p0, p1)
+        };
+
+        // 層帰属: 上端節点の story が当該層。
+        if n_top.story != Some(story) {
+            continue;
+        }
+
+        // material / section が必須。
+        let mid = match elem.material {
+            Some(m) => m,
+            None => continue,
+        };
+        let sid = match elem.section {
+            Some(s) => s,
+            None => continue,
+        };
+        let mat = &model.materials[mid.index()];
+        let sec = &model.sections[sid.index()];
+        let e = mat.young;
+        let h = (p_top[2] - p_bot[2]).abs();
+        if h < 1e-12 {
+            continue;
+        }
+
+        // 局所座標系から ey, ez を取得。
+        let ref_vec = elem.local_axis.ref_vector;
+        let frame = LocalFrame::from_nodes(p0, p1, ref_vec);
+        let ey = frame.rot[1]; // 局所 y 軸（全体方向への射影に使う）
+        let ez = frame.rot[2]; // 局所 z 軸
+
+        // 方向別有効断面二次モーメント（局所→全体の射影）。
+        // 全体 X 方向変位に抵抗: 局所 y 方向成分 iz, 局所 z 方向成分 iy。
+        let iy = sec.iy;
+        let iz = sec.iz;
+        let i_global_x = iz * ey[0] * ey[0] + iy * ez[0] * ez[0];
+        let i_global_y = iz * ey[1] * ey[1] + iy * ez[1] * ez[1];
+
+        // 梁剛比 ΣKb（武藤 a 補正用）。当該柱の上端・下端節点に取り付く水平梁を探す。
+        let (sum_kb_x, sum_kb_y) = {
+            let mut skbx = 0.0_f64;
+            let mut skby = 0.0_f64;
+            for other in &model.elements {
+                if other.id == elem.id {
+                    continue;
+                }
+                if other.kind != ElementKind::Beam || other.nodes.len() != 2 {
+                    continue;
+                }
+                // 当該柱の節点（上端または下端）を含む梁か。
+                let has_top = other.nodes.contains(&n_top.id);
+                let has_bot = other.nodes.contains(&n_bot.id);
+                if !has_top && !has_bot {
+                    continue;
+                }
+                // 梁の部材軸単位ベクトル。
+                let bn0 = &model.nodes[other.nodes[0].index()];
+                let bn1 = &model.nodes[other.nodes[1].index()];
+                let bdx = bn1.coord[0] - bn0.coord[0];
+                let bdy = bn1.coord[1] - bn0.coord[1];
+                let bdz = bn1.coord[2] - bn0.coord[2];
+                let bl = (bdx * bdx + bdy * bdy + bdz * bdz).sqrt();
+                if bl < 1e-12 {
+                    continue;
+                }
+                let bex = [bdx / bl, bdy / bl, bdz / bl];
+                // 水平部材（梁）判定: ez[2].abs() < 0.707
+                if bex[2].abs() >= 0.707 {
+                    continue;
+                }
+                // 梁の断面二次モーメント（強軸 iz）と梁剛比。
+                let beam_iz = match other.section {
+                    Some(s) => model.sections[s.index()].iz,
+                    None => continue,
+                };
+                let kb = beam_iz / bl;
+                // X方向に効く梁: 梁軸 bex[0].abs() > 0.707
+                if bex[0].abs() > 0.707 {
+                    skbx += kb;
+                }
+                // Y方向に効く梁: 梁軸 bex[1].abs() > 0.707
+                if bex[1].abs() > 0.707 {
+                    skby += kb;
+                }
+            }
+            (skbx, skby)
+        };
+
+        let dx_val = d_value(e, i_global_x, h, sum_kb_x, first_story);
+        let dy_val = d_value(e, i_global_y, h, sum_kb_y, first_story);
+        let pos = [p_top[0], p_top[1]];
+        result.push(ColumnStiffness {
+            pos,
+            dx: dx_val,
+            dy: dy_val,
+        });
+    }
+    result
+}
+
+/// 剛心・重心をまとめた構造体。
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct StoryCenters {
+    pub center_of_mass: [f64; 2],
+    pub center_of_rigidity: [f64; 2],
+}
+
+/// 当該層の剛心・重心を算定して返す。
+pub fn story_centers(model: &Model, story: StoryId) -> StoryCenters {
+    let cols = column_stiffnesses(model, story);
+    let com = center_of_mass(model, story);
+    let cor = center_of_rigidity(&cols);
+    StoryCenters {
+        center_of_mass: com,
+        center_of_rigidity: cor,
+    }
+}
+
+/// 当該層の偏心率を算定して返す。
+pub fn story_eccentricity(model: &Model, story: StoryId) -> Eccentricity {
+    let cols = column_stiffnesses(model, story);
+    let cor = center_of_rigidity(&cols);
+    let com = center_of_mass(model, story);
+    eccentricity(&cols, com, cor)
 }
 
 #[cfg(test)]
@@ -331,5 +511,265 @@ mod tests {
         let sum_dy = 800.0;
         let rey = (9.0e9_f64 / sum_dy).sqrt();
         assert!((ecc.re_y - 1500.0 / rey).abs() < 1e-9, "Rey {}", ecc.re_y);
+    }
+
+    // ===== モデル自動算定テスト =====
+
+    use sc_core::dof::Dof6Mask;
+    use sc_core::ids::{ElemId, MaterialId, NodeId, SectionId};
+    use sc_core::model::{
+        ElementData, EndCondition, ForceRegime, LocalAxis, Material, Node, RigidZone, Section,
+        Story,
+    };
+    use smallvec::SmallVec;
+
+    /// 対称4柱・田の字梁モデルを構築するヘルパー。
+    /// 柱: 底 z=0（拘束）・頂 z=3000、story=Some(S0)。
+    /// 梁: 上端節点間を X 方向・Y 方向に接続（同一 section）。
+    /// 質量: 上端4節点に等質量（mass[0]=1.0）。
+    /// section_iz_override: 右側 2 本（x=6000）の柱の iz を指定値に差し替え（None なら全同一）。
+    fn build_symmetric_frame(section_iz_override: Option<f64>) -> (sc_core::model::Model, StoryId) {
+        // 断面（共通: iy=iz=1.0e6）
+        let sec_base = Section {
+            id: SectionId(0),
+            name: "col".to_string(),
+            area: 100.0,
+            iy: 1.0e6,
+            iz: 1.0e6,
+            j: 1.0e6,
+            depth: 0.0,
+            width: 0.0,
+            as_y: 0.0,
+            as_z: 0.0,
+            panel_thickness: None,
+            thickness: None,
+        };
+        // 右側柱用 section（iz を上書き）
+        let sec_right = Section {
+            id: SectionId(1),
+            name: "col_right".to_string(),
+            iz: section_iz_override.unwrap_or(1.0e6),
+            ..sec_base.clone()
+        };
+        // 梁用 section: iz を非常に大きくして全柱で a ≈ 1（kbar→∞）にする。
+        // これにより D ≈ Kc0 = 12EI/h³ ∝ iz となり「Dy 比 = iz 比」が精度良く成立。
+        let sec_beam = Section {
+            id: SectionId(2),
+            name: "beam".to_string(),
+            area: 100.0,
+            iy: 1.0e12,
+            iz: 1.0e12,
+            j: 1.0e12,
+            depth: 0.0,
+            width: 0.0,
+            as_y: 0.0,
+            as_z: 0.0,
+            panel_thickness: None,
+            thickness: None,
+        };
+
+        // 材料（共通）
+        let mat = Material {
+            id: MaterialId(0),
+            name: "steel".to_string(),
+            young: 2.05e5,
+            poisson: 0.3,
+            density: 0.0,
+            shear: None,
+            fc: None,
+            fy: None,
+        };
+
+        // 層
+        let s0 = StoryId(0);
+        let story = Story {
+            id: s0,
+            name: "1F".to_string(),
+            elevation: 3000.0,
+            node_ids: vec![],
+            diaphragms: vec![],
+            seismic_weight: None,
+        };
+
+        // 節点配置:
+        // NodeId 0-3: 底部（z=0、story=None、拘束）
+        // NodeId 4-7: 上部（z=3000、story=Some(S0)、質量有り）
+        // 平面位置: 0→(0,0), 1→(6000,0), 2→(0,6000), 3→(6000,6000)
+        let restraint_fixed = Dof6Mask::FIXED;
+        let restraint_free = Dof6Mask::FREE;
+        let mass_val: Option<[f64; 6]> = Some([1.0, 1.0, 1.0, 0.0, 0.0, 0.0]);
+        let xy = [[0.0_f64, 0.0], [6000.0, 0.0], [0.0, 6000.0], [6000.0, 6000.0]];
+        let mut nodes: Vec<Node> = Vec::new();
+        for (i, &[x, y]) in xy.iter().enumerate() {
+            nodes.push(Node {
+                id: NodeId(i as u32),
+                coord: [x, y, 0.0],
+                restraint: restraint_fixed,
+                mass: None,
+                story: None,
+            });
+        }
+        for (i, &[x, y]) in xy.iter().enumerate() {
+            nodes.push(Node {
+                id: NodeId((i + 4) as u32),
+                coord: [x, y, 3000.0],
+                restraint: restraint_free,
+                mass: mass_val,
+                story: Some(s0),
+            });
+        }
+
+        // 部材構築ヘルパー
+        // 柱の ref_vector = [0,1,0] にすると:
+        //   ex=[0,0,1], ey=[0,1,0](Y軸), ez=[1,0,0](X軸)
+        //   I_globalX = iz·ey[0]² + iy·ez[0]² = iz·0 + iy·1 = iy → Dx ∝ iy
+        //   I_globalY = iz·ey[1]² + iy·ez[1]² = iz·1 + iy·0 = iz → Dy ∝ iz（★意図）
+        // これにより「右側柱の iz を 3 倍 → Dy が 3 倍 → 剛心 Xs = 4500」が成立。
+        let col_local_axis = LocalAxis {
+            ref_vector: [0.0, 1.0, 0.0],
+        };
+        let beam_local_axis = LocalAxis {
+            ref_vector: [0.0, 0.0, 1.0],
+        };
+        let end_fixed = [EndCondition::Fixed, EndCondition::Fixed];
+
+        // 柱: bottom i → top i+4
+        // 左側 (x=0): SectionId(0)、右側 (x=6000): SectionId(0 or 1)
+        let col_sec = |i: usize| -> SectionId {
+            if section_iz_override.is_some() && (xy[i][0] - 6000.0).abs() < 1.0 {
+                SectionId(1)
+            } else {
+                SectionId(0)
+            }
+        };
+        let mut elements: Vec<ElementData> = Vec::new();
+        for i in 0..4_usize {
+            elements.push(ElementData {
+                id: ElemId(i as u32),
+                kind: ElementKind::Beam,
+                nodes: {
+                    let mut v: SmallVec<[NodeId; 8]> = SmallVec::new();
+                    v.push(NodeId(i as u32));
+                    v.push(NodeId((i + 4) as u32));
+                    v
+                },
+                section: Some(col_sec(i)),
+                material: Some(MaterialId(0)),
+                local_axis: col_local_axis,
+                end_cond: end_fixed,
+                force_regime: ForceRegime::Auto,
+                rigid_zone: RigidZone::default(),
+            });
+        }
+
+        // 梁: X方向（同 y、異なる x）: top0-top1, top2-top3
+        // 梁: Y方向（同 x、異なる y）: top0-top2, top1-top3
+        // ElemId 4..7
+        let beam_pairs: [(usize, usize); 4] = [(4, 5), (6, 7), (4, 6), (5, 7)];
+        for (bi, &(na, nb)) in beam_pairs.iter().enumerate() {
+            elements.push(ElementData {
+                id: ElemId((4 + bi) as u32),
+                kind: ElementKind::Beam,
+                nodes: {
+                    let mut v: SmallVec<[NodeId; 8]> = SmallVec::new();
+                    v.push(NodeId(na as u32));
+                    v.push(NodeId(nb as u32));
+                    v
+                },
+                section: Some(SectionId(2)),
+                material: Some(MaterialId(0)),
+                local_axis: beam_local_axis,
+                end_cond: end_fixed,
+                force_regime: ForceRegime::Auto,
+                rigid_zone: RigidZone::default(),
+            });
+        }
+
+        let sections = if section_iz_override.is_some() {
+            vec![sec_base, sec_right, sec_beam]
+        } else {
+            vec![
+                sec_base,
+                Section {
+                    id: SectionId(1),
+                    ..sec_right
+                },
+                sec_beam,
+            ]
+        };
+
+        let model = sc_core::model::Model {
+            nodes,
+            elements,
+            sections,
+            materials: vec![mat],
+            stories: vec![story],
+            ..Default::default()
+        };
+        (model, s0)
+    }
+
+    /// テスト1: 対称フレーム → 偏心率 ≈ 0、剛心 ≈ [3000, 3000]。
+    #[test]
+    fn test_story_eccentricity_symmetric_zero() {
+        let (model, s0) = build_symmetric_frame(None);
+        let ecc = story_eccentricity(&model, s0);
+        assert!(
+            ecc.re_x.abs() < 1e-6,
+            "re_x={} (should be ~0)",
+            ecc.re_x
+        );
+        assert!(
+            ecc.re_y.abs() < 1e-6,
+            "re_y={} (should be ~0)",
+            ecc.re_y
+        );
+        // 剛心確認
+        let sc = story_centers(&model, s0);
+        assert!(
+            (sc.center_of_rigidity[0] - 3000.0).abs() < 1.0,
+            "Xs={}",
+            sc.center_of_rigidity[0]
+        );
+        assert!(
+            (sc.center_of_rigidity[1] - 3000.0).abs() < 1.0,
+            "Ys={}",
+            sc.center_of_rigidity[1]
+        );
+    }
+
+    /// テスト2: 右側柱 iz を 3 倍 → 剛心 x ≈ 4500、偏心距離 ex ≈ 1500。
+    /// 軸整合フレーム（柱軸=Z）では I_globalY = iz なので Dy ∝ iz。
+    /// 梁は全柱で対称なので a 補正は全柱一致 → Dy 比 = iz 比。
+    /// Xs = (1·0 + 1·0 + 3·6000 + 3·6000)/(1+1+3+3) = 4500。重心 = 3000 → ex=1500。
+    #[test]
+    fn test_story_eccentricity_biased_rigidity() {
+        let (model, s0) = build_symmetric_frame(Some(3.0e6));
+        let sc = story_centers(&model, s0);
+        let xs = sc.center_of_rigidity[0];
+        assert!(
+            (xs - 4500.0).abs() < 1.0,
+            "Xs={} (expected ≈4500)",
+            xs
+        );
+        let ecc = story_eccentricity(&model, s0);
+        // 重心 x = 3000（等質量 4 点の中央）→ ex = |3000 - 4500| = 1500
+        assert!(
+            (ecc.ex - 1500.0).abs() < 1.0,
+            "ex={} (expected ≈1500)",
+            ecc.ex
+        );
+    }
+
+    /// テスト3: 柱が無い層（story=S1 が存在するが柱の上端は S0）→ 空 Vec、剛心 [0,0]。
+    #[test]
+    fn test_story_eccentricity_empty_story() {
+        let (model, _s0) = build_symmetric_frame(None);
+        // S1 は存在しない（stories は S0 のみ）→ column_stiffnesses は空を返す。
+        let s1 = StoryId(1);
+        let cols = column_stiffnesses(&model, s1);
+        assert!(cols.is_empty(), "S1 に柱が無いはず、got {} 本", cols.len());
+        let cor = center_of_rigidity(&cols);
+        assert_eq!(cor, [0.0, 0.0], "空時の剛心は [0,0]");
     }
 }

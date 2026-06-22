@@ -4898,7 +4898,9 @@ dependencies = [
  "approx",
  "sc-core",
  "sc-element",
+ "sc-load",
  "sc-solver",
+ "smallvec",
 ]
 
 [[package]]
