@@ -172,6 +172,7 @@ impl Default for App {
 /// egui の既定フォント（Ubuntu/Hack）は日本語グリフを持たないため、
 /// OS のシステムフォントから日本語対応フォントを探して読み込む。
 /// 見つからない場合は何もしない（英数字は既定フォントで表示される）。
+#[cfg(feature = "gui")]
 pub fn install_japanese_fonts(ctx: &egui::Context) {
     // OS ごとの代表的な日本語フォント候補（先に見つかったものを使用）。
     const CANDIDATES: &[&str] = &[
