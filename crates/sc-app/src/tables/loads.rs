@@ -1,6 +1,34 @@
 use crate::app::App;
-use sc_core::ids::{LoadCaseId, NodeId};
-use sc_edit::{SetLoadCaseName, SetNodalLoad};
+use sc_core::ids::{ElemId, LoadCaseId, NodeId};
+use sc_core::model::{ElementKind, MemberLoad, MemberLoadKind};
+use sc_edit::{AddMemberLoad, DeleteMemberLoad, SetLoadCaseName, SetNodalLoad};
+
+#[derive(Clone)]
+struct MemberLoadDraft {
+    elem_idx: usize, // app.model.elements のインデックス
+    kind: u8,        // 0=中間集中, 1=等分布, 2=台形
+    dir: u8,         // 0=-Z(鉛直下),1=+Z,2=+X,3=-X,4=+Y,5=-Y
+    a: String,
+    b: String,
+    w1: String,
+    w2: String,
+    p: String,
+}
+
+impl Default for MemberLoadDraft {
+    fn default() -> Self {
+        Self {
+            elem_idx: 0,
+            kind: 1,
+            dir: 0,
+            a: "0".into(),
+            b: "0".into(),
+            w1: "0".into(),
+            w2: "0".into(),
+            p: "0".into(),
+        }
+    }
+}
 
 pub fn loads_table(ui: &mut egui::Ui, app: &mut App) {
     use egui_extras::{Column, TableBuilder};
@@ -156,6 +184,235 @@ pub fn loads_table(ui: &mut egui::Ui, app: &mut App) {
         );
     }
     if had_load {
+        app.staleness.mark_edited();
+    }
+
+    // --- 部材荷重セクション ---
+    ui.add_space(8.0);
+    ui.strong("部材荷重");
+
+    // (A) 既存の部材荷重リスト（削除可能）
+    let mut pending_delete: Option<usize> = None;
+    {
+        let member_loads = &app.model.load_cases[lc_idx].member;
+        if member_loads.is_empty() {
+            ui.label("部材荷重なし");
+        } else {
+            for (i, ml) in member_loads.iter().enumerate() {
+                ui.horizontal(|ui| {
+                    let kind_str = match &ml.kind {
+                        MemberLoadKind::Point { a, p } => {
+                            format!("中間集中 a={:.0} P={:.1}", a, p)
+                        }
+                        MemberLoadKind::Distributed { a, b, w1, w2 } => {
+                            format!("分布 [{:.0},{:.0}] w1={:.2} w2={:.2}", a, b, w1, w2)
+                        }
+                    };
+                    let dir_str = format!(
+                        "dir=({:.1},{:.1},{:.1})",
+                        ml.dir[0], ml.dir[1], ml.dir[2]
+                    );
+                    ui.label(format!("梁#{} / {} / {}", ml.elem.0, kind_str, dir_str));
+                    if ui.button("削除").clicked() {
+                        pending_delete = Some(i);
+                    }
+                });
+            }
+        }
+    }
+    if let Some(idx) = pending_delete {
+        app.undo.run(
+            &mut app.model,
+            Box::new(DeleteMemberLoad { lc: lc_id, index: idx }),
+        );
+        app.staleness.mark_edited();
+    }
+
+    // (B) 追加フォーム
+    // 梁要素のインデックス一覧を収集
+    let beam_indices: Vec<usize> = app
+        .model
+        .elements
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| e.kind == ElementKind::Beam)
+        .map(|(i, _)| i)
+        .collect();
+
+    if beam_indices.is_empty() {
+        ui.label("梁がありません");
+        return;
+    }
+
+    let draft_id = egui::Id::new("member_load_draft");
+    let mut draft: MemberLoadDraft =
+        ui.data_mut(|d| d.get_temp::<MemberLoadDraft>(draft_id)).unwrap_or_default();
+
+    // elem_idx が梁一覧の範囲外なら先頭梁に補正
+    if !beam_indices.contains(&draft.elem_idx) {
+        draft.elem_idx = beam_indices[0];
+    }
+
+    let mut pending_add: Option<MemberLoad> = None;
+
+    ui.add_space(4.0);
+
+    // 対象梁 ComboBox
+    ui.horizontal(|ui| {
+        ui.label("対象梁:");
+        let current_beam_label = app
+            .model
+            .elements
+            .get(draft.elem_idx)
+            .map(|e| format!("梁#{}", e.id.0))
+            .unwrap_or_else(|| "―".to_string());
+        egui::ComboBox::from_id_salt("member_load_beam")
+            .selected_text(current_beam_label)
+            .show_ui(ui, |ui| {
+                for &bi in &beam_indices {
+                    if let Some(elem) = app.model.elements.get(bi) {
+                        let label = format!("梁#{}", elem.id.0);
+                        if ui.selectable_label(draft.elem_idx == bi, &label).clicked() {
+                            draft.elem_idx = bi;
+                        }
+                    }
+                }
+            });
+    });
+
+    // 種別選択
+    ui.horizontal(|ui| {
+        ui.label("種別:");
+        ui.selectable_value(&mut draft.kind, 0u8, "中間集中");
+        ui.selectable_value(&mut draft.kind, 1u8, "等分布");
+        ui.selectable_value(&mut draft.kind, 2u8, "台形");
+    });
+
+    // 方向 ComboBox
+    ui.horizontal(|ui| {
+        ui.label("方向:");
+        let dir_labels = ["鉛直下(-Z)", "鉛直上(+Z)", "X+", "X-", "Y+", "Y-"];
+        let current_dir_label = dir_labels.get(draft.dir as usize).copied().unwrap_or("―");
+        egui::ComboBox::from_id_salt("member_load_dir")
+            .selected_text(current_dir_label)
+            .show_ui(ui, |ui| {
+                for (idx, label) in dir_labels.iter().enumerate() {
+                    if ui
+                        .selectable_label(draft.dir == idx as u8, *label)
+                        .clicked()
+                    {
+                        draft.dir = idx as u8;
+                    }
+                }
+            });
+    });
+
+    // パラメータ（kind で出し分け）
+    match draft.kind {
+        0 => {
+            // 中間集中
+            ui.horizontal(|ui| {
+                ui.label("a[mm]:");
+                ui.add(egui::TextEdit::singleline(&mut draft.a).desired_width(80.0));
+                ui.label("P[N]:");
+                ui.add(egui::TextEdit::singleline(&mut draft.p).desired_width(80.0));
+            });
+        }
+        1 => {
+            // 等分布
+            ui.horizontal(|ui| {
+                ui.label("w1[N/mm]:");
+                ui.add(egui::TextEdit::singleline(&mut draft.w1).desired_width(80.0));
+            });
+        }
+        _ => {
+            // 台形
+            ui.horizontal(|ui| {
+                ui.label("a[mm]:");
+                ui.add(egui::TextEdit::singleline(&mut draft.a).desired_width(80.0));
+                ui.label("b[mm]:");
+                ui.add(egui::TextEdit::singleline(&mut draft.b).desired_width(80.0));
+            });
+            ui.horizontal(|ui| {
+                ui.label("w1[N/mm]:");
+                ui.add(egui::TextEdit::singleline(&mut draft.w1).desired_width(80.0));
+                ui.label("w2[N/mm]:");
+                ui.add(egui::TextEdit::singleline(&mut draft.w2).desired_width(80.0));
+            });
+        }
+    }
+
+    // 追加ボタン
+    if ui.button("+ 部材荷重追加").clicked() {
+        if let Some(elem) = app.model.elements.get(draft.elem_idx) {
+            let elem_id: ElemId = elem.id;
+
+            // 梁長を計算（等分布の b 用）
+            let len = if elem.nodes.len() >= 2 {
+                let ni = elem.nodes[0].index();
+                let nj = elem.nodes[1].index();
+                if ni < app.model.nodes.len() && nj < app.model.nodes.len() {
+                    let pi = app.model.nodes[ni].coord;
+                    let pj = app.model.nodes[nj].coord;
+                    ((pj[0] - pi[0]).powi(2)
+                        + (pj[1] - pi[1]).powi(2)
+                        + (pj[2] - pi[2]).powi(2))
+                    .sqrt()
+                } else {
+                    0.0
+                }
+            } else {
+                0.0
+            };
+
+            // 方向ベクトル
+            let dir: [f64; 3] = match draft.dir {
+                0 => [0.0, 0.0, -1.0],
+                1 => [0.0, 0.0, 1.0],
+                2 => [1.0, 0.0, 0.0],
+                3 => [-1.0, 0.0, 0.0],
+                4 => [0.0, 1.0, 0.0],
+                _ => [0.0, -1.0, 0.0],
+            };
+
+            let parse = |s: &str| s.trim().parse::<f64>().unwrap_or(0.0);
+
+            let kind = match draft.kind {
+                0 => MemberLoadKind::Point {
+                    a: parse(&draft.a),
+                    p: parse(&draft.p),
+                },
+                1 => MemberLoadKind::Distributed {
+                    a: 0.0,
+                    b: len,
+                    w1: parse(&draft.w1),
+                    w2: parse(&draft.w1),
+                },
+                _ => MemberLoadKind::Distributed {
+                    a: parse(&draft.a),
+                    b: parse(&draft.b),
+                    w1: parse(&draft.w1),
+                    w2: parse(&draft.w2),
+                },
+            };
+
+            pending_add = Some(MemberLoad {
+                elem: elem_id,
+                dir,
+                kind,
+            });
+        }
+    }
+
+    // draft を書き戻す（クロージャ外）
+    ui.data_mut(|d| d.insert_temp(draft_id, draft));
+
+    // (C) 追加コマンド発行（クロージャ外、借用衝突なし）
+    if let Some(load) = pending_add {
+        app.undo.run(
+            &mut app.model,
+            Box::new(AddMemberLoad { lc: lc_id, load }),
+        );
         app.staleness.mark_edited();
     }
 }

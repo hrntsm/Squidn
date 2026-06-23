@@ -282,6 +282,7 @@ pub fn import_stbridge(xml: &str) -> Result<Model, StbError> {
                             id: LoadCaseId(get_u32(&a, "id")?),
                             name: a.get("name").cloned().unwrap_or_default(),
                             nodal: vec![],
+                            member: vec![],
                         });
                     }
                     "StbNodalLoad" => {
@@ -494,6 +495,7 @@ mod tests {
                 node: NodeId(2),
                 values: [10.5, 0.0, -3.0, 0.0, 0.0, 0.0],
             }],
+            member: vec![],
         });
         m
     }

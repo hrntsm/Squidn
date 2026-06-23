@@ -484,6 +484,89 @@ impl EditCommand for DeleteNodalLoad {
     }
 }
 
+/// 部材（梁）荷重を荷重ケースへ追加。逆操作は末尾要素の削除。
+pub struct AddMemberLoad {
+    pub lc: LoadCaseId,
+    pub load: sc_core::model::MemberLoad,
+}
+
+impl EditCommand for AddMemberLoad {
+    fn apply(&self, model: &mut Model) -> Box<dyn EditCommand> {
+        let idx = self.lc.index();
+        if idx >= model.load_cases.len() || model.load_cases[idx].id != self.lc {
+            return Box::new(Noop);
+        }
+        model.load_cases[idx].member.push(self.load.clone());
+        let pos = model.load_cases[idx].member.len() - 1;
+        Box::new(DeleteMemberLoad {
+            lc: self.lc,
+            index: pos,
+        })
+    }
+
+    fn label(&self) -> &str {
+        "部材荷重追加"
+    }
+}
+
+/// 部材荷重を index 指定で削除。逆操作は同位置への挿入。
+pub struct DeleteMemberLoad {
+    pub lc: LoadCaseId,
+    pub index: usize,
+}
+
+impl EditCommand for DeleteMemberLoad {
+    fn apply(&self, model: &mut Model) -> Box<dyn EditCommand> {
+        let idx = self.lc.index();
+        if idx >= model.load_cases.len() || model.load_cases[idx].id != self.lc {
+            return Box::new(Noop);
+        }
+        let member = &mut model.load_cases[idx].member;
+        if self.index >= member.len() {
+            return Box::new(Noop);
+        }
+        let removed = member.remove(self.index);
+        Box::new(InsertMemberLoad {
+            lc: self.lc,
+            index: self.index,
+            load: removed,
+        })
+    }
+
+    fn label(&self) -> &str {
+        "部材荷重削除"
+    }
+}
+
+/// 部材荷重を index 位置へ挿入（DeleteMemberLoad の逆操作）。
+pub struct InsertMemberLoad {
+    pub lc: LoadCaseId,
+    pub index: usize,
+    pub load: sc_core::model::MemberLoad,
+}
+
+impl EditCommand for InsertMemberLoad {
+    fn apply(&self, model: &mut Model) -> Box<dyn EditCommand> {
+        let idx = self.lc.index();
+        if idx >= model.load_cases.len() || model.load_cases[idx].id != self.lc {
+            return Box::new(Noop);
+        }
+        let member = &mut model.load_cases[idx].member;
+        if self.index > member.len() {
+            return Box::new(Noop);
+        }
+        member.insert(self.index, self.load.clone());
+        Box::new(DeleteMemberLoad {
+            lc: self.lc,
+            index: self.index,
+        })
+    }
+
+    fn label(&self) -> &str {
+        "部材荷重挿入"
+    }
+}
+
 /// 断面形状を新規追加（UI-3 の新規断面作成）。
 pub struct AddSectionShape {
     pub shape: sc_section::shape::SectionShape,
@@ -815,6 +898,58 @@ mod tests {
         // 中間節点（末尾でない）の削除は Noop
         stack.run(&mut model, Box::new(DeleteNode { id: NodeId(0) }));
         assert_eq!(model.nodes.len(), 2);
+    }
+
+    #[test]
+    fn test_add_delete_member_load_roundtrip() {
+        use sc_core::ids::LoadCaseId;
+        use sc_core::model::{LoadCase, MemberLoad, MemberLoadKind};
+        let mut model = empty_model();
+        model.load_cases.push(LoadCase {
+            id: LoadCaseId(0),
+            name: "lc".into(),
+            nodal: vec![],
+            member: vec![],
+        });
+        let mut stack = UndoStack::new();
+        let load = MemberLoad {
+            elem: sc_core::ids::ElemId(0),
+            dir: [0.0, 0.0, -1.0],
+            kind: MemberLoadKind::Distributed {
+                a: 0.0,
+                b: 1000.0,
+                w1: 2.0,
+                w2: 2.0,
+            },
+        };
+        stack.run(
+            &mut model,
+            Box::new(AddMemberLoad {
+                lc: LoadCaseId(0),
+                load: load.clone(),
+            }),
+        );
+        assert_eq!(model.load_cases[0].member.len(), 1);
+        assert_eq!(model.load_cases[0].member[0], load);
+
+        stack.undo(&mut model);
+        assert_eq!(model.load_cases[0].member.len(), 0);
+
+        stack.redo(&mut model);
+        assert_eq!(model.load_cases[0].member.len(), 1);
+
+        // 削除と復元（位置保持）
+        stack.run(
+            &mut model,
+            Box::new(DeleteMemberLoad {
+                lc: LoadCaseId(0),
+                index: 0,
+            }),
+        );
+        assert_eq!(model.load_cases[0].member.len(), 0);
+        stack.undo(&mut model);
+        assert_eq!(model.load_cases[0].member.len(), 1);
+        assert_eq!(model.load_cases[0].member[0], load);
     }
 
     #[test]

@@ -209,11 +209,34 @@ pub struct NodalLoad {
     pub values: [f64; 6],
 }
 
+/// 部材（梁）荷重の種別。位置・強度はすべて部材ローカル x 軸（i→j）に沿った
+/// 距離 [mm] と強度で与える。作用方向は `MemberLoad::dir`（全体座標）で指定する。
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub enum MemberLoadKind {
+    /// 中間集中荷重: i 端から距離 `a` [mm] の位置に大きさ `p` [N]。
+    Point { a: f64, p: f64 },
+    /// 区間分布荷重: [`a`, `b`] 区間に強度 `w1`→`w2` [N/mm] の線形分布。
+    /// 等分布は `w1 == w2`、全長は `a = 0, b = L`、三角形は端の強度を 0 にする。
+    Distributed { a: f64, b: f64, w1: f64, w2: f64 },
+}
+
+/// 部材に作用する荷重。`dir` は全体座標系での作用方向（内部で正規化）。
+/// 既定の重力方向は `[0.0, 0.0, -1.0]`。
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct MemberLoad {
+    pub elem: ElemId,
+    pub dir: [f64; 3],
+    pub kind: MemberLoadKind,
+}
+
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct LoadCase {
     pub id: LoadCaseId,
     pub name: String,
     pub nodal: Vec<NodalLoad>,
+    /// 部材（梁）荷重。既存データとの後方互換のため `#[serde(default)]`。
+    #[serde(default)]
+    pub member: Vec<MemberLoad>,
 }
 
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]

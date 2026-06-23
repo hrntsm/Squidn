@@ -59,6 +59,13 @@ pub fn linear_static_once(model: &Model, lc: LoadCaseId) -> Result<StaticOnce, S
 
         let mut member_forces = Vec::new();
         let _ctx = sc_element::behavior::Ctx { model };
+        // 解析対象荷重ケースの部材荷重（内力回復の重ね合わせ用）
+        let member_loads: &[sc_core::model::MemberLoad] = model
+            .load_cases
+            .iter()
+            .find(|l| l.id == lc)
+            .map(|l| l.member.as_slice())
+            .unwrap_or(&[]);
         for elem in &model.elements {
             let (behavior, _state) = build_behavior(elem, model);
             let gdofs = behavior.global_dofs(&dofmap);
@@ -71,7 +78,8 @@ pub fn linear_static_once(model: &Model, lc: LoadCaseId) -> Result<StaticOnce, S
                 }
             }
 
-            if let Some(forces) = behavior.recover_forces(&u_elem) {
+            if let Some(mut forces) = behavior.recover_forces(&u_elem) {
+                superpose_member_loads(model, elem, member_loads, &mut forces);
                 member_forces.push((elem.id, forces));
             }
         }
@@ -89,15 +97,303 @@ pub fn linear_static_once(model: &Model, lc: LoadCaseId) -> Result<StaticOnce, S
     }
 }
 
+/// 部材荷重の固定端内力を、`K·u` 由来の回復内力へ各断面で重ね合わせる。
+/// 線形重ね合わせ: 実内力 = （等価節点力に対する応答 K·u）＋（両端固定梁のスパン内力）。
+fn superpose_member_loads(
+    model: &Model,
+    elem: &sc_core::model::ElementData,
+    member_loads: &[sc_core::model::MemberLoad],
+    forces: &mut sc_element::beam::MemberForces,
+) {
+    use sc_element::transform::LocalFrame;
+
+    if elem.nodes.len() < 2 {
+        return;
+    }
+    let loads: Vec<sc_core::model::MemberLoad> = member_loads
+        .iter()
+        .filter(|ml| ml.elem == elem.id)
+        .cloned()
+        .collect();
+    if loads.is_empty() {
+        return;
+    }
+    let ni = elem.nodes[0].index();
+    let nj = elem.nodes[1].index();
+    if ni >= model.nodes.len() || nj >= model.nodes.len() {
+        return;
+    }
+    let p_i = model.nodes[ni].coord;
+    let p_j = model.nodes[nj].coord;
+    let dx = p_j[0] - p_i[0];
+    let dy = p_j[1] - p_i[1];
+    let dz = p_j[2] - p_i[2];
+    let length = (dx * dx + dy * dy + dz * dz).sqrt();
+    if length < 1e-9 {
+        return;
+    }
+    let frame = LocalFrame::from_nodes(p_i, p_j, elem.local_axis.ref_vector);
+    for (xi, vals) in forces.at.iter_mut() {
+        let fixed = sc_element::member_load::fixed_internal_local(&loads, &frame, length, *xi);
+        for k in 0..6 {
+            vals[k] += fixed[k];
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use sc_core::dof::Dof6Mask;
     use sc_core::ids::{ElemId, LoadCaseId, MaterialId, NodeId, SectionId, StoryId};
     use sc_core::model::{
-        ElementData, ElementKind, EndCondition, ForceRegime, LoadCase, LocalAxis, Material, Model,
-        NodalLoad, Node, Section,
+        ElementData, ElementKind, EndCondition, ForceRegime, LoadCase, LocalAxis, Material,
+        MemberLoad, MemberLoadKind, Model, NodalLoad, Node, Section,
     };
+
+    /// 単純梁（i:ピン, j:ローラ）に等分布荷重 → 中央曲げ wL²/8、端部 0 を検証。
+    /// 曲げは静定なので EI に依らず厳密。組立（等価節点力）＋回復（重ね合わせ）の総合検証。
+    #[test]
+    fn simply_supported_udl_midspan_moment() {
+        let l = 1000.0_f64;
+        let w = 2.0_f64; // N/mm（下向き -Z）
+        let model = Model {
+            nodes: vec![
+                Node {
+                    id: NodeId(0),
+                    coord: [0.0, 0.0, 0.0],
+                    // Ux,Uy,Uz,Rx 拘束（並進ピン＋ねじり剛体モード除去）
+                    restraint: Dof6Mask(0b001111),
+                    mass: None,
+                    story: None,
+                },
+                Node {
+                    id: NodeId(1),
+                    coord: [l, 0.0, 0.0],
+                    // Uy,Uz 拘束（ローラ。Ux 自由）
+                    restraint: Dof6Mask(0b000110),
+                    mass: None,
+                    story: None,
+                },
+            ],
+            elements: vec![ElementData {
+                id: ElemId(0),
+                kind: ElementKind::Beam,
+                nodes: smallvec::smallvec![NodeId(0), NodeId(1)],
+                section: Some(SectionId(0)),
+                material: Some(MaterialId(0)),
+                local_axis: LocalAxis {
+                    ref_vector: [0.0, 0.0, 1.0],
+                },
+                end_cond: [EndCondition::Fixed, EndCondition::Fixed],
+                force_regime: ForceRegime::Auto,
+                rigid_zone: Default::default(),
+            }],
+            sections: vec![Section {
+                id: SectionId(0),
+                name: "s".into(),
+                area: 1000.0,
+                iy: 1.0e7,
+                iz: 1.0e7,
+                j: 1.0e6,
+                depth: 200.0,
+                width: 100.0,
+                as_y: 800.0,
+                as_z: 800.0,
+                panel_thickness: None,
+                thickness: None,
+            }],
+            materials: vec![Material {
+                id: MaterialId(0),
+                name: "m".into(),
+                young: 205000.0,
+                poisson: 0.3,
+                density: 0.0,
+                shear: None,
+                fc: None,
+                fy: None,
+            }],
+            load_cases: vec![LoadCase {
+                id: LoadCaseId(1),
+                name: "udl".into(),
+                nodal: vec![],
+                member: vec![MemberLoad {
+                    elem: ElemId(0),
+                    dir: [0.0, 0.0, -1.0],
+                    kind: MemberLoadKind::Distributed {
+                        a: 0.0,
+                        b: l,
+                        w1: w,
+                        w2: w,
+                    },
+                }],
+            }],
+            ..Default::default()
+        };
+
+        let res = linear_static_once(&model, LoadCaseId(1)).expect("solve");
+        let (_, mf) = res
+            .member_forces
+            .iter()
+            .find(|(id, _)| *id == ElemId(0))
+            .expect("member forces for elem 0");
+
+        let expected_mid = w * l * l / 8.0; // 250000
+        let mut mid_mz = None;
+        let mut end_mz_max = 0.0_f64;
+        for (xi, vals) in &mf.at {
+            let mz = vals[5];
+            if (xi - 0.5).abs() < 1e-9 {
+                mid_mz = Some(mz);
+            }
+            if (*xi < 1e-9) || ((xi - 1.0).abs() < 1e-9) {
+                end_mz_max = end_mz_max.max(mz.abs());
+            }
+        }
+        let mid = mid_mz.expect("midspan section present");
+        assert!(
+            (mid.abs() - expected_mid).abs() / expected_mid < 1e-3,
+            "midspan Mz={} expected {}",
+            mid,
+            expected_mid
+        );
+        assert!(
+            end_mz_max < expected_mid * 1e-3,
+            "end Mz should be ~0, got {}",
+            end_mz_max
+        );
+    }
+
+    /// 単純梁モデル（長さ l、i:ピン+ねじり拘束, j:ローラ）を指定の部材荷重で作る。
+    fn ss_beam(l: f64, member: Vec<MemberLoad>) -> Model {
+        Model {
+            nodes: vec![
+                Node {
+                    id: NodeId(0),
+                    coord: [0.0, 0.0, 0.0],
+                    restraint: Dof6Mask(0b001111),
+                    mass: None,
+                    story: None,
+                },
+                Node {
+                    id: NodeId(1),
+                    coord: [l, 0.0, 0.0],
+                    restraint: Dof6Mask(0b000110),
+                    mass: None,
+                    story: None,
+                },
+            ],
+            elements: vec![ElementData {
+                id: ElemId(0),
+                kind: ElementKind::Beam,
+                nodes: smallvec::smallvec![NodeId(0), NodeId(1)],
+                section: Some(SectionId(0)),
+                material: Some(MaterialId(0)),
+                local_axis: LocalAxis {
+                    ref_vector: [0.0, 0.0, 1.0],
+                },
+                end_cond: [EndCondition::Fixed, EndCondition::Fixed],
+                force_regime: ForceRegime::Auto,
+                rigid_zone: Default::default(),
+            }],
+            sections: vec![Section {
+                id: SectionId(0),
+                name: "s".into(),
+                area: 1000.0,
+                iy: 1.0e7,
+                iz: 1.0e7,
+                j: 1.0e6,
+                depth: 200.0,
+                width: 100.0,
+                as_y: 800.0,
+                as_z: 800.0,
+                panel_thickness: None,
+                thickness: None,
+            }],
+            materials: vec![Material {
+                id: MaterialId(0),
+                name: "m".into(),
+                young: 205000.0,
+                poisson: 0.3,
+                density: 0.0,
+                shear: None,
+                fc: None,
+                fy: None,
+            }],
+            load_cases: vec![LoadCase {
+                id: LoadCaseId(1),
+                name: "lc".into(),
+                nodal: vec![],
+                member,
+            }],
+            ..Default::default()
+        }
+    }
+
+    fn mid_value(mf: &sc_element::beam::MemberForces, comp: usize) -> f64 {
+        mf.at
+            .iter()
+            .find(|(xi, _)| (xi - 0.5).abs() < 1e-9)
+            .map(|(_, v)| v[comp])
+            .expect("midspan")
+    }
+
+    /// 単純梁・中央集中荷重 P → 中央曲げ PL/4。
+    #[test]
+    fn simply_supported_point_mid_moment() {
+        let l = 1000.0_f64;
+        let p = 500.0_f64;
+        let model = ss_beam(
+            l,
+            vec![MemberLoad {
+                elem: ElemId(0),
+                dir: [0.0, 0.0, -1.0],
+                kind: MemberLoadKind::Point { a: l / 2.0, p },
+            }],
+        );
+        let res = linear_static_once(&model, LoadCaseId(1)).expect("solve");
+        let (_, mf) = res.member_forces.iter().find(|(id, _)| *id == ElemId(0)).unwrap();
+        let expected = p * l / 4.0;
+        let mid = mid_value(mf, 5).abs();
+        assert!(
+            (mid - expected).abs() / expected < 1e-3,
+            "point mid Mz={} expected {}",
+            mid,
+            expected
+        );
+    }
+
+    /// 単純梁・全体 Y 方向 UDL（ローカル z 面）→ 中央 My = wL²/8。z 面の符号検証。
+    #[test]
+    fn simply_supported_udl_zplane_moment() {
+        let l = 1000.0_f64;
+        let w = 1.5_f64;
+        let model = ss_beam(
+            l,
+            vec![MemberLoad {
+                elem: ElemId(0),
+                dir: [0.0, -1.0, 0.0],
+                kind: MemberLoadKind::Distributed {
+                    a: 0.0,
+                    b: l,
+                    w1: w,
+                    w2: w,
+                },
+            }],
+        );
+        let res = linear_static_once(&model, LoadCaseId(1)).expect("solve");
+        let (_, mf) = res.member_forces.iter().find(|(id, _)| *id == ElemId(0)).unwrap();
+        let expected = w * l * l / 8.0;
+        let mid = mid_value(mf, 4).abs(); // My
+        assert!(
+            (mid - expected).abs() / expected < 1e-3,
+            "zplane mid My={} expected {}",
+            mid,
+            expected
+        );
+        // ねじり・Mz は概ね 0
+        assert!(mid_value(mf, 5).abs() < expected * 1e-3, "Mz leak");
+    }
 
     fn make_axial_cantilever() -> Model {
         Model {
@@ -161,6 +457,7 @@ mod tests {
                     node: NodeId(1),
                     values: [1000.0, 0.0, 0.0, 0.0, 0.0, 0.0],
                 }],
+                member: vec![],
             }],
             ..Default::default()
         }
@@ -318,6 +615,7 @@ mod tests {
                     node: NodeId(1),
                     values: [1000.0, 0.0, 0.0, 0.0, 0.0, 0.0],
                 }],
+                member: vec![],
             }],
             ..Default::default()
         };
@@ -408,6 +706,7 @@ mod tests {
                     node: NodeId(2),
                     values: [0.0, 0.0, 1.0, 0.0, 0.0, 0.0],
                 }],
+                member: vec![],
             }],
             ..Default::default()
         };
@@ -622,6 +921,7 @@ mod tests {
                     node: NodeId(8),
                     values: [0.0, 0.0, 1.0, 0.0, 0.0, 0.0],
                 }],
+                member: vec![],
             }],
             ..Default::default()
         };
@@ -708,6 +1008,7 @@ mod tests {
                     node: NodeId(2),
                     values: [0.0, 0.0, 1.0, 0.0, 0.0, 0.0],
                 }],
+                member: vec![],
             }],
             ..Default::default()
         };
@@ -828,6 +1129,7 @@ mod tests {
                     node: NodeId(2),
                     values: [0.0, 0.0, 1.0, 0.0, 0.0, 0.0],
                 }],
+                member: vec![],
             }],
             ..Default::default()
         };
@@ -944,6 +1246,7 @@ mod tests {
                 id: LoadCaseId(1),
                 name: "q".into(),
                 nodal,
+                member: vec![],
             }],
             ..Default::default()
         }

@@ -73,7 +73,60 @@ pub fn assemble_global_f(model: &Model, dofmap: &DofMap, lc: LoadCaseId) -> Vec<
                 }
             }
         }
+
+        // 部材（梁）荷重 → 等価節点力（consistent load vector）を全体系へ加算。
+        add_member_loads(model, dofmap, &lc_data.member, &mut f);
     }
 
     f
+}
+
+/// 部材荷重の等価節点力を local で計算し、全体系へ回して荷重ベクトルへ散布する。
+fn add_member_loads(
+    model: &Model,
+    dofmap: &DofMap,
+    member_loads: &[sc_core::model::MemberLoad],
+    f: &mut [f64],
+) {
+    use sc_element::transform::LocalFrame;
+
+    for elem in &model.elements {
+        // この部材に作用する荷重だけ収集
+        let loads: Vec<sc_core::model::MemberLoad> = member_loads
+            .iter()
+            .filter(|ml| ml.elem == elem.id)
+            .cloned()
+            .collect();
+        if loads.is_empty() || elem.nodes.len() < 2 {
+            continue;
+        }
+        let ni = elem.nodes[0].index();
+        let nj = elem.nodes[1].index();
+        if ni >= model.nodes.len() || nj >= model.nodes.len() {
+            continue;
+        }
+        let p_i = model.nodes[ni].coord;
+        let p_j = model.nodes[nj].coord;
+        let length = {
+            let dx = p_j[0] - p_i[0];
+            let dy = p_j[1] - p_i[1];
+            let dz = p_j[2] - p_i[2];
+            (dx * dx + dy * dy + dz * dz).sqrt()
+        };
+        if length < 1e-9 {
+            continue;
+        }
+        let frame = LocalFrame::from_nodes(p_i, p_j, elem.local_axis.ref_vector);
+        let q_local = sc_element::member_load::consistent_load_local(&loads, &frame, length);
+        let q_global = frame.rotate_to_global(&q_local);
+        // q_global: [i:0..6, j:6..12] を各節点 DOF へ散布
+        for (local_node, &node_idx) in [ni, nj].iter().enumerate() {
+            for d in 0..DOF_PER_NODE {
+                let g = node_idx * DOF_PER_NODE + d;
+                if let Some(active) = dofmap.active(g) {
+                    f[active as usize] += q_global[local_node * DOF_PER_NODE + d];
+                }
+            }
+        }
+    }
 }

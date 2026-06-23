@@ -277,6 +277,7 @@ impl<'m> Analysis<'m> {
             id: lc_id,
             name: format!("seismic_{:?}_{:?}", dir, mode),
             nodal: Vec::new(),
+            member: Vec::new(),
         };
 
         for (i, story) in stories.iter().enumerate() {
@@ -434,6 +435,7 @@ mod tests {
                         node: NodeId(1),
                         values: [1000.0, 0.0, 0.0, 0.0, 0.0, 0.0],
                     }],
+                    member: Vec::new(),
                 },
                 LoadCase {
                     id: LoadCaseId(2),
@@ -442,6 +444,7 @@ mod tests {
                         node: NodeId(1),
                         values: [0.0, 500.0, 0.0, 0.0, 0.0, 0.0],
                     }],
+                    member: Vec::new(),
                 },
             ],
             combinations: vec![LoadCombination {
