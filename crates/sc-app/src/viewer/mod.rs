@@ -112,7 +112,12 @@ pub fn viewer_panel(ui: &mut egui::Ui, app: &mut App) {
     // --- 梁作成モード ---
     // ON 中はクリックで節点を選び、2 点目で梁を生成する（OFF 中は部材クリック=断面割当）。
     ui.horizontal(|ui| {
+        let beam_was_on = app.beam_draw_mode;
         ui.toggle_value(&mut app.beam_draw_mode, "梁作成モード");
+        // 梁作成を ON にしたら壁作成は OFF（排他）
+        if app.beam_draw_mode && !beam_was_on {
+            app.wall_draw_mode = false;
+        }
         if app.beam_draw_mode {
             match app.beam_draw_first {
                 None => {
@@ -130,6 +135,40 @@ pub fn viewer_panel(ui: &mut egui::Ui, app: &mut App) {
     // モード OFF 時は始点選択をクリア
     if !app.beam_draw_mode {
         app.beam_draw_first = None;
+    }
+
+    // --- 壁作成モード ---
+    // ON 中はクリックで柱・梁に囲まれた 4 節点を順に選び、4 点目で壁を生成する。
+    ui.horizontal(|ui| {
+        let wall_was_on = app.wall_draw_mode;
+        ui.toggle_value(&mut app.wall_draw_mode, "壁作成モード");
+        // 壁作成を ON にしたら梁作成は OFF（排他）
+        if app.wall_draw_mode && !wall_was_on {
+            app.beam_draw_mode = false;
+        }
+        if app.wall_draw_mode {
+            let picked: Vec<String> = app
+                .wall_draw_nodes
+                .iter()
+                .map(|n| format!("N{}", n.0))
+                .collect();
+            ui.label(format!(
+                "節点を4つクリック ({}/4){}",
+                app.wall_draw_nodes.len(),
+                if picked.is_empty() {
+                    String::new()
+                } else {
+                    format!(": {}", picked.join(", "))
+                }
+            ));
+            if !app.wall_draw_nodes.is_empty() && ui.button("キャンセル").clicked() {
+                app.wall_draw_nodes.clear();
+            }
+        }
+    });
+    // モード OFF 時は選択をクリア
+    if !app.wall_draw_mode {
+        app.wall_draw_nodes.clear();
     }
 
     // --- 断面割当 UI ---
@@ -307,7 +346,7 @@ pub fn viewer_panel(ui: &mut egui::Ui, app: &mut App) {
                 let mut best: Option<(usize, f32)> = None;
                 for (i, &p) in pts.iter().enumerate() {
                     let d = (click_pos - egui::pos2(p[0], p[1])).length();
-                    if best.map_or(true, |(_, bd)| d < bd) {
+                    if best.is_none_or(|(_, bd)| d < bd) {
                         best = Some((i, d));
                     }
                 }
@@ -353,6 +392,52 @@ pub fn viewer_panel(ui: &mut egui::Ui, app: &mut App) {
                         }
                     }
                 }
+            } else if app.wall_draw_mode {
+                // 壁作成モード：クリック位置に最も近い節点を選ぶ
+                let mut best: Option<(usize, f32)> = None;
+                for (i, &p) in pts.iter().enumerate() {
+                    let d = (click_pos - egui::pos2(p[0], p[1])).length();
+                    if best.is_none_or(|(_, bd)| d < bd) {
+                        best = Some((i, d));
+                    }
+                }
+                // 節点ピッキング許容距離（px）
+                const NODE_PICK_THRESHOLD: f32 = 10.0;
+                if let Some((i, d)) = best {
+                    if d <= NODE_PICK_THRESHOLD {
+                        let node_id = app.model.nodes[i].id;
+                        // 同一節点の重複選択は無視
+                        if !app.wall_draw_nodes.contains(&node_id) {
+                            app.wall_draw_nodes.push(node_id);
+                        }
+                        // 4 点そろったら壁を生成
+                        if app.wall_draw_nodes.len() == 4 {
+                            let ordered = order_wall_nodes(&app.model, &app.wall_draw_nodes);
+                            let new_id = sc_core::ids::ElemId(app.model.elements.len() as u32);
+                            let elem = sc_core::model::ElementData {
+                                id: new_id,
+                                kind: sc_core::model::ElementKind::Wall,
+                                nodes: ordered.into_iter().collect(),
+                                section: None,
+                                material: None,
+                                local_axis: sc_core::model::LocalAxis {
+                                    ref_vector: [0.0, 0.0, 1.0],
+                                },
+                                end_cond: [
+                                    sc_core::model::EndCondition::Fixed,
+                                    sc_core::model::EndCondition::Fixed,
+                                ],
+                                force_regime: sc_core::model::ForceRegime::Auto,
+                                rigid_zone: Default::default(),
+                            };
+                            app.undo
+                                .run(&mut app.model, Box::new(sc_edit::AddMember { elem }));
+                            app.staleness.mark_edited();
+                            app.nav.focus_member = Some(new_id);
+                            app.wall_draw_nodes.clear();
+                        }
+                    }
+                }
             } else {
                 // 通常モード：クリック位置に最も近い部材線分を選び、閾値内なら選択。
                 let mut best: Option<(sc_core::ids::ElemId, f32)> = None;
@@ -368,7 +453,7 @@ pub fn viewer_panel(ui: &mut egui::Ui, app: &mut App) {
                     let a = egui::pos2(pts[n0][0], pts[n0][1]);
                     let b = egui::pos2(pts[n1][0], pts[n1][1]);
                     let d = dist_point_to_segment(click_pos, a, b);
-                    if best.map_or(true, |(_, bd)| d < bd) {
+                    if best.is_none_or(|(_, bd)| d < bd) {
                         best = Some((elem.id, d));
                     }
                 }
@@ -387,10 +472,12 @@ pub fn viewer_panel(ui: &mut egui::Ui, app: &mut App) {
         }
     }
 
-    // 節点（梁作成モードの始点は強調表示）
+    // 節点（梁/壁作成モードで選択中の節点は強調表示）
     for (i, &p) in pts.iter().enumerate() {
-        let is_first = app.beam_draw_first == Some(app.model.nodes[i].id);
-        let (radius, color) = if is_first {
+        let node_id = app.model.nodes[i].id;
+        let is_first = app.beam_draw_first == Some(node_id);
+        let is_wall_pick = app.wall_draw_nodes.contains(&node_id);
+        let (radius, color) = if is_first || is_wall_pick {
             (5.0, egui::Color32::from_rgb(255, 120, 120))
         } else {
             (3.0, egui::Color32::from_rgb(100, 200, 255))
@@ -405,6 +492,25 @@ pub fn viewer_panel(ui: &mut egui::Ui, app: &mut App) {
         egui::Color32::from_gray(200)
     };
     for elem in &app.model.elements {
+        // 壁（面要素）は半透明ポリゴンで描画
+        if elem.kind == sc_core::model::ElementKind::Wall && elem.nodes.len() >= 3 {
+            let poly: Vec<egui::Pos2> = elem
+                .nodes
+                .iter()
+                .filter_map(|n| {
+                    let idx = n.index();
+                    (idx < pts.len()).then(|| egui::pos2(pts[idx][0], pts[idx][1]))
+                })
+                .collect();
+            if poly.len() == elem.nodes.len() {
+                painter.add(egui::Shape::convex_polygon(
+                    poly,
+                    egui::Color32::from_rgba_unmultiplied(120, 180, 255, 50),
+                    egui::Stroke::new(1.5, egui::Color32::from_rgb(120, 180, 255)),
+                ));
+            }
+            continue;
+        }
         if elem.nodes.len() < 2 {
             continue;
         }
@@ -648,6 +754,92 @@ fn draw_cmq_diagram(painter: &egui::Painter, app: &App, pts: &[[f32; 2]]) {
         egui::FontId::proportional(14.0),
         egui::Color32::from_gray(220),
     );
+}
+
+/// 壁の頂点を自己交差しない多角形になるよう並べ替える。
+/// クリック順は任意なので、節点の重心まわりの偏角で反時計回りにソートする。
+/// 節点が同一平面上にあることを前提に、面内 2 軸へ投影して角度を求める。
+fn order_wall_nodes(
+    model: &sc_core::model::Model,
+    node_ids: &[sc_core::ids::NodeId],
+) -> Vec<sc_core::ids::NodeId> {
+    // 各節点の座標を取得（見つからなければ並べ替えせず返す）
+    let coords: Vec<[f64; 3]> = node_ids
+        .iter()
+        .map(|id| {
+            model
+                .nodes
+                .iter()
+                .find(|n| n.id == *id)
+                .map(|n| n.coord)
+                .unwrap_or([0.0; 3])
+        })
+        .collect();
+    if coords.len() < 3 {
+        return node_ids.to_vec();
+    }
+
+    // 重心
+    let n = coords.len() as f64;
+    let centroid = [
+        coords.iter().map(|c| c[0]).sum::<f64>() / n,
+        coords.iter().map(|c| c[1]).sum::<f64>() / n,
+        coords.iter().map(|c| c[2]).sum::<f64>() / n,
+    ];
+
+    // 面の法線（最初の非共線な 3 点の外積）。面内基底 u, v を作る。
+    let sub = |a: [f64; 3], b: [f64; 3]| [a[0] - b[0], a[1] - b[1], a[2] - b[2]];
+    let cross = |a: [f64; 3], b: [f64; 3]| {
+        [
+            a[1] * b[2] - a[2] * b[1],
+            a[2] * b[0] - a[0] * b[2],
+            a[0] * b[1] - a[1] * b[0],
+        ]
+    };
+    let norm = |v: [f64; 3]| (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
+
+    let u = {
+        let d = sub(coords[1], coords[0]);
+        let len = norm(d);
+        if len < 1e-9 {
+            [1.0, 0.0, 0.0]
+        } else {
+            [d[0] / len, d[1] / len, d[2] / len]
+        }
+    };
+    // u に直交し面内に収まる v を、法線×u から作る
+    let mut normal = [0.0; 3];
+    for c in coords.iter().skip(2) {
+        let cand = cross(sub(coords[1], coords[0]), sub(*c, coords[0]));
+        if norm(cand) > 1e-9 {
+            normal = cand;
+            break;
+        }
+    }
+    let v = {
+        let cand = cross(normal, u);
+        let len = norm(cand);
+        if len < 1e-9 {
+            // 退化（共線）時は並べ替えしない
+            return node_ids.to_vec();
+        }
+        [cand[0] / len, cand[1] / len, cand[2] / len]
+    };
+
+    // 重心からの相対ベクトルを (u, v) に投影し偏角でソート
+    let mut indexed: Vec<(usize, f64)> = coords
+        .iter()
+        .enumerate()
+        .map(|(i, c)| {
+            let r = sub(*c, centroid);
+            let pu = r[0] * u[0] + r[1] * u[1] + r[2] * u[2];
+            let pv = r[0] * v[0] + r[1] * v[1] + r[2] * v[2];
+            (i, pv.atan2(pu))
+        })
+        .collect();
+    indexed.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+
+    indexed.into_iter().map(|(i, _)| node_ids[i]).collect()
 }
 
 /// 点 p から線分 ab までの最短距離（スクリーン座標, px）。

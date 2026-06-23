@@ -135,6 +135,12 @@ pub struct App {
     /// 梁作成モードで選択済みの始点節点（2 点目で梁を生成しリセット）
     #[cfg(feature = "gui")]
     pub beam_draw_first: Option<sc_core::ids::NodeId>,
+    /// ビューアの壁作成モード（ON 中はクリックで節点を選び 4 点で壁を作る）
+    #[cfg(feature = "gui")]
+    pub wall_draw_mode: bool,
+    /// 壁作成モードで選択済みの節点（4 点目で壁を生成しリセット）
+    #[cfg(feature = "gui")]
+    pub wall_draw_nodes: Vec<sc_core::ids::NodeId>,
 }
 
 impl Default for App {
@@ -173,6 +179,10 @@ impl Default for App {
             beam_draw_mode: false,
             #[cfg(feature = "gui")]
             beam_draw_first: None,
+            #[cfg(feature = "gui")]
+            wall_draw_mode: false,
+            #[cfg(feature = "gui")]
+            wall_draw_nodes: Vec::new(),
         }
     }
 }
