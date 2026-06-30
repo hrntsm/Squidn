@@ -161,94 +161,88 @@ pub fn nodes_table(ui: &mut egui::Ui, app: &mut App) {
 
     // バッファを戻す
     app.node_edit = node_edit;
-
-    ui.add_space(8.0);
-    ui.separator();
-    boundary_condition_panel(ui, app);
 }
 
-/// 境界条件（拘束）の編集パネル。節点一覧・追加フォームとは完全に独立した UI。
+/// 境界条件（拘束）タブ：節点一覧・追加フォームとは別の独立したサブタブ。
 /// 節点を選んでから 自由／ピン／固定 やチェックボックスで拘束成分を設定する。
-fn boundary_condition_panel(ui: &mut egui::Ui, app: &mut App) {
-    ui.group(|ui| {
-        ui.strong("境界条件");
-        if app.model.nodes.is_empty() {
-            ui.label("節点がありません");
-            return;
-        }
+pub fn boundary_condition_panel(ui: &mut egui::Ui, app: &mut App) {
+    if app.model.nodes.is_empty() {
+        ui.label("節点がありません（先に「節点」タブで節点を追加してください）");
+        return;
+    }
 
-        let node_ids: Vec<NodeId> = app.model.nodes.iter().map(|n| n.id).collect();
-        let selected = app
-            .nav
-            .focus_node
-            .filter(|id| node_ids.contains(id))
-            .unwrap_or(node_ids[0]);
-        app.nav.focus_node = Some(selected);
+    let node_ids: Vec<NodeId> = app.model.nodes.iter().map(|n| n.id).collect();
+    let selected = app
+        .nav
+        .focus_node
+        .filter(|id| node_ids.contains(id))
+        .unwrap_or(node_ids[0]);
+    app.nav.focus_node = Some(selected);
 
-        ui.horizontal(|ui| {
-            ui.label("対象節点:");
-            egui::ComboBox::from_id_salt("bc_node_select")
-                .selected_text(format!("N{}", selected.0))
-                .show_ui(ui, |ui| {
-                    for id in &node_ids {
-                        if ui
-                            .selectable_label(selected == *id, format!("N{}", id.0))
-                            .clicked()
-                        {
-                            app.nav.focus_node = Some(*id);
-                        }
+    ui.horizontal(|ui| {
+        ui.label("対象節点:");
+        egui::ComboBox::from_id_salt("bc_node_select")
+            .selected_text(format!("N{}", selected.0))
+            .show_ui(ui, |ui| {
+                for id in &node_ids {
+                    if ui
+                        .selectable_label(selected == *id, format!("N{}", id.0))
+                        .clicked()
+                    {
+                        app.nav.focus_node = Some(*id);
                     }
-                });
-        });
-
-        let selected = app.nav.focus_node.unwrap_or(selected);
-        let Some(node) = app.model.nodes.iter().find(|n| n.id == selected) else {
-            return;
-        };
-        let r = node.restraint;
-        let mut pending_restraint: Option<Dof6Mask> = None;
-
-        ui.horizontal(|ui| {
-            // プリセットボタン（自由／ピン／固定）
-            if ui.small_button("自由").clicked() {
-                pending_restraint = Some(Dof6Mask::FREE);
-            }
-            if ui.small_button("ピン").clicked() {
-                pending_restraint = Some(Dof6Mask::PINNED);
-            }
-            if ui.small_button("固定").clicked() {
-                pending_restraint = Some(Dof6Mask::FIXED);
-            }
-        });
-        ui.horizontal_wrapped(|ui| {
-            // 各成分チェックボックス
-            use squid_n_core::dof::Dof;
-            for (d, lbl) in [
-                (Dof::Ux, "X"),
-                (Dof::Uy, "Y"),
-                (Dof::Uz, "Z"),
-                (Dof::Rx, "RX"),
-                (Dof::Ry, "RY"),
-                (Dof::Rz, "RZ"),
-            ] {
-                let mut on = r.is_fixed(d);
-                if ui.checkbox(&mut on, lbl).changed() {
-                    let mut new_mask = r;
-                    new_mask.set(d, on);
-                    pending_restraint = Some(new_mask);
                 }
-            }
-        });
+            });
+    });
+    ui.separator();
 
-        if let Some(mask) = pending_restraint {
-            app.undo.run(
-                &mut app.model,
-                Box::new(SetNodeRestraint {
-                    node: selected,
-                    restraint: mask,
-                }),
-            );
-            app.staleness.mark_edited();
+    let selected = app.nav.focus_node.unwrap_or(selected);
+    let Some(node) = app.model.nodes.iter().find(|n| n.id == selected) else {
+        return;
+    };
+    let r = node.restraint;
+    let mut pending_restraint: Option<Dof6Mask> = None;
+
+    ui.horizontal(|ui| {
+        // プリセットボタン（自由／ピン／固定）
+        if ui.small_button("自由").clicked() {
+            pending_restraint = Some(Dof6Mask::FREE);
+        }
+        if ui.small_button("ピン").clicked() {
+            pending_restraint = Some(Dof6Mask::PINNED);
+        }
+        if ui.small_button("固定").clicked() {
+            pending_restraint = Some(Dof6Mask::FIXED);
         }
     });
+    ui.horizontal_wrapped(|ui| {
+        // 各成分チェックボックス
+        use squid_n_core::dof::Dof;
+        for (d, lbl) in [
+            (Dof::Ux, "X"),
+            (Dof::Uy, "Y"),
+            (Dof::Uz, "Z"),
+            (Dof::Rx, "RX"),
+            (Dof::Ry, "RY"),
+            (Dof::Rz, "RZ"),
+        ] {
+            let mut on = r.is_fixed(d);
+            if ui.checkbox(&mut on, lbl).changed() {
+                let mut new_mask = r;
+                new_mask.set(d, on);
+                pending_restraint = Some(new_mask);
+            }
+        }
+    });
+
+    if let Some(mask) = pending_restraint {
+        app.undo.run(
+            &mut app.model,
+            Box::new(SetNodeRestraint {
+                node: selected,
+                restraint: mask,
+            }),
+        );
+        app.staleness.mark_edited();
+    }
 }

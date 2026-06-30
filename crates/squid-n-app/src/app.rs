@@ -22,6 +22,7 @@ pub enum Tab {
 pub enum ModelTab {
     #[default]
     Nodes,
+    BoundaryConditions,
     Members,
     Sections,
     Materials,
@@ -529,8 +530,7 @@ impl eframe::App for App {
                 (self.left_panel_width + resize_response.drag_delta().x).clamp(180.0, 520.0);
         }
         if resize_response.hovered() || resize_response.dragged() {
-            ui.ctx()
-                .set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
+            ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
         }
         ui.painter().vline(
             nav_rect.max.x,
@@ -700,6 +700,7 @@ impl App {
         ui.horizontal(|ui| {
             let subs = [
                 ("節点", ModelTab::Nodes),
+                ("境界条件", ModelTab::BoundaryConditions),
                 ("部材", ModelTab::Members),
                 ("断面", ModelTab::Sections),
                 ("材料", ModelTab::Materials),
@@ -714,6 +715,9 @@ impl App {
         ui.separator();
         match self.model_tab {
             ModelTab::Nodes => crate::tables::nodes::nodes_table(ui, self),
+            ModelTab::BoundaryConditions => {
+                crate::tables::nodes::boundary_condition_panel(ui, self)
+            }
             ModelTab::Members => crate::tables::members::members_table(ui, self),
             ModelTab::Sections => {
                 crate::tables::sections::sections_table(ui, self);
