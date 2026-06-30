@@ -160,10 +160,13 @@ impl EditCommand for AddNode {
     }
 }
 
-/// 節点削除。逆操作は節点追加。
+/// 節点削除（末尾以外の中間節点も可）。逆操作は [`InsertNode`]（元の位置に再挿入し、
+/// 繰り上がった ID・参照を元に戻す）。
 ///
-/// ID＝配列インデックスの不変条件を保つため、末尾の節点のみ削除可能とする
-/// （中間節点の削除は ID 再採番と部材参照の更新が必要なため未対応）。
+/// ID＝配列インデックスの不変条件を保つため、削除後は当該節点より後ろの
+/// 節点 ID と、それを参照する全ての箇所（部材・節点荷重・階・床・拘束）を
+/// 1 つずつ繰り上げる。部材などからまだ参照されている節点は削除すると
+/// 参照が壊れるため Noop とする（先に参照を解消する必要がある）。
 pub struct DeleteNode {
     pub id: NodeId,
 }
@@ -171,19 +174,127 @@ pub struct DeleteNode {
 impl EditCommand for DeleteNode {
     fn apply(&self, model: &mut Model) -> Box<dyn EditCommand> {
         let idx = self.id.index();
-        // 末尾以外、または ID 不一致は不正参照として Noop
-        if idx + 1 != model.nodes.len() || model.nodes[idx].id != self.id {
+        if idx >= model.nodes.len() || model.nodes[idx].id != self.id {
+            return Box::new(Noop);
+        }
+        if model.node_in_use(self.id) {
             return Box::new(Noop);
         }
         let removed = model.nodes.remove(idx);
-        Box::new(AddNode {
+        shift_node_ids(model, |id| {
+            if id.0 > self.id.0 {
+                id.0 -= 1;
+            }
+        });
+        Box::new(InsertNode {
+            index: idx,
             coord: removed.coord,
             restraint: removed.restraint,
+            mass: removed.mass,
+            story: removed.story,
         })
     }
 
     fn label(&self) -> &str {
         "節点削除"
+    }
+}
+
+/// 指定インデックスへ節点を再挿入し、以降の節点 ID・参照を 1 つ繰り下げる
+/// （[`DeleteNode`] の逆操作専用。新規追加は [`AddNode`] を使うこと）。
+pub struct InsertNode {
+    pub index: usize,
+    pub coord: [f64; 3],
+    pub restraint: squid_n_core::dof::Dof6Mask,
+    pub mass: Option<[f64; 6]>,
+    pub story: Option<squid_n_core::ids::StoryId>,
+}
+
+impl EditCommand for InsertNode {
+    fn apply(&self, model: &mut Model) -> Box<dyn EditCommand> {
+        let id = NodeId(self.index as u32);
+        shift_node_ids(model, |nid| {
+            if nid.0 >= id.0 {
+                nid.0 += 1;
+            }
+        });
+        model.nodes.insert(
+            self.index,
+            squid_n_core::model::Node {
+                id,
+                coord: self.coord,
+                restraint: self.restraint,
+                mass: self.mass,
+                story: self.story,
+            },
+        );
+        Box::new(DeleteNode { id })
+    }
+
+    fn label(&self) -> &str {
+        "節点削除の取り消し"
+    }
+}
+
+/// モデル内の全ての `NodeId` 参照（節点自身の ID を含む）に `f` を適用する。
+/// [`DeleteNode`]／[`InsertNode`] の ID 繰り上げ・繰り下げで共用する。
+fn shift_node_ids(model: &mut Model, mut f: impl FnMut(&mut NodeId)) {
+    for node in &mut model.nodes {
+        f(&mut node.id);
+    }
+    for elem in &mut model.elements {
+        for n in &mut elem.nodes {
+            f(n);
+        }
+    }
+    for story in &mut model.stories {
+        for n in &mut story.node_ids {
+            f(n);
+        }
+        for d in &mut story.diaphragms {
+            f(&mut d.master);
+            for s in &mut d.slaves {
+                f(s);
+            }
+        }
+    }
+    for slab in &mut model.slabs {
+        for n in &mut slab.boundary {
+            f(n);
+        }
+        for j in &mut slab.joists {
+            for n in &mut j.support {
+                f(n);
+            }
+        }
+    }
+    for c in &mut model.constraints {
+        use squid_n_core::model::Constraint;
+        match c {
+            Constraint::RigidDiaphragm { master, slaves, .. } => {
+                f(master);
+                for s in slaves {
+                    f(s);
+                }
+            }
+            Constraint::Mpc { master, terms } => {
+                f(master);
+                for (n, _, _) in terms {
+                    f(n);
+                }
+            }
+            Constraint::RigidLink { master, slaves, .. } => {
+                f(master);
+                for s in slaves {
+                    f(s);
+                }
+            }
+        }
+    }
+    for lc in &mut model.load_cases {
+        for nl in &mut lc.nodal {
+            f(&mut nl.node);
+        }
     }
 }
 
@@ -880,7 +991,60 @@ mod tests {
     }
 
     #[test]
-    fn test_delete_node_non_tail_is_noop() {
+    fn test_delete_node_middle_renumbers_and_roundtrips() {
+        let mut model = empty_model();
+        let mut stack = UndoStack::new();
+        for i in 0..3 {
+            model.nodes.push(Node {
+                id: NodeId(i),
+                coord: [i as f64, 0.0, 0.0],
+                restraint: Dof6Mask::FREE,
+                mass: None,
+                story: None,
+            });
+        }
+        // 末尾の節点（N2）を使う部材を用意し、中間節点（N1）削除後に
+        // 参照が N1 へ繰り上がることを確認する。
+        model.elements.push(ElementData {
+            id: squid_n_core::ids::ElemId(0),
+            kind: ElementKind::Beam,
+            nodes: smallvec![NodeId(0), NodeId(2)],
+            section: None,
+            material: None,
+            local_axis: LocalAxis {
+                ref_vector: [1.0, 0.0, 0.0],
+            },
+            end_cond: [EndCondition::Fixed, EndCondition::Fixed],
+            force_regime: ForceRegime::Auto,
+            rigid_zone: Default::default(),
+        });
+
+        stack.run(&mut model, Box::new(DeleteNode { id: NodeId(1) }));
+        assert_eq!(model.nodes.len(), 2);
+        assert_eq!(model.nodes[0].id, NodeId(0));
+        assert_eq!(model.nodes[1].id, NodeId(1));
+        assert_eq!(model.nodes[1].coord, [2.0, 0.0, 0.0]);
+        // 元 N2 だった部材参照は N1 に繰り上がる
+        assert_eq!(model.elements[0].nodes[1], NodeId(1));
+        assert!(model.validate().is_ok());
+
+        stack.undo(&mut model);
+        assert_eq!(model.nodes.len(), 3);
+        for (i, node) in model.nodes.iter().enumerate() {
+            assert_eq!(node.id, NodeId(i as u32));
+            assert_eq!(node.coord, [i as f64, 0.0, 0.0]);
+        }
+        assert_eq!(model.elements[0].nodes.to_vec(), vec![NodeId(0), NodeId(2)]);
+        assert!(model.validate().is_ok());
+
+        stack.redo(&mut model);
+        assert_eq!(model.nodes.len(), 2);
+        assert_eq!(model.elements[0].nodes[1], NodeId(1));
+        assert!(model.validate().is_ok());
+    }
+
+    #[test]
+    fn test_delete_node_in_use_is_noop() {
         let mut model = empty_model();
         let mut stack = UndoStack::new();
         model.nodes.push(Node {
@@ -897,9 +1061,24 @@ mod tests {
             mass: None,
             story: None,
         });
-        // 中間節点（末尾でない）の削除は Noop
+        model.elements.push(ElementData {
+            id: squid_n_core::ids::ElemId(0),
+            kind: ElementKind::Beam,
+            nodes: smallvec![NodeId(0), NodeId(1)],
+            section: None,
+            material: None,
+            local_axis: LocalAxis {
+                ref_vector: [1.0, 0.0, 0.0],
+            },
+            end_cond: [EndCondition::Fixed, EndCondition::Fixed],
+            force_regime: ForceRegime::Auto,
+            rigid_zone: Default::default(),
+        });
+
+        // 部材に使われている節点の削除は Noop（先に部材を削除する必要がある）
         stack.run(&mut model, Box::new(DeleteNode { id: NodeId(0) }));
         assert_eq!(model.nodes.len(), 2);
+        assert!(model.validate().is_ok());
     }
 
     #[test]

@@ -387,6 +387,36 @@ impl Model {
         Ok(())
     }
 
+    /// 指定した節点が部材・節点荷重・階・床・拘束のいずれかから参照されているかを判定する。
+    /// 参照中の節点を削除すると参照が壊れる（ダングリング）ため、削除前にこれで確認する。
+    pub fn node_in_use(&self, id: NodeId) -> bool {
+        self.elements.iter().any(|e| e.nodes.contains(&id))
+            || self
+                .load_cases
+                .iter()
+                .any(|lc| lc.nodal.iter().any(|nl| nl.node == id))
+            || self.stories.iter().any(|s| {
+                s.node_ids.contains(&id)
+                    || s.diaphragms
+                        .iter()
+                        .any(|d| d.master == id || d.slaves.contains(&id))
+            })
+            || self.slabs.iter().any(|sl| {
+                sl.boundary.contains(&id) || sl.joists.iter().any(|j| j.support.contains(&id))
+            })
+            || self.constraints.iter().any(|c| match c {
+                Constraint::RigidDiaphragm { master, slaves, .. } => {
+                    *master == id || slaves.contains(&id)
+                }
+                Constraint::Mpc { master, terms } => {
+                    *master == id || terms.iter().any(|(n, _, _)| *n == id)
+                }
+                Constraint::RigidLink { master, slaves, .. } => {
+                    *master == id || slaves.contains(&id)
+                }
+            })
+    }
+
     pub fn eq_ignoring_dofmap(&self, other: &Self) -> bool {
         self.nodes == other.nodes
             && self.elements == other.elements

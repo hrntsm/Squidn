@@ -114,12 +114,14 @@ pub fn nodes_table(ui: &mut egui::Ui, app: &mut App) {
                     });
                 }
                 row.col(|ui| {
-                    // ID＝配列インデックスの不変条件のため、削除できるのは末尾の節点のみ
-                    // （DeleteNode の制約。中間節点の削除は部材参照の更新が必要で未対応）。
-                    let is_last = i + 1 == n;
-                    let resp = ui.add_enabled(is_last, egui::Button::new("🗑"));
-                    if !is_last {
-                        resp.on_hover_text("末尾の節点のみ削除できます（部材参照の整合性のため）");
+                    // 部材・節点荷重などから参照中の節点は削除すると参照が壊れるため、
+                    // 先に参照を解消するまで無効化する（DeleteNode 側でも安全のため再確認する）。
+                    let in_use = app.model.node_in_use(node.id);
+                    let resp = ui.add_enabled(!in_use, egui::Button::new("🗑"));
+                    if in_use {
+                        resp.on_hover_text(
+                            "この節点は部材などに使用されているため削除できません（先に参照を解消してください）",
+                        );
                     } else if resp.on_hover_text("この節点を削除").clicked() {
                         pending_delete = Some(node.id);
                     }
