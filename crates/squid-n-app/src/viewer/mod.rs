@@ -919,6 +919,9 @@ pub fn viewer_panel(ui: &mut egui::Ui, app: &mut App) {
         draw_support_legend(&painter);
     }
 
+    // 左下にカメラ追従の座標系アイコン（常に手前に表示）
+    draw_axis_gadget(&painter, &cam);
+
     // カメラ状態を保存
     app.camera = cam;
 }
@@ -1247,10 +1250,32 @@ fn model_bbox_size(model: &squid_n_core::model::Model) -> f64 {
     ((max[0] - min[0]).powi(2) + (max[1] - min[1]).powi(2) + (max[2] - min[2]).powi(2)).sqrt()
 }
 
-/// §3-2 の 3D 規約に沿ってグリッド（XY/XZ/YZ の 3 面・各 4 分割）と
-/// 座標軸（赤=X / 緑=Y / 青=Z）・軸ラベルを描く。
+/// モデルサイズに応じた「きりの良い」グリッド間隔（1, 2, 5, 10, ... の倍数）を返す。
+/// モデルサイズの約 1/6 になる値を 1-2-5 系で丸める。
+fn nice_step(size: f64) -> f64 {
+    if size < 1e-9 {
+        return 1.0;
+    }
+    let target = size / 6.0;
+    let mag = 10.0_f64.powi(target.abs().log10().floor() as i32);
+    let norm = target / mag;
+    if norm < 1.5 {
+        mag
+    } else if norm < 3.5 {
+        2.0 * mag
+    } else if norm < 7.5 {
+        5.0 * mag
+    } else {
+        10.0 * mag
+    }
+}
+
+/// §3-2 の 3D 規約に沿ってグリッド・座標軸（赤=X / 緑=Y / 青=Z）・原点マーカーを描く。
 ///
-/// 構造モデルは実寸比を保つため軸の正規化は行わず、ラベルの最大/最小はワールド座標を表示する。
+/// グリッドはワールド原点 (0,0,0) を通る 3 面（XY/XZ/YZ）に、`nice_step` で求めた
+/// きりの良い間隔で格子線を引く。原点がモデル範囲外の場合は bmin 面にフォールバックする。
+/// 軸線は原点から両方向（正=濃色 / 負=淡色）へ伸ばし、原点位置を一目で判別できるようにする。
+/// 軸ラベルの値はワールド座標（実寸）を表示する。
 fn draw_grid_and_axes(
     painter: &egui::Painter,
     bmin: [f64; 3],
@@ -1265,16 +1290,21 @@ fn draw_grid_and_axes(
         egui::pos2(s[0], s[1])
     };
 
-    const DIV: usize = 4;
+    let model_size = [bmax[0] - bmin[0], bmax[1] - bmin[1], bmax[2] - bmin[2]];
+    let step = nice_step(model_size[0].max(model_size[1]).max(model_size[2]));
     // ダーク半透明・線幅 0.5（淡グレー背景の上で奥行きを示す）
     let grid_stroke = egui::Stroke::new(0.5, egui::Color32::from_black_alpha(36));
+    let origin: [f64; 3] = [0.0; 3];
 
-    // 1 面を DIV×DIV のグリッドで描く（fixed 軸を固定し a,b 軸方向に格子線）。
+    // 原点が各軸でモデル範囲内（1 メッシュ分のマージン）か
+    let origin_in = (0..3).all(|i| origin[i] >= bmin[i] - step && origin[i] <= bmax[i] + step);
+
+    // 1 面の格子線を描く。fixed 軸を fixed_val に固定し、a,b 軸方向に原点基準で線を引く。
     let plane = |fixed: usize, fixed_val: f64, a: usize, b: usize| {
-        for i in 0..=DIV {
-            let f = i as f64 / DIV as f64;
-            // a を固定して b 方向へ伸びる線
-            let av = bmin[a] + (bmax[a] - bmin[a]) * f;
+        let a_lo = (bmin[a] / step).floor() as i64;
+        let a_hi = (bmax[a] / step).ceil() as i64;
+        for k in a_lo..=a_hi {
+            let av = k as f64 * step;
             let mut p0 = [0.0; 3];
             p0[fixed] = fixed_val;
             p0[a] = av;
@@ -1282,8 +1312,11 @@ fn draw_grid_and_axes(
             let mut p1 = p0;
             p1[b] = bmax[b];
             painter.line_segment([proj(p0), proj(p1)], grid_stroke);
-            // b を固定して a 方向へ伸びる線
-            let bv = bmin[b] + (bmax[b] - bmin[b]) * f;
+        }
+        let b_lo = (bmin[b] / step).floor() as i64;
+        let b_hi = (bmax[b] / step).ceil() as i64;
+        for k in b_lo..=b_hi {
+            let bv = k as f64 * step;
             let mut q0 = [0.0; 3];
             q0[fixed] = fixed_val;
             q0[b] = bv;
@@ -1293,37 +1326,109 @@ fn draw_grid_and_axes(
             painter.line_segment([proj(q0), proj(q1)], grid_stroke);
         }
     };
-    plane(2, bmin[2], 0, 1); // XY 面（z=min）
-    plane(1, bmin[1], 0, 2); // XZ 面（y=min）
-    plane(0, bmin[0], 1, 2); // YZ 面（x=min）
 
-    // 座標軸（min 角から正方向へ）。赤=X / 緑=Y / 青=Z を全 3D ビューで固定。
-    let origin = bmin;
+    if origin_in {
+        plane(2, origin[2], 0, 1); // XY 面（z=0）
+        plane(1, origin[1], 0, 2); // XZ 面（y=0）
+        plane(0, origin[0], 1, 2); // YZ 面（x=0）
+    } else {
+        // 原点が範囲外なら bmin 面にフォールバック
+        plane(2, bmin[2], 0, 1);
+        plane(1, bmin[1], 0, 2);
+        plane(0, bmin[0], 1, 2);
+    }
+
+    // 原点からの座標軸（赤=X / 緑=Y / 青=Z）。正方向=濃色 / 負方向=淡色。
     for (axis, col, name) in [
         (0usize, theme::AXIS_X, "X"),
         (1, theme::AXIS_Y, "Y"),
         (2, theme::AXIS_Z, "Z"),
     ] {
-        let mut pe = origin;
-        pe[axis] = bmax[axis];
-        painter.line_segment([proj(origin), proj(pe)], egui::Stroke::new(1.5, col));
-        // 正方向端: 軸名 (最大値) 11px・軸色
+        // 正方向: 原点 → bmax
+        if bmax[axis] > origin[axis] {
+            let mut pe = origin;
+            pe[axis] = bmax[axis];
+            painter.line_segment([proj(origin), proj(pe)], egui::Stroke::new(1.5, col));
+            painter.text(
+                proj(pe),
+                egui::Align2::LEFT_BOTTOM,
+                format!("{} ({:.1})", name, bmax[axis]),
+                egui::FontId::proportional(11.0),
+                col,
+            );
+        }
+        // 負方向: 原点 → bmin（淡色）
+        if bmin[axis] < origin[axis] {
+            let mut pn = origin;
+            pn[axis] = bmin[axis];
+            painter.line_segment(
+                [proj(origin), proj(pn)],
+                egui::Stroke::new(1.0, theme::lighten(col, 0.45)),
+            );
+            painter.text(
+                proj(pn),
+                egui::Align2::RIGHT_TOP,
+                format!("{:.1}", bmin[axis]),
+                egui::FontId::proportional(10.0),
+                theme::lighten(col, 0.45),
+            );
+        }
+    }
+
+    // 原点マーカー（黒点 + "O" ラベル）
+    let op = proj(origin);
+    painter.circle_filled(op, 3.0, theme::GRAY_900);
+    painter.text(
+        egui::pos2(op.x + 6.0, op.y - 6.0),
+        egui::Align2::LEFT_BOTTOM,
+        "O",
+        egui::FontId::proportional(11.0),
+        theme::GRAY_900,
+    );
+}
+
+/// ビューポート左下にカメラの向きへ追従する座標系アイコン（XYZ 軸ガジェット）を描く。
+///
+/// CAD ソフトで一般的な、画面端に固定された小さな座標系。各軸をカメラの回転
+/// クォータニオンで投影し、Z（手前）成分でソートして奥から描くことで
+/// 手前の軸が上に重なる。軸色は 3D ビューと同一（赤=X / 緑=Y / 青=Z）。
+fn draw_axis_gadget(painter: &egui::Painter, cam: &CameraState) {
+    let rect = painter.clip_rect();
+    let center = egui::pos2(rect.min.x + 40.0, rect.max.y - 40.0);
+    const LEN: f32 = 28.0;
+
+    let axes: [([f32; 3], egui::Color32, &str); 3] = [
+        ([1.0, 0.0, 0.0], theme::AXIS_X, "X"),
+        ([0.0, 1.0, 0.0], theme::AXIS_Y, "Y"),
+        ([0.0, 0.0, 1.0], theme::AXIS_Z, "Z"),
+    ];
+
+    // 各軸をカメラ回転で投影。r[0]=右, r[1]=上（画面Yは下向きなので反転）, r[2]=手前
+    let mut projected: Vec<(egui::Vec2, egui::Color32, &str, f32)> = axes
+        .iter()
+        .map(|(v, col, name)| {
+            let r = q_rotate(cam.rot, *v);
+            (egui::vec2(r[0], -r[1]), *col, *name, r[2])
+        })
+        .collect();
+    // r[2]（手前=正）が小さい（奥）順に描く → 手前の軸が最後に描かれ上に来る
+    projected.sort_by(|a, b| a.3.partial_cmp(&b.3).unwrap_or(std::cmp::Ordering::Equal));
+
+    // 背景円（軸が背景と混ざらないよう淡い白）
+    painter.circle_filled(center, LEN + 8.0, theme::translucent(theme::WHITE, 200));
+
+    for (dir, col, name, _) in &projected {
+        let end = center + *dir * LEN;
+        draw_arrow(painter, center, end, *col);
+        let label_pos = center + *dir * (LEN + 10.0);
         painter.text(
-            proj(pe),
-            egui::Align2::LEFT_BOTTOM,
-            format!("{} ({:.1})", name, bmax[axis]),
-            egui::FontId::proportional(11.0),
-            col,
-        );
-        // 負方向端: 最小値 10px・軸色の淡色（3 軸ラベルの重なりを避け少し内側へ）
-        let mut pn = origin;
-        pn[axis] = bmin[axis] + (bmax[axis] - bmin[axis]) * 0.06;
-        painter.text(
-            proj(pn),
-            egui::Align2::RIGHT_TOP,
-            format!("{:.1}", bmin[axis]),
-            egui::FontId::proportional(10.0),
-            theme::lighten(col, 0.45),
+            label_pos,
+            egui::Align2::CENTER_CENTER,
+            *name,
+            egui::FontId::proportional(12.0),
+            *col,
         );
     }
+    // 中心点
+    painter.circle_filled(center, 2.0, theme::GRAY_900);
 }
