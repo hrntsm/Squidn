@@ -1273,7 +1273,9 @@ fn nice_step(size: f64) -> f64 {
 /// §3-2 の 3D 規約に沿ってグリッド・座標軸（赤=X / 緑=Y / 青=Z）・原点マーカーを描く。
 ///
 /// グリッドはワールド原点 (0,0,0) を通る 3 面（XY/XZ/YZ）に、`nice_step` で求めた
-/// きりの良い間隔で格子線を引く。原点がモデル範囲外の場合は bmin 面にフォールバックする。
+/// きりの良い間隔で格子線を引く。各軸の描画範囲はモデルのバウンディングボックスを
+/// 最低限広げて原点まわり ±1 メッシュを確保するため、1 次元的なモデル（梁1本など）
+/// でバウンディングボックスが縮退していてもグリッドが表示される。
 /// 軸線は原点から両方向（正=濃色 / 負=淡色）へ伸ばし、原点位置を一目で判別できるようにする。
 /// 軸ラベルの値はワールド座標（実寸）を表示する。
 fn draw_grid_and_axes(
@@ -1296,47 +1298,45 @@ fn draw_grid_and_axes(
     let grid_stroke = egui::Stroke::new(0.5, egui::Color32::from_black_alpha(36));
     let origin: [f64; 3] = [0.0; 3];
 
-    // 原点が各軸でモデル範囲内（1 メッシュ分のマージン）か
-    let origin_in = (0..3).all(|i| origin[i] >= bmin[i] - step && origin[i] <= bmax[i] + step);
+    // 各軸の描画範囲。縮退軸（サイズ < step）は原点まわりに最低 ±step を確保し、
+    // グリッド線が長さ 0 にならないようにする。
+    let range = [
+        (bmin[0].min(origin[0] - step), bmax[0].max(origin[0] + step)),
+        (bmin[1].min(origin[1] - step), bmax[1].max(origin[1] + step)),
+        (bmin[2].min(origin[2] - step), bmax[2].max(origin[2] + step)),
+    ];
 
     // 1 面の格子線を描く。fixed 軸を fixed_val に固定し、a,b 軸方向に原点基準で線を引く。
     let plane = |fixed: usize, fixed_val: f64, a: usize, b: usize| {
-        let a_lo = (bmin[a] / step).floor() as i64;
-        let a_hi = (bmax[a] / step).ceil() as i64;
+        let a_lo = (range[a].0 / step).floor() as i64;
+        let a_hi = (range[a].1 / step).ceil() as i64;
         for k in a_lo..=a_hi {
             let av = k as f64 * step;
             let mut p0 = [0.0; 3];
             p0[fixed] = fixed_val;
             p0[a] = av;
-            p0[b] = bmin[b];
+            p0[b] = range[b].0;
             let mut p1 = p0;
-            p1[b] = bmax[b];
+            p1[b] = range[b].1;
             painter.line_segment([proj(p0), proj(p1)], grid_stroke);
         }
-        let b_lo = (bmin[b] / step).floor() as i64;
-        let b_hi = (bmax[b] / step).ceil() as i64;
+        let b_lo = (range[b].0 / step).floor() as i64;
+        let b_hi = (range[b].1 / step).ceil() as i64;
         for k in b_lo..=b_hi {
             let bv = k as f64 * step;
             let mut q0 = [0.0; 3];
             q0[fixed] = fixed_val;
             q0[b] = bv;
-            q0[a] = bmin[a];
+            q0[a] = range[a].0;
             let mut q1 = q0;
-            q1[a] = bmax[a];
+            q1[a] = range[a].1;
             painter.line_segment([proj(q0), proj(q1)], grid_stroke);
         }
     };
 
-    if origin_in {
-        plane(2, origin[2], 0, 1); // XY 面（z=0）
-        plane(1, origin[1], 0, 2); // XZ 面（y=0）
-        plane(0, origin[0], 1, 2); // YZ 面（x=0）
-    } else {
-        // 原点が範囲外なら bmin 面にフォールバック
-        plane(2, bmin[2], 0, 1);
-        plane(1, bmin[1], 0, 2);
-        plane(0, bmin[0], 1, 2);
-    }
+    plane(2, origin[2], 0, 1); // XY 面（z=0）
+    plane(1, origin[1], 0, 2); // XZ 面（y=0）
+    plane(0, origin[0], 1, 2); // YZ 面（x=0）
 
     // 原点からの座標軸（赤=X / 緑=Y / 青=Z）。正方向=濃色 / 負方向=淡色。
     for (axis, col, name) in [
@@ -1344,35 +1344,31 @@ fn draw_grid_and_axes(
         (1, theme::AXIS_Y, "Y"),
         (2, theme::AXIS_Z, "Z"),
     ] {
-        // 正方向: 原点 → bmax
-        if bmax[axis] > origin[axis] {
-            let mut pe = origin;
-            pe[axis] = bmax[axis];
-            painter.line_segment([proj(origin), proj(pe)], egui::Stroke::new(1.5, col));
-            painter.text(
-                proj(pe),
-                egui::Align2::LEFT_BOTTOM,
-                format!("{} ({:.1})", name, bmax[axis]),
-                egui::FontId::proportional(11.0),
-                col,
-            );
-        }
-        // 負方向: 原点 → bmin（淡色）
-        if bmin[axis] < origin[axis] {
-            let mut pn = origin;
-            pn[axis] = bmin[axis];
-            painter.line_segment(
-                [proj(origin), proj(pn)],
-                egui::Stroke::new(1.0, theme::lighten(col, 0.45)),
-            );
-            painter.text(
-                proj(pn),
-                egui::Align2::RIGHT_TOP,
-                format!("{:.1}", bmin[axis]),
-                egui::FontId::proportional(10.0),
-                theme::lighten(col, 0.45),
-            );
-        }
+        // 正方向: 原点 → range の上端
+        let mut pe = origin;
+        pe[axis] = range[axis].1;
+        painter.line_segment([proj(origin), proj(pe)], egui::Stroke::new(1.5, col));
+        painter.text(
+            proj(pe),
+            egui::Align2::LEFT_BOTTOM,
+            format!("{} ({:.1})", name, range[axis].1),
+            egui::FontId::proportional(11.0),
+            col,
+        );
+        // 負方向: 原点 → range の下端（淡色）
+        let mut pn = origin;
+        pn[axis] = range[axis].0;
+        painter.line_segment(
+            [proj(origin), proj(pn)],
+            egui::Stroke::new(1.0, theme::lighten(col, 0.45)),
+        );
+        painter.text(
+            proj(pn),
+            egui::Align2::RIGHT_TOP,
+            format!("{:.1}", range[axis].0),
+            egui::FontId::proportional(10.0),
+            theme::lighten(col, 0.45),
+        );
     }
 
     // 原点マーカー（黒点 + "O" ラベル）
