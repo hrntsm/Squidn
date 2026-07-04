@@ -12,15 +12,40 @@ use squid_n_core::model::{LoadCombination, Model};
 use squid_n_element::factory::build_behavior;
 use squid_n_math::solver::{make_solver, LinearSolver, SolveError, SolverBackend};
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SeismicDir {
     X,
     Y,
 }
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AiMode {
     Approx,
     SemiPrecise,
+}
+
+/// 地震静的解析(Ai分布)の設定。
+#[derive(Debug, Clone, Copy)]
+pub struct SeismicCfg {
+    pub dir: SeismicDir,
+    pub mode: AiMode,
+    /// 地域係数 Z（令88条）。
+    pub z: f64,
+    /// 地盤種別（Tc の決定に使用）。
+    pub soil: squid_n_load::ai::SoilClass,
+    /// 標準せん断力係数 C0（一次設計 0.2、保有 1.0）。
+    pub c0: f64,
+}
+
+impl Default for SeismicCfg {
+    fn default() -> Self {
+        Self {
+            dir: SeismicDir::X,
+            mode: AiMode::SemiPrecise,
+            z: 1.0,
+            soil: squid_n_load::ai::SoilClass::II,
+            c0: 0.2,
+        }
+    }
 }
 
 pub struct Analysis<'m> {
@@ -211,6 +236,22 @@ impl<'m> Analysis<'m> {
     /// 階(Story)・地震重量・剛床が未定義の場合は黙ってゼロ結果を返さず、
     /// 何をすべきかを含むエラーを返す。
     pub fn seismic_static(&self, dir: SeismicDir, mode: AiMode) -> Result<StaticOnce, SolveError> {
+        self.seismic_static_with(SeismicCfg {
+            dir,
+            mode,
+            ..SeismicCfg::default()
+        })
+    }
+
+    /// 地震静的解析（設定指定版）。Z・地盤種別・C0 を UI から与える。
+    pub fn seismic_static_with(&self, cfg: SeismicCfg) -> Result<StaticOnce, SolveError> {
+        let SeismicCfg {
+            dir,
+            mode,
+            z,
+            soil,
+            c0,
+        } = cfg;
         let stories = &self.model.stories;
         if stories.is_empty() {
             return Err(SolveError::InvalidInput(
@@ -231,10 +272,8 @@ impl<'m> Analysis<'m> {
             }
         };
 
-        let z = 1.0;
-        let tc = squid_n_load::ai::tc_of(squid_n_load::ai::SoilClass::II);
+        let tc = squid_n_load::ai::tc_of(soil);
         let rt_val = squid_n_load::ai::rt(t, tc);
-        let c0 = 0.2;
 
         let story_weights: Vec<f64> = stories
             .iter()

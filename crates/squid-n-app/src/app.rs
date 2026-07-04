@@ -28,12 +28,13 @@ pub enum ModelTab {
     Materials,
 }
 
-/// 結果タブ内の切替（3D 各種図と時刻歴グラフ）。
+/// 結果タブ内の切替（3D 各種図・時刻歴グラフ・プッシュオーバー曲線）。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum ResultsView {
     #[default]
     Spatial,
     TimeHistory,
+    Pushover,
 }
 
 /// ナビゲータ（左ペイン）。階/部材群/ケース系の選択状態。
@@ -81,11 +82,58 @@ pub struct Selection {
     pub members: Vec<squid_n_core::ids::ElemId>,
 }
 
+#[derive(Default)]
 pub struct ResultsBundle {
     pub statics: Vec<(LoadCaseId, squid_n_solver::linear::StaticOnce)>,
     pub modal: Option<squid_n_solver::eigen::ModalResult>,
     pub member_forces: Vec<(ElemId, squid_n_element::beam::MemberForces)>,
     pub checks: Vec<(ElemId, f64, squid_n_design_jp::CheckResult)>,
+    pub pushover: Option<squid_n_solver::pushover::PushoverResult>,
+    pub time_history: Option<squid_n_solver::timehistory::ResponseResult>,
+}
+
+/// 解析タブの設定値（GUI 非依存。テストからも使う）。
+#[derive(Clone, Copy, Debug)]
+pub struct AnalysisSettings {
+    /// 固有値解析のモード数
+    pub n_modes: usize,
+    /// 地震静的(Ai)の方向・Ai算定法・地域係数・地盤種別・標準せん断力係数
+    pub seismic_dir: SeismicDir,
+    pub ai_mode: AiMode,
+    pub z: f64,
+    pub soil: squid_n_load::ai::SoilClass,
+    pub c0: f64,
+    /// プッシュオーバー: 方向・最大ステップ・目標変位 [mm]
+    pub push_dir: SeismicDir,
+    pub push_steps: usize,
+    pub push_max_disp: f64,
+    /// 時刻歴: 減衰比・サンプル波の刻み/継続時間/周期/振幅 [mm/s²]
+    pub th_damping: f64,
+    pub th_dt: f64,
+    pub th_duration: f64,
+    pub th_period: f64,
+    pub th_amp: f64,
+}
+
+impl Default for AnalysisSettings {
+    fn default() -> Self {
+        Self {
+            n_modes: 3,
+            seismic_dir: SeismicDir::X,
+            ai_mode: AiMode::SemiPrecise,
+            z: 1.0,
+            soil: squid_n_load::ai::SoilClass::II,
+            c0: 0.2,
+            push_dir: SeismicDir::X,
+            push_steps: 50,
+            push_max_disp: 500.0,
+            th_damping: 0.02,
+            th_dt: 0.01,
+            th_duration: 10.0,
+            th_period: 0.5,
+            th_amp: 1000.0,
+        }
+    }
 }
 
 pub struct App {
@@ -156,6 +204,8 @@ pub struct App {
     pub wall_draw_nodes: Vec<squid_n_core::ids::NodeId>,
     /// 現在のプロジェクトファイル（.scz）パス。未保存なら None。
     pub project_path: Option<std::path::PathBuf>,
+    /// 解析タブの設定値
+    pub analysis_cfg: AnalysisSettings,
 }
 
 impl Default for App {
@@ -188,7 +238,7 @@ impl Default for App {
             camera: crate::viewer::CameraState::default(),
             beam_loads: Vec::new(),
             #[cfg(feature = "gui")]
-            time_history_data: crate::time_history_view::dummy_time_history(),
+            time_history_data: crate::time_history_view::TimeHistoryData::default(),
             #[cfg(feature = "gui")]
             time_history_source: crate::time_history_view::TimeHistorySource::default(),
             #[cfg(feature = "gui")]
@@ -204,6 +254,7 @@ impl Default for App {
             #[cfg(feature = "gui")]
             wall_draw_nodes: Vec::new(),
             project_path: None,
+            analysis_cfg: AnalysisSettings::default(),
         }
     }
 }
@@ -326,12 +377,7 @@ impl App {
             Ok(analysis) => match analysis.linear_static(lc) {
                 Ok(res) => {
                     let member_forces = res.member_forces.clone();
-                    let mut bundle = self.results.take().unwrap_or(ResultsBundle {
-                        statics: Vec::new(),
-                        modal: None,
-                        member_forces: Vec::new(),
-                        checks: Vec::new(),
-                    });
+                    let mut bundle = self.results.take().unwrap_or_default();
                     bundle.statics.retain(|(id, _)| *id != lc);
                     bundle.statics.push((lc, res));
                     bundle.member_forces = member_forces;
@@ -352,12 +398,7 @@ impl App {
         match Analysis::prepare(&self.model) {
             Ok(analysis) => match analysis.eigen(n_modes) {
                 Ok(modal) => {
-                    let mut bundle = self.results.take().unwrap_or(ResultsBundle {
-                        statics: Vec::new(),
-                        modal: None,
-                        member_forces: Vec::new(),
-                        checks: Vec::new(),
-                    });
+                    let mut bundle = self.results.take().unwrap_or_default();
                     bundle.modal = Some(modal);
                     self.results = Some(bundle);
                     // 固有値のみの更新では設計は更新されないが、最新実行時刻は更新
@@ -369,19 +410,43 @@ impl App {
         }
     }
 
+    /// 階(Story)を節点標高から自動生成して適用する（undo 可能）。
+    /// 地震重量には最初の荷重ケースの鉛直下向き荷重＋自重を用いる。
+    pub fn generate_stories_action(&mut self) {
+        self.last_error = None;
+        let gravity_lc = self.model.load_cases.first().map(|c| c.id);
+        match squid_n_load::story_gen::generate_stories(&self.model, gravity_lc) {
+            Ok(gen) => {
+                self.undo.run(
+                    &mut self.model,
+                    Box::new(squid_n_edit::ApplyStories {
+                        stories: gen.stories,
+                        node_story: gen.node_story,
+                        constraints: gen.constraints,
+                    }),
+                );
+                self.staleness.mark_edited();
+            }
+            Err(e) => self.last_error = Some(format!("階の自動生成エラー: {}", e)),
+        }
+    }
+
     /// T3: 地震静的解析（Ai一気通貫）を実行し、結果を `self.results` に格納する。
+    /// 方向・Ai算定法・Z・地盤種別・C0 は `analysis_cfg` を用いる。
     pub fn run_seismic(&mut self, dir: SeismicDir) {
         self.last_error = None;
+        let cfg = squid_n_solver::analysis::SeismicCfg {
+            dir,
+            mode: self.analysis_cfg.ai_mode,
+            z: self.analysis_cfg.z,
+            soil: self.analysis_cfg.soil,
+            c0: self.analysis_cfg.c0,
+        };
         match Analysis::prepare(&self.model) {
-            Ok(analysis) => match analysis.seismic_static(dir, AiMode::SemiPrecise) {
+            Ok(analysis) => match analysis.seismic_static_with(cfg) {
                 Ok(res) => {
                     let member_forces = res.member_forces.clone();
-                    let mut bundle = self.results.take().unwrap_or(ResultsBundle {
-                        statics: Vec::new(),
-                        modal: None,
-                        member_forces: Vec::new(),
-                        checks: Vec::new(),
-                    });
+                    let mut bundle = self.results.take().unwrap_or_default();
                     bundle.statics.retain(|(id, _)| *id != LoadCaseId(0));
                     bundle.statics.push((LoadCaseId(0), res));
                     bundle.member_forces = member_forces;
@@ -394,6 +459,110 @@ impl App {
             },
             Err(e) => self.last_error = Some(format!("解析準備エラー: {:?}", e)),
         }
+    }
+
+    /// プッシュオーバー解析を実行する。モデルは複製の上で解析する
+    /// （非線形状態の副作用を GUI 上のモデルへ残さないため）。
+    pub fn run_pushover(&mut self) {
+        self.last_error = None;
+        if let Err(e) = Analysis::prepare(&self.model) {
+            self.last_error = Some(format!("解析準備エラー: {}", e));
+            return;
+        }
+        let mut work = self.model.clone();
+        let dofmap = squid_n_core::dof::DofMap::build(&work);
+        let reducer = squid_n_solver::constraint::Reducer::build(&work, &dofmap);
+        let cfg = &self.analysis_cfg;
+        match squid_n_solver::pushover::pushover_analysis(
+            &mut work,
+            &dofmap,
+            &reducer,
+            cfg.push_dir,
+            cfg.push_steps,
+            cfg.push_max_disp,
+            false,
+            false,
+            0.0,
+        ) {
+            Ok(res) => {
+                let mut bundle = self.results.take().unwrap_or_default();
+                bundle.pushover = Some(res);
+                self.results = Some(bundle);
+                self.staleness.last_run = Some(SystemTime::now());
+            }
+            Err(e) => self.last_error = Some(format!("プッシュオーバー解析エラー: {}", e)),
+        }
+    }
+
+    /// 線形時刻歴応答解析を実行する。減衰は 1 次固有周期に対する剛性比例。
+    pub fn run_time_history(&mut self, wave: squid_n_solver::timehistory::GroundMotion) {
+        self.last_error = None;
+        let analysis = match Analysis::prepare(&self.model) {
+            Ok(a) => a,
+            Err(e) => {
+                self.last_error = Some(format!("解析準備エラー: {}", e));
+                return;
+            }
+        };
+        // 1 次固有円振動数（減衰の基準）
+        let omega1 = match analysis.eigen(1) {
+            Ok(modal) => match modal.omega2.first() {
+                Some(&w2) if w2 > 0.0 => w2.sqrt(),
+                _ => {
+                    self.last_error = Some("固有値が得られず減衰を設定できません。".to_string());
+                    return;
+                }
+            },
+            Err(e) => {
+                self.last_error = Some(format!("固有値解析エラー: {}", e));
+                return;
+            }
+        };
+        let damping = squid_n_solver::damping::Damping::StiffnessProportional {
+            h: self.analysis_cfg.th_damping,
+            omega: omega1,
+            basis: squid_n_solver::damping::StiffnessKind::Initial,
+        };
+        let newmark = squid_n_solver::timehistory::NewmarkCfg::average_accel();
+        match analysis.time_history(&wave, newmark, damping) {
+            Ok(res) => {
+                #[cfg(feature = "gui")]
+                {
+                    self.time_history_data = crate::time_history_view::TimeHistoryData {
+                        time: res.time.clone(),
+                        node_disp: res.history.node_disp_x.clone(),
+                        story_shear: res.history.base_shear_x.clone(),
+                        story_drift_angle: res.history.top_drift_angle.clone(),
+                        node: res.history.node,
+                    };
+                }
+                let mut bundle = self.results.take().unwrap_or_default();
+                bundle.time_history = Some(res);
+                self.results = Some(bundle);
+                self.staleness.last_run = Some(SystemTime::now());
+            }
+            Err(e) => self.last_error = Some(format!("時刻歴解析エラー: {}", e)),
+        }
+    }
+
+    /// 正弦減衰のサンプル地震波を生成して時刻歴解析を実行する
+    /// （外部波形ファイルなしで機能を試せる導線）。
+    pub fn run_time_history_sample(&mut self) {
+        let cfg = &self.analysis_cfg;
+        let n = ((cfg.th_duration / cfg.th_dt).ceil() as usize).max(2);
+        let omega = 2.0 * std::f64::consts::PI / cfg.th_period.max(1e-6);
+        let accel_x: Vec<f64> = (0..n)
+            .map(|i| {
+                let t = i as f64 * cfg.th_dt;
+                cfg.th_amp * (omega * t).sin() * (-0.3 * t).exp()
+            })
+            .collect();
+        let wave = squid_n_solver::timehistory::GroundMotion {
+            dt: cfg.th_dt,
+            accel_x,
+            accel_y: None,
+        };
+        self.run_time_history(wave);
     }
 
     /// T7: 解析結果の member_forces から検定結果を生成する。
@@ -878,20 +1047,280 @@ impl App {
         }
         ui.separator();
 
-        ui.label("種別:");
-        if ui.button("線形静的").clicked() {
-            if let Some(lc) = self.model.load_cases.first().map(|c| c.id) {
-                self.run_linear_static(lc);
+        // ── 階の定義（地震系解析の前提） ──────────────────────────
+        ui.group(|ui| {
+            ui.strong("階の定義");
+            if self.model.stories.is_empty() {
+                ui.colored_label(
+                    crate::theme::GRAY_600,
+                    "未定義（地震静的・プッシュオーバーには階が必要です）",
+                );
             } else {
-                self.last_error = Some("荷重ケースがありません".to_string());
+                for s in &self.model.stories {
+                    ui.label(format!(
+                        "{}: 標高 {:.0} mm, 節点 {}, W = {:.1} kN",
+                        s.name,
+                        s.elevation,
+                        s.node_ids.len(),
+                        s.seismic_weight.unwrap_or(0.0) / 1000.0
+                    ));
+                }
             }
+            if ui
+                .button("🏢 階の自動生成")
+                .on_hover_text(
+                    "節点の標高(Z)から階を推定し、剛床と地震重量(自重+先頭荷重ケース)を設定します",
+                )
+                .clicked()
+            {
+                self.generate_stories_action();
+            }
+        });
+        ui.add_space(6.0);
+
+        // ── 線形静的 ──────────────────────────────────────────────
+        ui.group(|ui| {
+            ui.strong("線形静的");
+            let selected_lc = self
+                .nav
+                .focus_load_case
+                .filter(|id| self.model.load_cases.iter().any(|c| c.id == *id))
+                .or_else(|| self.model.load_cases.first().map(|c| c.id));
+            ui.horizontal(|ui| {
+                ui.label("荷重ケース:");
+                let text = selected_lc
+                    .and_then(|id| {
+                        self.model
+                            .load_cases
+                            .iter()
+                            .find(|c| c.id == id)
+                            .map(|c| format!("[{}] {}", c.id.0, c.name))
+                    })
+                    .unwrap_or_else(|| "（なし）".to_string());
+                egui::ComboBox::from_id_salt("analysis_lc")
+                    .selected_text(text)
+                    .show_ui(ui, |ui| {
+                        for lc in &self.model.load_cases {
+                            if ui
+                                .selectable_label(
+                                    selected_lc == Some(lc.id),
+                                    format!("[{}] {}", lc.id.0, lc.name),
+                                )
+                                .clicked()
+                            {
+                                self.nav.focus_load_case = Some(lc.id);
+                            }
+                        }
+                    });
+                if ui
+                    .add_enabled(selected_lc.is_some(), egui::Button::new("▶ 実行"))
+                    .clicked()
+                {
+                    if let Some(lc) = selected_lc {
+                        self.run_linear_static(lc);
+                    }
+                }
+            });
+            if self.model.load_cases.is_empty() {
+                ui.colored_label(
+                    crate::theme::GRAY_600,
+                    "荷重ケースがありません。荷重タブで作成してください。",
+                );
+            }
+        });
+        ui.add_space(6.0);
+
+        // ── 固有値 ────────────────────────────────────────────────
+        ui.group(|ui| {
+            ui.strong("固有値");
+            ui.horizontal(|ui| {
+                ui.label("モード数:");
+                let mut n = self.analysis_cfg.n_modes;
+                ui.add(egui::DragValue::new(&mut n).range(1..=30));
+                self.analysis_cfg.n_modes = n;
+                if ui.button("▶ 実行").clicked() {
+                    self.run_eigen(self.analysis_cfg.n_modes);
+                }
+            });
+        });
+        ui.add_space(6.0);
+
+        // ── 地震静的（Ai 分布） ───────────────────────────────────
+        ui.group(|ui| {
+            ui.strong("地震静的 (Ai 分布)");
+            ui.horizontal(|ui| {
+                ui.label("方向:");
+                ui.selectable_value(&mut self.analysis_cfg.seismic_dir, SeismicDir::X, "X");
+                ui.selectable_value(&mut self.analysis_cfg.seismic_dir, SeismicDir::Y, "Y");
+                ui.separator();
+                ui.label("T算定:");
+                ui.selectable_value(
+                    &mut self.analysis_cfg.ai_mode,
+                    AiMode::SemiPrecise,
+                    "固有値",
+                )
+                .on_hover_text("固有値解析による 1 次周期");
+                ui.selectable_value(&mut self.analysis_cfg.ai_mode, AiMode::Approx, "略算")
+                    .on_hover_text("T = h(0.02 + 0.01α) の略算式");
+            });
+            ui.horizontal(|ui| {
+                ui.label("Z:");
+                ui.add(
+                    egui::DragValue::new(&mut self.analysis_cfg.z)
+                        .speed(0.05)
+                        .range(0.7..=1.0),
+                );
+                ui.label("地盤:");
+                use squid_n_load::ai::SoilClass;
+                for (label, soil) in [
+                    ("第一種", SoilClass::I),
+                    ("第二種", SoilClass::II),
+                    ("第三種", SoilClass::III),
+                ] {
+                    ui.selectable_value(&mut self.analysis_cfg.soil, soil, label);
+                }
+                ui.label("C0:");
+                ui.add(
+                    egui::DragValue::new(&mut self.analysis_cfg.c0)
+                        .speed(0.05)
+                        .range(0.05..=1.0),
+                );
+            });
+            if ui.button("▶ 実行").clicked() {
+                self.run_seismic(self.analysis_cfg.seismic_dir);
+            }
+        });
+        ui.add_space(6.0);
+
+        // ── プッシュオーバー ──────────────────────────────────────
+        ui.group(|ui| {
+            ui.strong("プッシュオーバー");
+            ui.horizontal(|ui| {
+                ui.label("方向:");
+                ui.selectable_value(&mut self.analysis_cfg.push_dir, SeismicDir::X, "X");
+                ui.selectable_value(&mut self.analysis_cfg.push_dir, SeismicDir::Y, "Y");
+                ui.label("ステップ:");
+                ui.add(egui::DragValue::new(&mut self.analysis_cfg.push_steps).range(1..=100));
+                ui.label("目標変位[mm]:");
+                ui.add(
+                    egui::DragValue::new(&mut self.analysis_cfg.push_max_disp)
+                        .speed(10.0)
+                        .range(1.0..=10000.0),
+                );
+            });
+            if ui.button("▶ 実行").clicked() {
+                self.run_pushover();
+                if self.last_error.is_none() {
+                    self.active_tab = Tab::Results;
+                    self.results_view = ResultsView::Pushover;
+                }
+            }
+        });
+        ui.add_space(6.0);
+
+        // ── 時刻歴応答 ────────────────────────────────────────────
+        ui.group(|ui| {
+            ui.strong("時刻歴応答（線形 Newmark-β）");
+            ui.horizontal(|ui| {
+                ui.label("減衰比 h:");
+                ui.add(
+                    egui::DragValue::new(&mut self.analysis_cfg.th_damping)
+                        .speed(0.005)
+                        .range(0.0..=0.3),
+                );
+            });
+            ui.horizontal(|ui| {
+                ui.label("サンプル波: dt[s]");
+                ui.add(
+                    egui::DragValue::new(&mut self.analysis_cfg.th_dt)
+                        .speed(0.001)
+                        .range(0.001..=0.1),
+                );
+                ui.label("継続[s]");
+                ui.add(
+                    egui::DragValue::new(&mut self.analysis_cfg.th_duration)
+                        .speed(0.5)
+                        .range(1.0..=120.0),
+                );
+                ui.label("周期[s]");
+                ui.add(
+                    egui::DragValue::new(&mut self.analysis_cfg.th_period)
+                        .speed(0.05)
+                        .range(0.05..=5.0),
+                );
+                ui.label("振幅[mm/s²]");
+                ui.add(
+                    egui::DragValue::new(&mut self.analysis_cfg.th_amp)
+                        .speed(50.0)
+                        .range(10.0..=10000.0),
+                );
+            });
+            ui.horizontal(|ui| {
+                if ui
+                    .button("▶ サンプル波で実行")
+                    .on_hover_text("正弦減衰波を生成して時刻歴解析を実行します")
+                    .clicked()
+                {
+                    self.run_time_history_sample();
+                    if self.last_error.is_none() {
+                        self.active_tab = Tab::Results;
+                        self.results_view = ResultsView::TimeHistory;
+                    }
+                }
+                if ui
+                    .button("📂 波形CSVを開いて実行…")
+                    .on_hover_text(
+                        "1 行 1 値(加速度 gal)の CSV/テキスト。dt は上の設定値を使用します",
+                    )
+                    .clicked()
+                {
+                    self.run_time_history_from_csv();
+                    if self.last_error.is_none() {
+                        self.active_tab = Tab::Results;
+                        self.results_view = ResultsView::TimeHistory;
+                    }
+                }
+            });
+        });
+    }
+
+    /// 波形 CSV（1 行 1 値、gal 単位）を選択して時刻歴解析を実行する。
+    fn run_time_history_from_csv(&mut self) {
+        let Some(path) = rfd::FileDialog::new()
+            .add_filter("波形 (CSV/テキスト)", &["csv", "txt", "dat"])
+            .pick_file()
+        else {
+            return;
+        };
+        let content = match std::fs::read_to_string(&path) {
+            Ok(c) => c,
+            Err(e) => {
+                self.last_error = Some(format!("波形読込エラー: {}", e));
+                return;
+            }
+        };
+        // 1 行 1 値（カンマ区切りなら最後の列）を gal → mm/s² (×10) で読む
+        let accel_x: Vec<f64> = content
+            .lines()
+            .filter_map(|l| {
+                let field = l.split(',').next_back()?.trim();
+                field.parse::<f64>().ok()
+            })
+            .map(|gal| gal * 10.0)
+            .collect();
+        if accel_x.len() < 2 {
+            self.last_error = Some(
+                "波形データが読み取れませんでした（数値が 2 点未満）。1 行 1 値の CSV を指定してください。"
+                    .to_string(),
+            );
+            return;
         }
-        if ui.button("固有値").clicked() {
-            self.run_eigen(3);
-        }
-        if ui.button("地震(Ai)").clicked() {
-            self.run_seismic(SeismicDir::X);
-        }
+        let wave = squid_n_solver::timehistory::GroundMotion {
+            dt: self.analysis_cfg.th_dt,
+            accel_x,
+            accel_y: None,
+        };
+        self.run_time_history(wave);
     }
 
     /// 結果タブ：3Dビューア と 時刻歴グラフを切替。
@@ -899,11 +1328,15 @@ impl App {
         ui.horizontal(|ui| {
             let sel_spatial = self.results_view == ResultsView::Spatial;
             let sel_th = self.results_view == ResultsView::TimeHistory;
+            let sel_po = self.results_view == ResultsView::Pushover;
             if ui.selectable_label(sel_spatial, "3D/応力図").clicked() {
                 self.results_view = ResultsView::Spatial;
             }
             if ui.selectable_label(sel_th, "時刻歴").clicked() {
                 self.results_view = ResultsView::TimeHistory;
+            }
+            if ui.selectable_label(sel_po, "プッシュオーバー").clicked() {
+                self.results_view = ResultsView::Pushover;
             }
             ui.separator();
             // 結果サマリ
@@ -922,7 +1355,72 @@ impl App {
         match self.results_view {
             ResultsView::Spatial => crate::viewer::viewer_panel(ui, self),
             ResultsView::TimeHistory => crate::time_history_view::time_history_panel(ui, self),
+            ResultsView::Pushover => self.pushover_panel(ui),
         }
+    }
+
+    /// プッシュオーバー結果（性能曲線・ヒンジ・崩壊機構）の表示。
+    fn pushover_panel(&mut self, ui: &mut egui::Ui) {
+        let Some(po) = self.results.as_ref().and_then(|r| r.pushover.as_ref()) else {
+            ui.colored_label(
+                crate::theme::GRAY_600,
+                "プッシュオーバー結果がありません。解析タブから実行してください。",
+            );
+            return;
+        };
+
+        ui.horizontal(|ui| {
+            ui.label(format!("保有水平耐力 Qu = {:.1} kN", po.qu / 1000.0));
+            ui.separator();
+            let mech = match &po.mechanism {
+                squid_n_solver::pushover::MechanismType::Overall => "全体崩壊形".to_string(),
+                squid_n_solver::pushover::MechanismType::StoryCollapse { story } => {
+                    format!("層崩壊形 (Story {})", story.0)
+                }
+                squid_n_solver::pushover::MechanismType::Partial => "部分崩壊形".to_string(),
+            };
+            ui.label(format!("崩壊機構: {}", mech));
+            ui.separator();
+            ui.label(format!("ヒンジ発生 {} 件", po.hinges.len()));
+        });
+
+        // 性能曲線（頂部変位 - ベースシア）
+        let points: Vec<[f64; 2]> = po
+            .capacity_curve
+            .iter()
+            .map(|p| [p.roof_disp, p.base_shear / 1000.0])
+            .collect();
+        egui_plot::Plot::new("pushover_curve")
+            .x_axis_label("頂部変位 [mm]")
+            .y_axis_label("ベースシア [kN]")
+            .height(ui.available_height() * 0.6)
+            .show(ui, |plot_ui| {
+                plot_ui.line(
+                    egui_plot::Line::new("capacity", egui_plot::PlotPoints::from(points))
+                        .color(crate::theme::DATA_BLUE)
+                        .width(2.0),
+                );
+            });
+
+        // ヒンジ発生履歴（先頭 20 件）
+        ui.separator();
+        ui.strong("ヒンジ発生履歴");
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            for h in po.hinges.iter().take(20) {
+                let level = match h.level {
+                    squid_n_solver::pushover::HingeLevel::Crack => "ひび割れ",
+                    squid_n_solver::pushover::HingeLevel::Yield => "降伏",
+                    squid_n_solver::pushover::HingeLevel::Ultimate => "終局",
+                };
+                ui.label(format!(
+                    "step {}: 部材 {} pos={:.2} {} (μ={:.2})",
+                    h.step, h.elem.0, h.pos, level, h.ductility
+                ));
+            }
+            if po.hinges.len() > 20 {
+                ui.label(format!("... 他 {} 件", po.hinges.len() - 20));
+            }
+        });
     }
 
     /// レポートタブ：P9 で実装予定（プレースホルダー）。
@@ -1134,6 +1632,61 @@ mod tests {
     #[test]
     fn test_tab_default_is_model() {
         assert_eq!(Tab::Model, Tab::default());
+    }
+
+    #[test]
+    fn test_seismic_flow_requires_then_uses_stories() {
+        let mut app = App::default();
+        app.load_model(crate::sample::portal_frame());
+
+        // 階なし → 明示エラー（サイレントゼロ結果ではない）
+        app.run_seismic(SeismicDir::X);
+        assert!(app.last_error.is_some());
+
+        // 階の自動生成 → 地震静的が成功する
+        app.generate_stories_action();
+        assert!(app.last_error.is_none(), "{:?}", app.last_error);
+        assert_eq!(app.model.stories.len(), 1);
+        assert!(app.model.stories[0].seismic_weight.unwrap() > 0.0);
+
+        app.run_seismic(SeismicDir::X);
+        assert!(app.last_error.is_none(), "{:?}", app.last_error);
+        let r = app.results.as_ref().unwrap();
+        let (_, res) = r.statics.first().unwrap();
+        // 柱頭が X 方向へ変位している
+        assert!(res.disp[2][0].abs() > 1e-3, "{}", res.disp[2][0]);
+
+        // undo で階定義が戻る
+        app.undo.undo(&mut app.model);
+        assert!(app.model.stories.is_empty());
+    }
+
+    #[test]
+    fn test_time_history_sample_flow() {
+        let mut app = App::default();
+        app.load_model(crate::sample::portal_frame());
+        app.analysis_cfg.th_duration = 2.0;
+        app.run_time_history_sample();
+        assert!(app.last_error.is_none(), "{:?}", app.last_error);
+        let th = app.results.as_ref().unwrap().time_history.as_ref().unwrap();
+        assert!(th.history.node_disp_x.len() > 100);
+        assert!(
+            th.history.node_disp_x.iter().any(|v| v.abs() > 1e-6),
+            "応答がゼロのままです"
+        );
+        assert!(th.history.node.is_some());
+    }
+
+    #[test]
+    fn test_pushover_flow() {
+        let mut app = App::default();
+        app.load_model(crate::sample::portal_frame());
+        app.generate_stories_action();
+        app.analysis_cfg.push_steps = 10;
+        app.run_pushover();
+        assert!(app.last_error.is_none(), "{:?}", app.last_error);
+        let po = app.results.as_ref().unwrap().pushover.as_ref().unwrap();
+        assert!(!po.capacity_curve.is_empty());
     }
 
     #[test]

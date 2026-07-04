@@ -5272,6 +5272,7 @@ dependencies = [
  "squid-n-element",
  "squid-n-io",
  "squid-n-load",
+ "squid-n-math",
  "squid-n-section",
  "squid-n-solver",
 ]

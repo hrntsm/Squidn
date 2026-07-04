@@ -1243,6 +1243,74 @@ fn shift_load_case_ids(model: &mut Model, mut f: impl FnMut(&mut LoadCaseId)) {
     }
 }
 
+/// 階定義の一括適用（階自動生成の結果を反映する）。
+///
+/// `model.stories`・各節点の所属階・剛床拘束(`Constraint::RigidDiaphragm`)を
+/// まとめて差し替える。既存の RigidDiaphragm 拘束は除去し、Mpc / RigidLink は
+/// 保持する。逆操作は差し替え前の状態の復元。
+pub struct ApplyStories {
+    pub stories: Vec<squid_n_core::model::Story>,
+    /// `model.nodes` と同順の所属階。長さが合わない分は無視する。
+    pub node_story: Vec<Option<squid_n_core::ids::StoryId>>,
+    /// 追加する剛床拘束（既存の RigidDiaphragm と置換）。
+    pub constraints: Vec<squid_n_core::model::Constraint>,
+}
+
+impl EditCommand for ApplyStories {
+    fn apply(&self, model: &mut Model) -> Box<dyn EditCommand> {
+        use squid_n_core::model::Constraint;
+        let old_stories = std::mem::replace(&mut model.stories, self.stories.clone());
+        let old_node_story: Vec<Option<squid_n_core::ids::StoryId>> =
+            model.nodes.iter().map(|n| n.story).collect();
+        for (node, st) in model.nodes.iter_mut().zip(self.node_story.iter()) {
+            node.story = *st;
+        }
+        // RigidDiaphragm のみ差し替え、それ以外の拘束は保持
+        let old_constraints = model.constraints.clone();
+        model
+            .constraints
+            .retain(|c| !matches!(c, Constraint::RigidDiaphragm { .. }));
+        model.constraints.extend(self.constraints.iter().cloned());
+        Box::new(RestoreStories {
+            stories: old_stories,
+            node_story: old_node_story,
+            constraints: old_constraints,
+        })
+    }
+
+    fn label(&self) -> &str {
+        "階定義の適用"
+    }
+}
+
+/// [`ApplyStories`] の逆操作。拘束リストを丸ごと復元する。
+pub struct RestoreStories {
+    pub stories: Vec<squid_n_core::model::Story>,
+    pub node_story: Vec<Option<squid_n_core::ids::StoryId>>,
+    pub constraints: Vec<squid_n_core::model::Constraint>,
+}
+
+impl EditCommand for RestoreStories {
+    fn apply(&self, model: &mut Model) -> Box<dyn EditCommand> {
+        let new_stories = std::mem::replace(&mut model.stories, self.stories.clone());
+        let new_node_story: Vec<Option<squid_n_core::ids::StoryId>> =
+            model.nodes.iter().map(|n| n.story).collect();
+        for (node, st) in model.nodes.iter_mut().zip(self.node_story.iter()) {
+            node.story = *st;
+        }
+        let new_constraints = std::mem::replace(&mut model.constraints, self.constraints.clone());
+        Box::new(RestoreStories {
+            stories: new_stories,
+            node_story: new_node_story,
+            constraints: new_constraints,
+        })
+    }
+
+    fn label(&self) -> &str {
+        "階定義の復元"
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
