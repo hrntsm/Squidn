@@ -291,6 +291,7 @@ pub fn pushover_analysis(
     let thresholds = compute_hinge_thresholds(model);
     let mut hinges = Vec::new();
     let mut capacity_curve = Vec::new();
+    let mut steps: Vec<PushoverStep> = Vec::new();
     let mut total_disp = vec![0.0; n_active];
     let n_steps = max_steps.clamp(1, 100);
     let dlambda = 1.0 / n_steps as f64;
@@ -360,12 +361,21 @@ pub fn pushover_analysis(
                 // 変位制御フェーズと統一し反力ベースで求める）。
                 let f_int_now = compute_f_int(model, dofmap, &behaviors);
                 let base_shear = compute_base_shear(model, dofmap, &f_int_now, dir);
+                let story_drift = compute_story_drift(model, dofmap, &total_disp, dir);
                 capacity_curve.push(CapacityPoint {
                     step: step as u32,
                     roof_disp: roof,
                     base_shear,
                     story_shear: compute_story_shear(model, dofmap, &f_int_now, dir),
-                    story_drift: compute_story_drift(model, dofmap, &total_disp, dir),
+                    story_drift: story_drift.clone(),
+                });
+                steps.push(PushoverStep {
+                    // 荷重制御フェーズ: 参照外力ベクトル q に対する倍率 current_lambda を
+                    // そのまま荷重係数として記録する。
+                    load_factor: current_lambda,
+                    top_disp: roof,
+                    base_shear,
+                    story_drifts: story_drift,
                 });
                 track_hinges(
                     model,
@@ -471,13 +481,23 @@ pub fn pushover_analysis(
                         let roof = get_roof_disp(&total_disp, model, dofmap, dir);
                         let f_int_now = compute_f_int(model, dofmap, &behaviors);
                         let base_shear = compute_base_shear(model, dofmap, &f_int_now, dir);
+                        let story_drift = compute_story_drift(model, dofmap, &total_disp, dir);
                         let cstep = (n_steps + 1 + step) as u32;
                         capacity_curve.push(CapacityPoint {
                             step: cstep,
                             roof_disp: roof,
                             base_shear,
                             story_shear: compute_story_shear(model, dofmap, &f_int_now, dir),
-                            story_drift: compute_story_drift(model, dofmap, &total_disp, dir),
+                            story_drift: story_drift.clone(),
+                        });
+                        steps.push(PushoverStep {
+                            // 変位制御フェーズ: 荷重制御フェーズで λ=1 まで到達した後の継続で、
+                            // 目標頂部変位をペナルティ法で強制するため比例載荷の λ という概念が
+                            // 存在しない。荷重制御完了時点の値(1.0)をそのまま保持して記録する。
+                            load_factor: 1.0,
+                            top_disp: roof,
+                            base_shear,
+                            story_drifts: story_drift,
                         });
                         track_hinges(model, dofmap, &behaviors, &thresholds, cstep, &mut hinges);
                         step_ok = true;
@@ -557,12 +577,20 @@ pub fn pushover_analysis(
                     let roof = get_roof_disp(&total_disp, model, dofmap, dir);
                     let f_int_now = compute_f_int(model, dofmap, &behaviors);
                     let base_shear = compute_base_shear(model, dofmap, &f_int_now, dir);
+                    let story_drift = compute_story_drift(model, dofmap, &total_disp, dir);
                     capacity_curve.push(CapacityPoint {
                         step: (n_steps + 1 + _step) as u32,
                         roof_disp: roof,
                         base_shear,
                         story_shear: compute_story_shear(model, dofmap, &f_int_now, dir),
-                        story_drift: compute_story_drift(model, dofmap, &total_disp, dir),
+                        story_drift: story_drift.clone(),
+                    });
+                    steps.push(PushoverStep {
+                        // 弧長法: 各増分後に更新される荷重倍率 arc_lambda をそのまま記録する。
+                        load_factor: arc_lambda,
+                        top_disp: roof,
+                        base_shear,
+                        story_drifts: story_drift,
                     });
                 }
                 _ => {
@@ -581,7 +609,7 @@ pub fn pushover_analysis(
         .map(|c| c.base_shear)
         .fold(0.0_f64, f64::max);
     Ok(PushoverResult {
-        steps: vec![],
+        steps,
         capacity_curve,
         hinges,
         mechanism,
@@ -911,6 +939,21 @@ mod tests {
             !result.hinges.is_empty(),
             "at least one hinge should form in the column under lateral push"
         );
+
+        // steps は capacity_curve と同じ収束ステップ数だけ積まれること。
+        assert_eq!(
+            result.steps.len(),
+            result.capacity_curve.len(),
+            "steps should have one entry per capacity_curve point"
+        );
+        // 各 step の story_drifts は層数（本モデルは1層）と一致すること。
+        for s in &result.steps {
+            assert_eq!(
+                s.story_drifts.len(),
+                model.stories.len(),
+                "story_drifts length should match number of stories"
+            );
+        }
     }
 
     #[test]
