@@ -232,16 +232,31 @@ pub fn design_table(ui: &mut egui::Ui, app: &mut App) {
         ui.selectable_value(&mut app.design_frame, FrameType::RcWall, "RC壁式");
         ui.selectable_value(&mut app.design_frame, FrameType::SteelFrame, "Sラーメン");
         ui.selectable_value(&mut app.design_frame, FrameType::SteelBrace, "Sブレース");
-        ui.separator();
+    });
+    ui.horizontal(|ui| {
+        ui.checkbox(&mut app.design_rank_auto, "自動判定（鋼・幅厚比）")
+            .on_hover_text(
+                "鋼部材(断面形状を持つもの)の幅厚比から部材ランクを層ごとに自動判定します。\
+                 RC 部材・断面形状未設定の部材・幅厚比の対象外形状(円形鋼管等)はスキップされ、\
+                 1 本も算定できなかった層は下記の選択値にフォールバックします。",
+            );
+    });
+    ui.horizontal(|ui| {
         use squid_n_design_jp::holding_capacity::MemberRank;
-        ui.label("部材ランク:");
+        ui.label(if app.design_rank_auto {
+            "部材ランク（フォールバック用）:"
+        } else {
+            "部材ランク:"
+        });
         ui.selectable_value(&mut app.design_rank, MemberRank::FA, "FA");
         ui.selectable_value(&mut app.design_rank, MemberRank::FB, "FB");
         ui.selectable_value(&mut app.design_rank, MemberRank::FC, "FC");
         ui.selectable_value(&mut app.design_rank, MemberRank::FD, "FD");
     });
-    let ds = squid_n_design_jp::holding_capacity::ds_value(app.design_frame, app.design_rank);
-    ui.label(format!("Ds = {:.2}（部材ランク選択値による簡易運用）", ds));
+    if !app.design_rank_auto {
+        let ds = squid_n_design_jp::holding_capacity::ds_value(app.design_frame, app.design_rank);
+        ui.label(format!("Ds = {:.2}（部材ランク選択値による簡易運用）", ds));
+    }
 
     match app.compute_holding_capacity() {
         Err(msg) => {
@@ -252,7 +267,7 @@ pub fn design_table(ui: &mut egui::Ui, app: &mut App) {
                 app.active_tab = crate::app::Tab::Analysis;
             }
         }
-        Ok(result) => {
+        Ok((result, story_ranks)) => {
             TableBuilder::new(ui)
                 .striped(true)
                 .column(Column::auto())
@@ -262,8 +277,18 @@ pub fn design_table(ui: &mut egui::Ui, app: &mut App) {
                 .column(Column::initial(60.0))
                 .column(Column::initial(80.0))
                 .column(Column::initial(60.0))
+                .column(Column::initial(70.0))
                 .header(20.0, |mut h| {
-                    for t in &["階", "Qu[kN]", "Qud[kN]", "Ds", "Fes", "Qun[kN]", "判定"] {
+                    for t in &[
+                        "階",
+                        "Qu[kN]",
+                        "Qud[kN]",
+                        "Ds",
+                        "Fes",
+                        "Qun[kN]",
+                        "判定",
+                        "採用ランク",
+                    ] {
                         h.col(|ui| {
                             ui.strong(*t);
                         });
@@ -304,12 +329,29 @@ pub fn design_table(ui: &mut egui::Ui, app: &mut App) {
                                 ui.colored_label(crate::theme::ERROR_RED, "NG");
                             }
                         });
+                        row.col(|ui| {
+                            ui.label(story_ranks.get(i).map(|r| rank_label(*r)).unwrap_or("-"));
+                        });
                     });
                 });
-            ui.colored_label(
-                crate::theme::GRAY_600,
-                "Qu はプッシュオーバー最終ステップの層せん断力。Ds は選択値（部材ランク自動判定は未実装）。",
-            );
+            let note = if app.design_rank_auto {
+                "Qu はプッシュオーバー最終ステップの層せん断力。Ds は幅厚比による鋼部材ランク\
+                 自動判定（RC・形状未設定部材は選択値フォールバック）。"
+            } else {
+                "Qu はプッシュオーバー最終ステップの層せん断力。Ds は選択値（部材ランク自動判定OFF）。"
+            };
+            ui.colored_label(crate::theme::GRAY_600, note);
         }
+    }
+}
+
+/// `MemberRank` の表示名（FA〜FD）。
+fn rank_label(r: squid_n_design_jp::holding_capacity::MemberRank) -> &'static str {
+    use squid_n_design_jp::holding_capacity::MemberRank;
+    match r {
+        MemberRank::FA => "FA",
+        MemberRank::FB => "FB",
+        MemberRank::FC => "FC",
+        MemberRank::FD => "FD",
     }
 }

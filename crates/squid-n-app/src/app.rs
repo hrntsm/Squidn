@@ -128,13 +128,23 @@ pub struct AnalysisSettings {
     pub th_period: f64,
     pub th_amp: f64,
     /// 時刻歴の入力方向(サンプル波・CSV波形の作用方向)
-    pub th_dir: SeismicDir,
+    pub th_dir: ThDir,
     /// 時刻歴の減衰モデル
     pub th_damping_model: ThDampingModel,
     /// Rayleigh の2次モード減衰比(1次は th_damping を使用)
     pub th_h2: f64,
     /// 時刻歴の積分法
     pub th_integrator: ThIntegrator,
+}
+
+/// 時刻歴の入力方向選択（UI 用）。X・Y に加え、同一波形を両方向へ同時入力する
+/// 「X+Y」を持つ（`SeismicDir` は静的地震荷重・プッシュオーバー共用のため
+/// 拡張せず、時刻歴専用にこの型を新設する）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ThDir {
+    X,
+    Y,
+    Xy,
 }
 
 /// 時刻歴の減衰モデル選択（UI 用）。
@@ -168,7 +178,7 @@ impl Default for AnalysisSettings {
             th_duration: 10.0,
             th_period: 0.5,
             th_amp: 1000.0,
-            th_dir: SeismicDir::X,
+            th_dir: ThDir::X,
             th_damping_model: ThDampingModel::StiffnessProportional,
             th_h2: 0.02,
             th_integrator: ThIntegrator::NewmarkBeta,
@@ -223,8 +233,15 @@ pub struct App {
     pub model_tab: ModelTab,
     /// 保有水平耐力（ルート3）判定の架構種別（Ds 表の行選択）
     pub design_frame: squid_n_design_jp::holding_capacity::FrameType,
-    /// 保有水平耐力（ルート3）判定の部材ランク（Ds 表の列選択）
+    /// 保有水平耐力（ルート3）判定の部材ランク（Ds 表の列選択）。
+    /// `design_rank_auto == true` の場合はフォールバック用（幅厚比を算定できない
+    /// 層のみに適用される）。
     pub design_rank: squid_n_design_jp::holding_capacity::MemberRank,
+    /// 保有水平耐力（ルート3）の部材ランクを鋼部材の幅厚比から自動判定するか（UI-13）。
+    /// true の場合、鋼部材かつ断面形状(`Section.shape`)を持つ部材について
+    /// `squid_n_design_jp::ds::max_width_thickness` → `s_member_rank` で算定し、
+    /// 算定できなかった層のみ `design_rank`（選択値）にフォールバックする。
+    pub design_rank_auto: bool,
     /// 左ペインの幅（px）。ドラッグで調整可能（180–520 にクランプ）。
     #[cfg(feature = "gui")]
     pub left_panel_width: f32,
@@ -324,6 +341,7 @@ impl Default for App {
             // サンプル(門型ラーメン)が鋼構造のため既定は S ラーメン
             design_frame: squid_n_design_jp::holding_capacity::FrameType::SteelFrame,
             design_rank: squid_n_design_jp::holding_capacity::MemberRank::FA,
+            design_rank_auto: false,
             #[cfg(feature = "gui")]
             left_panel_width: 280.0,
             #[cfg(feature = "gui")]
@@ -601,10 +619,24 @@ impl App {
     }
 
     /// 保有水平耐力の層別判定を行う。前提データが不足していれば Err(案内文)。
+    ///
+    /// 戻り値の第 2 要素は層ごとに採用された部材ランク（`design_rank_auto` が
+    /// true の場合は幅厚比からの自動判定、算定できなかった層は `design_rank`
+    /// へフォールバック。false の場合は全層 `design_rank`）。
+    #[allow(clippy::type_complexity)]
     pub fn compute_holding_capacity(
         &self,
-    ) -> Result<squid_n_design_jp::holding_capacity::HoldingCapacityResult, String> {
-        use squid_n_design_jp::holding_capacity::{check_holding_capacity, ds_value, qud_by_story};
+    ) -> Result<
+        (
+            squid_n_design_jp::holding_capacity::HoldingCapacityResult,
+            Vec<squid_n_design_jp::holding_capacity::MemberRank>,
+        ),
+        String,
+    > {
+        use squid_n_design_jp::ds::{max_width_thickness, s_member_rank, worst_rank, RankCriteria};
+        use squid_n_design_jp::holding_capacity::{
+            check_holding_capacity, ds_value, qud_by_story, MemberRank,
+        };
 
         if self.model.stories.is_empty() {
             return Err(
@@ -661,23 +693,85 @@ impl App {
         let rt = squid_n_load::ai::rt(t, squid_n_load::ai::tc_of(self.analysis_cfg.soil));
         let qud = qud_by_story(&weights, self.analysis_cfg.z, rt, t);
 
-        let ds = ds_value(self.design_frame, self.design_rank);
-        let ds_vec = vec![ds; weights.len()];
+        let n_stories = weights.len();
+        let (story_ranks, member_ranks): (Vec<MemberRank>, Vec<(ElemId, MemberRank)>) =
+            if self.design_rank_auto {
+                // 鋼部材のうち断面形状(shape)を持つものについて幅厚比からランクを
+                // 算定し、所属階ごとに集計する。
+                //
+                // 所属階の規則: 部材の節点のうち最も高い階(story index 最大)。
+                // story_gen::generate_stories は各節点をその節点自身の標高が属する
+                // レベルへ割り当てる（柱下端は下階または基部=None、柱上端は上階、
+                // 梁は両端とも同一階）ため、柱は自動的に上端側の階（＝各節点の
+                // story のうち最大値）に算入される。
+                let mut per_story: Vec<Vec<MemberRank>> = vec![Vec::new(); n_stories];
+                let mut computed: Vec<(ElemId, MemberRank)> = Vec::new();
+                for elem in &self.model.elements {
+                    let Some(sec) = elem
+                        .section
+                        .and_then(|sid| self.model.sections.get(sid.index()))
+                    else {
+                        continue;
+                    };
+                    let Some(mat) = elem
+                        .material
+                        .and_then(|mid| self.model.materials.get(mid.index()))
+                    else {
+                        continue;
+                    };
+                    // RC 部材（非鋼材）は幅厚比の概念がないためスキップ。
+                    if !is_steel(&mat.name) {
+                        continue;
+                    }
+                    // 形状情報がない断面（カタログ数値直入力等）はスキップ。
+                    let Some(shape) = sec.shape.as_ref() else {
+                        continue;
+                    };
+                    // 円形鋼管等、幅厚比の対象外形状はスキップ。
+                    let Some(wt) = max_width_thickness(shape) else {
+                        continue;
+                    };
+                    // 節点が階を持たない部材（両端とも基部）はスキップ。
+                    let Some(story_idx) = elem
+                        .nodes
+                        .iter()
+                        .filter_map(|nid| self.model.nodes.get(nid.index()))
+                        .filter_map(|n| n.story)
+                        .max()
+                    else {
+                        continue;
+                    };
+                    let idx = story_idx.index();
+                    if idx >= n_stories {
+                        continue;
+                    }
+                    let rank = s_member_rank(wt, &RankCriteria::default());
+                    per_story[idx].push(rank);
+                    computed.push((elem.id, rank));
+                }
+                // 階ごとの代表ランク = 算定できた部材ランクの最悪値。
+                // 1 本も算定できなかった層は手動選択ランクへフォールバック。
+                let ranks: Vec<MemberRank> = per_story
+                    .into_iter()
+                    .map(|rs| worst_rank(&rs).unwrap_or(self.design_rank))
+                    .collect();
+                (ranks, computed)
+            } else {
+                (vec![self.design_rank; n_stories], Vec::new())
+            };
+
+        let ds_vec: Vec<f64> = story_ranks
+            .iter()
+            .map(|r| ds_value(self.design_frame, *r))
+            .collect();
         let heights: Vec<f64> = metrics.iter().map(|m| m.height).collect();
         let rs: Vec<f64> = metrics.iter().map(|m| m.rs).collect();
         let re: Vec<f64> = metrics.iter().map(|m| m.re).collect();
         let fes: Vec<f64> = metrics.iter().map(|m| m.fes).collect();
 
-        Ok(check_holding_capacity(
-            po,
-            &qud,
-            &ds_vec,
-            &fes,
-            &rs,
-            &re,
-            &heights,
-            Vec::new(),
-        ))
+        let result =
+            check_holding_capacity(po, &qud, &ds_vec, &fes, &rs, &re, &heights, member_ranks);
+        Ok((result, story_ranks))
     }
 
     /// T3: 固有値解析を実行し、結果を `self.results` に格納する。
@@ -1025,20 +1119,24 @@ impl App {
         self.run_time_history(wave);
     }
 
-    /// 方向 `dir` に加速度列 `accel` を割り当てた `GroundMotion` を組み立てる
-    /// （X なら accel_x、Y なら accel_y に入れ、他方はゼロ列にする）。
+    /// 方向 `dir` に加速度列 `accel` を割り当てた `GroundMotion` を組み立てる。
+    /// X なら accel_x、Y なら accel_y に入れ、他方はゼロ列にする。
+    /// Xy（X+Y 同時入力）は同一波形を accel_x・accel_y の両方にそのまま入れる
+    /// 簡易仕様（位相差・別波形の指定はサポートしない。CSV 2 列入力は
+    /// `parse_wave_csv` が別々の列を返すため、その場合は本関数を経由せず
+    /// 直接 `GroundMotion` を組み立てる）。
     fn build_ground_motion(
         dt: f64,
-        dir: SeismicDir,
+        dir: ThDir,
         accel: Vec<f64>,
     ) -> squid_n_solver::timehistory::GroundMotion {
         match dir {
-            SeismicDir::X => squid_n_solver::timehistory::GroundMotion {
+            ThDir::X => squid_n_solver::timehistory::GroundMotion {
                 dt,
                 accel_x: accel,
                 accel_y: None,
             },
-            SeismicDir::Y => {
+            ThDir::Y => {
                 let n = accel.len();
                 squid_n_solver::timehistory::GroundMotion {
                     dt,
@@ -1046,6 +1144,11 @@ impl App {
                     accel_y: Some(accel),
                 }
             }
+            ThDir::Xy => squid_n_solver::timehistory::GroundMotion {
+                dt,
+                accel_x: accel.clone(),
+                accel_y: Some(accel),
+            },
         }
     }
 
@@ -1133,6 +1236,72 @@ impl App {
             }
         }
         self.beam_loads = beam_loads;
+    }
+}
+
+/// 波形 CSV/テキストの内容を解析する（ヘッドレステスト可能な純粋関数）。
+///
+/// - `ThDir::X` / `ThDir::Y`: 1 行 1 値（カンマ区切りなら最後の列）を加速度(gal)として
+///   読む（従来仕様）。数値化できない行は無視する。戻り値の第 2 要素は常に `None`。
+/// - `ThDir::Xy`: 1 行をカンマ区切り 2 列（1 列目 X、2 列目 Y、ともに gal）として読む。
+///   2 列に満たない行があればエラーを返す（「X+Y には2列のCSVが必要です」）。
+///   数値化できない行（ヘッダ等）は無視する。
+///
+/// いずれも gal → mm/s²（内部単位系）へ ×10 で変換して返す。
+/// 有効なデータ点が 2 点未満の場合はエラーを返す。
+///
+/// 呼び出し元（`run_time_history_from_csv`）は GUI 専用のため、非 GUI ビルドでは
+/// テストからのみ使用される（`cfg(any(test, feature = "gui"))` で dead_code 警告を回避）。
+#[cfg(any(test, feature = "gui"))]
+fn parse_wave_csv(content: &str, dir: ThDir) -> Result<(Vec<f64>, Option<Vec<f64>>), String> {
+    match dir {
+        ThDir::X | ThDir::Y => {
+            let accel: Vec<f64> = content
+                .lines()
+                .filter_map(|l| {
+                    let field = l.split(',').next_back()?.trim();
+                    field.parse::<f64>().ok()
+                })
+                .map(|gal| gal * 10.0)
+                .collect();
+            if accel.len() < 2 {
+                return Err(
+                    "波形データが読み取れませんでした（数値が 2 点未満）。1 行 1 値の CSV を指定してください。"
+                        .to_string(),
+                );
+            }
+            Ok((accel, None))
+        }
+        ThDir::Xy => {
+            let mut xs = Vec::new();
+            let mut ys = Vec::new();
+            for line in content.lines() {
+                let line = line.trim();
+                if line.is_empty() {
+                    continue;
+                }
+                let fields: Vec<&str> = line.split(',').collect();
+                if fields.len() < 2 {
+                    return Err("X+Y には2列のCSVが必要です".to_string());
+                }
+                let (Ok(x), Ok(y)) = (
+                    fields[0].trim().parse::<f64>(),
+                    fields[1].trim().parse::<f64>(),
+                ) else {
+                    // ヘッダ行等、数値化できない行は無視する。
+                    continue;
+                };
+                xs.push(x * 10.0);
+                ys.push(y * 10.0);
+            }
+            if xs.len() < 2 {
+                return Err(
+                    "波形データが読み取れませんでした（数値が 2 点未満）。X+Y には2列のCSVが必要です。"
+                        .to_string(),
+                );
+            }
+            Ok((xs, Some(ys)))
+        }
     }
 }
 
@@ -1966,8 +2135,10 @@ impl App {
             ui.strong("時刻歴応答（線形）");
             ui.horizontal(|ui| {
                 ui.label("方向:");
-                ui.selectable_value(&mut self.analysis_cfg.th_dir, SeismicDir::X, "X");
-                ui.selectable_value(&mut self.analysis_cfg.th_dir, SeismicDir::Y, "Y");
+                ui.selectable_value(&mut self.analysis_cfg.th_dir, ThDir::X, "X");
+                ui.selectable_value(&mut self.analysis_cfg.th_dir, ThDir::Y, "Y");
+                ui.selectable_value(&mut self.analysis_cfg.th_dir, ThDir::Xy, "X+Y")
+                    .on_hover_text("同一波形を両方向へ同時入力(CSV は2列)");
                 ui.separator();
                 ui.label("積分法:");
                 ui.selectable_value(
@@ -2068,7 +2239,8 @@ impl App {
         });
     }
 
-    /// 波形 CSV（1 行 1 値、gal 単位）を選択して時刻歴解析をジョブ実行する。
+    /// 波形 CSV（X/Y: 1 行 1 値、X+Y: 1 行 2 列、いずれも gal 単位）を選択して
+    /// 時刻歴解析をジョブ実行する。
     fn run_time_history_from_csv(&mut self) {
         let Some(path) = rfd::FileDialog::new()
             .add_filter("波形 (CSV/テキスト)", &["csv", "txt", "dat"])
@@ -2083,24 +2255,26 @@ impl App {
                 return;
             }
         };
-        // 1 行 1 値（カンマ区切りなら最後の列）を gal → mm/s² (×10) で読む
-        let accel: Vec<f64> = content
-            .lines()
-            .filter_map(|l| {
-                let field = l.split(',').next_back()?.trim();
-                field.parse::<f64>().ok()
-            })
-            .map(|gal| gal * 10.0)
-            .collect();
-        if accel.len() < 2 {
-            self.last_error = Some(
-                "波形データが読み取れませんでした（数値が 2 点未満）。1 行 1 値の CSV を指定してください。"
-                    .to_string(),
-            );
-            return;
-        }
-        let wave =
-            Self::build_ground_motion(self.analysis_cfg.th_dt, self.analysis_cfg.th_dir, accel);
+        let dir = self.analysis_cfg.th_dir;
+        let (col1, col2) = match parse_wave_csv(&content, dir) {
+            Ok(v) => v,
+            Err(e) => {
+                self.last_error = Some(e);
+                return;
+            }
+        };
+        let wave = match dir {
+            // X/Y は単一列を方向へ振り分ける（従来仕様、build_ground_motion 共用）。
+            ThDir::X | ThDir::Y => Self::build_ground_motion(self.analysis_cfg.th_dt, dir, col1),
+            // X+Y は CSV の 2 列がそのまま X・Y の入力になる
+            // （build_ground_motion の Xy 分岐は「同一波形を複製」する仕様のため、
+            // 別波形の 2 列読込はここで直接 GroundMotion を組み立てる）。
+            ThDir::Xy => squid_n_solver::timehistory::GroundMotion {
+                dt: self.analysis_cfg.th_dt,
+                accel_x: col1,
+                accel_y: col2,
+            },
+        };
         self.start_time_history_job(wave);
     }
 
@@ -2531,7 +2705,7 @@ mod tests {
         let mut app = App::default();
         app.load_model(crate::sample::portal_frame());
         app.analysis_cfg.th_duration = 2.0;
-        app.analysis_cfg.th_dir = SeismicDir::Y;
+        app.analysis_cfg.th_dir = ThDir::Y;
         app.run_time_history_sample();
         assert!(app.last_error.is_none(), "{:?}", app.last_error);
         let th = app.results.as_ref().unwrap().time_history.as_ref().unwrap();
@@ -2550,13 +2724,88 @@ mod tests {
         // wave 構築のみを検証する純粋関数のテスト（th_dir=Y でも accel_x 側に
         // 誤って入らないことを確認する）。
         let accel = vec![1.0, 2.0, 3.0];
-        let wave_x = App::build_ground_motion(0.01, SeismicDir::X, accel.clone());
+        let wave_x = App::build_ground_motion(0.01, ThDir::X, accel.clone());
         assert_eq!(wave_x.accel_x, accel);
         assert!(wave_x.accel_y.is_none());
 
-        let wave_y = App::build_ground_motion(0.01, SeismicDir::Y, accel.clone());
+        let wave_y = App::build_ground_motion(0.01, ThDir::Y, accel.clone());
         assert_eq!(wave_y.accel_x, vec![0.0; accel.len()]);
-        assert_eq!(wave_y.accel_y, Some(accel));
+        assert_eq!(wave_y.accel_y, Some(accel.clone()));
+    }
+
+    /// ThDir::Xy: 同一波形を accel_x・accel_y の両方に入れる（簡易仕様）。
+    #[test]
+    fn test_build_ground_motion_xy_duplicates_wave() {
+        let accel = vec![1.0, 2.0, 3.0];
+        let wave = App::build_ground_motion(0.01, ThDir::Xy, accel.clone());
+        assert_eq!(wave.accel_x, accel);
+        assert_eq!(wave.accel_y, Some(accel));
+    }
+
+    // ===== parse_wave_csv テスト =====
+
+    #[test]
+    fn test_parse_wave_csv_single_column_x_or_y() {
+        let content = "10.0\n20.0\n30.0\n";
+        let (accel, second) = parse_wave_csv(content, ThDir::X).unwrap();
+        assert_eq!(accel, vec![100.0, 200.0, 300.0]); // gal→mm/s²(×10)
+        assert!(second.is_none());
+
+        // カンマ区切りなら最後の列を使う（従来仕様）。
+        let content_csv = "0.0,10.0\n0.01,20.0\n0.02,30.0\n";
+        let (accel, second) = parse_wave_csv(content_csv, ThDir::Y).unwrap();
+        assert_eq!(accel, vec![100.0, 200.0, 300.0]);
+        assert!(second.is_none());
+    }
+
+    #[test]
+    fn test_parse_wave_csv_single_column_too_few_points_is_err() {
+        assert!(parse_wave_csv("10.0\n", ThDir::X).is_err());
+        assert!(parse_wave_csv("", ThDir::X).is_err());
+    }
+
+    #[test]
+    fn test_parse_wave_csv_xy_two_columns() {
+        let content = "10.0,5.0\n20.0,15.0\n30.0,25.0\n";
+        let (xs, ys) = parse_wave_csv(content, ThDir::Xy).unwrap();
+        assert_eq!(xs, vec![100.0, 200.0, 300.0]);
+        assert_eq!(ys, Some(vec![50.0, 150.0, 250.0]));
+    }
+
+    #[test]
+    fn test_parse_wave_csv_xy_header_line_is_skipped() {
+        // ヘッダ行（数値化不可）は無視され、残りの2行が (X, Y) として読める。
+        let content = "x,y\n10.0,5.0\n20.0,15.0\n";
+        let (xs, ys) = parse_wave_csv(content, ThDir::Xy).unwrap();
+        assert_eq!(xs, vec![100.0, 200.0]);
+        assert_eq!(ys, Some(vec![50.0, 150.0]));
+    }
+
+    #[test]
+    fn test_parse_wave_csv_xy_insufficient_columns_is_err() {
+        let content = "10.0,5.0\n20.0\n30.0,25.0\n";
+        let err = parse_wave_csv(content, ThDir::Xy).unwrap_err();
+        assert_eq!(err, "X+Y には2列のCSVが必要です");
+    }
+
+    #[test]
+    fn test_parse_wave_csv_xy_too_few_points_is_err() {
+        assert!(parse_wave_csv("10.0,5.0\n", ThDir::Xy).is_err());
+    }
+
+    #[test]
+    fn test_time_history_xy_sample_flow() {
+        let mut app = App::default();
+        app.load_model(crate::sample::portal_frame());
+        app.analysis_cfg.th_duration = 2.0;
+        app.analysis_cfg.th_dir = ThDir::Xy;
+        app.run_time_history_sample();
+        assert!(app.last_error.is_none(), "{:?}", app.last_error);
+        let th = app.results.as_ref().unwrap().time_history.as_ref().unwrap();
+        assert!(
+            th.history.node_disp.iter().any(|v| v.abs() > 1e-6),
+            "応答がゼロのままです"
+        );
     }
 
     /// 2 層等質量等剛性せん断モデル（軸ばね 2 本の直列、Ux 方向のみ自由）。
@@ -2900,13 +3149,65 @@ mod tests {
         app.run_pushover();
         assert!(app.last_error.is_none(), "{:?}", app.last_error);
 
-        let result = app
+        let (result, story_ranks) = app
             .compute_holding_capacity()
             .expect("前提が揃えば Ok のはず");
         assert_eq!(result.stories.len(), 1);
         assert!(result.stories[0].qun > 0.0);
         // Qu はプッシュオーバー最終点の層せん断（capacity_curve.story_shear）から取得される。
         assert!(result.stories[0].qu > 0.0, "{}", result.stories[0].qu);
+        // design_rank_auto=false（既定）→ 全層フォールバック（選択値 design_rank）。
+        assert_eq!(story_ranks, vec![app.design_rank]);
+        assert!(result.member_ranks.is_empty());
+    }
+
+    /// UI-13: `design_rank_auto = true` で鋼部材の幅厚比から部材ランクを自動判定する。
+    /// portal_frame の柱(H-300x300x10x15)・梁(H-400x200x8x13)の幅厚比を手計算し、
+    /// `s_member_rank` の結果と一致することを確認する。
+    #[test]
+    fn test_holding_capacity_rank_auto_from_width_thickness() {
+        use squid_n_design_jp::ds::{max_width_thickness, s_member_rank, worst_rank, RankCriteria};
+
+        let mut app = App::default();
+        app.load_model(crate::sample::portal_frame());
+        app.generate_stories_action();
+        assert!(app.last_error.is_none(), "{:?}", app.last_error);
+
+        app.run_seismic(SeismicDir::X);
+        assert!(app.last_error.is_none(), "{:?}", app.last_error);
+
+        app.analysis_cfg.push_steps = 10;
+        app.run_pushover();
+        assert!(app.last_error.is_none(), "{:?}", app.last_error);
+
+        app.design_rank_auto = true;
+        let (result, story_ranks) = app
+            .compute_holding_capacity()
+            .expect("shape 付き鋼断面があれば Ok のはず");
+
+        assert!(
+            !result.member_ranks.is_empty(),
+            "鋼部材の幅厚比からランクが算定されているはず"
+        );
+
+        // 柱 H-300x300x10x15: flange=300/(2*15)=10.0, web=(300-30)/10=27.0 → max=27.0
+        let col_wt = max_width_thickness(app.model.sections[0].shape.as_ref().unwrap()).unwrap();
+        let col_rank = s_member_rank(col_wt, &RankCriteria::default());
+        // 梁 H-400x200x8x13: flange=200/(2*13)=7.69, web=(400-26)/8=46.75 → max=46.75
+        let beam_wt = max_width_thickness(app.model.sections[1].shape.as_ref().unwrap()).unwrap();
+        let beam_rank = s_member_rank(beam_wt, &RankCriteria::default());
+
+        for (elem_id, rank) in &result.member_ranks {
+            let expected = if elem_id.0 == 2 { beam_rank } else { col_rank };
+            assert_eq!(
+                *rank, expected,
+                "ElemId({}) のランクが手計算値と一致しません",
+                elem_id.0
+            );
+        }
+        // 唯一の層の代表ランクは柱・梁のうち最悪値（FD 寄り）。
+        assert_eq!(story_ranks.len(), 1);
+        assert_eq!(story_ranks[0], worst_rank(&[col_rank, beam_rank]).unwrap());
     }
 
     /// Z=0 平面の矩形（4000×6000）+外周4本の梁 + スラブ1枚（TriTrapezoid）を持つモデルを作る。
