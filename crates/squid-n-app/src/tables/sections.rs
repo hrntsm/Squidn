@@ -9,6 +9,7 @@ pub fn sections_table(ui: &mut egui::Ui, app: &mut App) {
     let mut pending_name: Vec<(usize, String)> = Vec::new();
     let mut pending_field: Vec<(usize, SectionField, f64)> = Vec::new();
     let mut pending_delete: Option<SectionId> = None;
+    let mut pending_focus: Option<SectionId> = None;
 
     // 編集バッファ（名称）
     let mut name_buf: Vec<String> = app.model.sections.iter().map(|s| s.name.clone()).collect();
@@ -51,7 +52,15 @@ pub fn sections_table(ui: &mut egui::Ui, app: &mut App) {
                 let i = row.index();
                 let sec = &app.model.sections[i];
                 row.col(|ui| {
-                    ui.label(sec.id.0.to_string());
+                    let sid = sec.id;
+                    let is_sel = app.nav.focus_section == Some(sid);
+                    if ui
+                        .add(egui::Button::selectable(is_sel, sid.0.to_string()))
+                        .on_hover_text("クリックでインスペクタに断面詳細を表示")
+                        .clicked()
+                    {
+                        pending_focus = Some(sid);
+                    }
                 });
                 row.col(|ui| {
                     let resp = ui.add(
@@ -126,6 +135,9 @@ pub fn sections_table(ui: &mut egui::Ui, app: &mut App) {
             app.nav.focus_section = None;
         }
         app.staleness.mark_edited();
+    }
+    if let Some(sid) = pending_focus {
+        app.nav.focus_section = Some(sid);
     }
     for (i, name) in pending_name {
         let sid = SectionId(app.model.sections[i].id.0);

@@ -48,6 +48,17 @@ pub struct Navigator {
     pub focus_member: Option<ElemId>,
     pub focus_section: Option<SectionId>,
     pub focus_load_case: Option<LoadCaseId>,
+    /// ナビゲータで選択中の結果表示対象（静的ケース／荷重組合せ）
+    pub focus_result: Option<StaticKey>,
+}
+
+/// 表示対象の静的解析結果を指すキー。荷重ケース単体か荷重組合せかを区別する。
+/// `Combo` のインデックスは **`ResultsBundle.combos` 上の位置**
+/// （`model.combinations` のインデックスではない）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StaticKey {
+    Case(LoadCaseId),
+    Combo(usize),
 }
 
 /// stale（要再計算）状態（UI設計 §5）。
@@ -85,6 +96,8 @@ pub struct Selection {
 #[derive(Default)]
 pub struct ResultsBundle {
     pub statics: Vec<(LoadCaseId, squid_n_solver::linear::StaticOnce)>,
+    /// 荷重組合せの解析結果（組合せ名で保持）
+    pub combos: Vec<(String, squid_n_solver::linear::StaticOnce)>,
     pub modal: Option<squid_n_solver::eigen::ModalResult>,
     pub member_forces: Vec<(ElemId, squid_n_element::beam::MemberForces)>,
     pub checks: Vec<(ElemId, f64, squid_n_design_jp::CheckResult)>,
@@ -144,8 +157,8 @@ pub struct App {
     pub active_tab: Tab,
     /// 設計検定の荷重継続性区分（長期／短期）
     pub design_term: LoadTerm,
-    /// 最後に実行した荷重ケース ID
-    pub last_lc: Option<LoadCaseId>,
+    /// 最後に実行した静的解析結果（荷重ケース／荷重組合せ）
+    pub last_static: Option<StaticKey>,
     /// 解析実行中のエラーメッセージ
     pub last_error: Option<String>,
     /// 節点座標の編集バッファ（model.nodes に同期）
@@ -161,6 +174,10 @@ pub struct App {
     pub nav: Navigator,
     /// モデルタブ内のサブタブ
     pub model_tab: ModelTab,
+    /// 保有水平耐力（ルート3）判定の架構種別（Ds 表の行選択）
+    pub design_frame: squid_n_design_jp::holding_capacity::FrameType,
+    /// 保有水平耐力（ルート3）判定の部材ランク（Ds 表の列選択）
+    pub design_rank: squid_n_design_jp::holding_capacity::MemberRank,
     /// 左ペインの幅（px）。ドラッグで調整可能（180–520 にクランプ）。
     #[cfg(feature = "gui")]
     pub left_panel_width: f32,
@@ -209,6 +226,23 @@ pub struct App {
     pub project_path: Option<std::path::PathBuf>,
     /// 解析タブの設定値
     pub analysis_cfg: AnalysisSettings,
+    /// 解析タブ「荷重組合せ」で選択中の組合せインデックス（model.combinations）
+    #[cfg(feature = "gui")]
+    pub analysis_combo_idx: usize,
+    /// 荷重タブ「荷重組合せ」自動生成 UI のドラフト状態
+    #[cfg(feature = "gui")]
+    pub combo_draft: ComboDraft,
+}
+
+/// 荷重組合せ自動生成 UI のドラフト（GUI 専用）。DL/LL は必須、地震X/Y・積雪は任意。
+#[cfg(feature = "gui")]
+#[derive(Clone, Debug, Default)]
+pub struct ComboDraft {
+    pub dl: Option<LoadCaseId>,
+    pub ll: Option<LoadCaseId>,
+    pub seismic_x: Option<LoadCaseId>,
+    pub seismic_y: Option<LoadCaseId>,
+    pub snow: Option<LoadCaseId>,
 }
 
 impl Default for App {
@@ -220,7 +254,7 @@ impl Default for App {
             undo: UndoStack::new(),
             active_tab: Tab::Model,
             design_term: LoadTerm::Long,
-            last_lc: None,
+            last_static: None,
             last_error: None,
             node_edit: Vec::new(),
             node_draft: ["0".to_string(), "0".to_string(), "0".to_string()],
@@ -228,6 +262,9 @@ impl Default for App {
             staleness: Staleness::default(),
             nav: Navigator::default(),
             model_tab: ModelTab::default(),
+            // サンプル(門型ラーメン)が鋼構造のため既定は S ラーメン
+            design_frame: squid_n_design_jp::holding_capacity::FrameType::SteelFrame,
+            design_rank: squid_n_design_jp::holding_capacity::MemberRank::FA,
             #[cfg(feature = "gui")]
             left_panel_width: 280.0,
             #[cfg(feature = "gui")]
@@ -259,6 +296,10 @@ impl Default for App {
             wall_draw_nodes: Vec::new(),
             project_path: None,
             analysis_cfg: AnalysisSettings::default(),
+            #[cfg(feature = "gui")]
+            analysis_combo_idx: 0,
+            #[cfg(feature = "gui")]
+            combo_draft: ComboDraft::default(),
         }
     }
 }
@@ -324,7 +365,7 @@ impl App {
         self.selection = Selection::default();
         self.undo = UndoStack::new();
         self.nav = Navigator::default();
-        self.last_lc = None;
+        self.last_static = None;
         self.last_error = None;
         self.beam_loads.clear();
         self.staleness = Staleness::default();
@@ -359,6 +400,43 @@ impl App {
         }
     }
 
+    /// ST-Bridge（XML, サブセット）ファイルを読み込む。
+    /// Squid-N プロジェクト（.scz）とは別物なので project_path はクリアする。
+    pub fn import_stbridge_from(&mut self, path: std::path::PathBuf) {
+        self.last_error = None;
+        let xml = match std::fs::read_to_string(&path) {
+            Ok(s) => s,
+            Err(e) => {
+                self.last_error = Some(format!("ST-Bridge読込エラー: {}", e));
+                return;
+            }
+        };
+        match squid_n_io::stbridge::import_stbridge(&xml) {
+            Ok(model) => {
+                if let Err(e) = model.validate() {
+                    self.last_error = Some(format!("ST-Bridge読込モデルの検証エラー: {:?}", e));
+                    return;
+                }
+                self.load_model(model);
+                self.project_path = None;
+            }
+            Err(e) => self.last_error = Some(format!("ST-Bridge読込エラー: {}", e)),
+        }
+    }
+
+    /// モデルを ST-Bridge（XML, サブセット）として指定パスへ書き出す。
+    pub fn export_stbridge_to(&mut self, path: std::path::PathBuf) {
+        self.last_error = None;
+        match squid_n_io::stbridge::export_stbridge(&self.model) {
+            Ok(xml) => {
+                if let Err(e) = std::fs::write(&path, xml) {
+                    self.last_error = Some(format!("ST-Bridge書出エラー: {}", e));
+                }
+            }
+            Err(e) => self.last_error = Some(format!("ST-Bridge書出エラー: {}", e)),
+        }
+    }
+
     /// 節点編集バッファを model.nodes に同期する。
     /// 編集中でない（フォーカス外）セルのみ model 値で更新する。
     pub fn sync_node_edit(&mut self) {
@@ -386,7 +464,7 @@ impl App {
                     bundle.statics.push((lc, res));
                     bundle.member_forces = member_forces;
                     self.results = Some(bundle);
-                    self.last_lc = Some(lc);
+                    self.last_static = Some(StaticKey::Case(lc));
                     self.staleness.mark_fresh();
                     self.run_design_check();
                 }
@@ -394,6 +472,147 @@ impl App {
             },
             Err(e) => self.last_error = Some(format!("解析準備エラー: {:?}", e)),
         }
+    }
+
+    /// T7: 荷重組合せ解析を実行し、結果を `bundle.combos` に格納する。
+    /// 指定インデックスの荷重組合せが存在しない場合はエラーメッセージをセット。
+    pub fn run_combination(&mut self, index: usize) {
+        self.last_error = None;
+        let Some(combo) = self.model.combinations.get(index).cloned() else {
+            self.last_error = Some(format!("荷重組合せ #{} が存在しません", index));
+            return;
+        };
+        match Analysis::prepare(&self.model) {
+            Ok(analysis) => match analysis.linear_combination(&combo) {
+                Ok(res) => {
+                    let member_forces = res.member_forces.clone();
+                    let mut bundle = self.results.take().unwrap_or_default();
+                    // StaticKey::Combo は bundle.combos 上の位置を指す規約
+                    // （current_static・ナビゲータと共有）。再実行時は既存位置を
+                    // その場で差し替え、他の組合せ結果のキーを無効化しない。
+                    let pos = match bundle
+                        .combos
+                        .iter()
+                        .position(|(name, _)| *name == combo.name)
+                    {
+                        Some(pos) => {
+                            bundle.combos[pos].1 = res;
+                            pos
+                        }
+                        None => {
+                            bundle.combos.push((combo.name.clone(), res));
+                            bundle.combos.len() - 1
+                        }
+                    };
+                    bundle.member_forces = member_forces;
+                    self.results = Some(bundle);
+                    self.last_static = Some(StaticKey::Combo(pos));
+                    self.staleness.mark_fresh();
+                    self.run_design_check();
+                }
+                Err(e) => self.last_error = Some(format!("荷重組合せ解析エラー: {:?}", e)),
+            },
+            Err(e) => self.last_error = Some(format!("解析準備エラー: {:?}", e)),
+        }
+    }
+
+    /// 表示対象の静的解析結果を解決する。優先順: ナビゲータ選択 → 最後に実行した結果。
+    pub fn current_static(&self) -> Option<&squid_n_solver::linear::StaticOnce> {
+        let bundle = self.results.as_ref()?;
+        let resolve = |key: StaticKey| -> Option<&squid_n_solver::linear::StaticOnce> {
+            match key {
+                StaticKey::Case(id) => bundle
+                    .statics
+                    .iter()
+                    .find(|(cid, _)| *cid == id)
+                    .map(|(_, s)| s),
+                StaticKey::Combo(idx) => bundle.combos.get(idx).map(|(_, s)| s),
+            }
+        };
+        self.nav
+            .focus_result
+            .and_then(resolve)
+            .or_else(|| self.last_static.and_then(resolve))
+    }
+
+    /// 保有水平耐力の層別判定を行う。前提データが不足していれば Err(案内文)。
+    pub fn compute_holding_capacity(
+        &self,
+    ) -> Result<squid_n_design_jp::holding_capacity::HoldingCapacityResult, String> {
+        use squid_n_design_jp::holding_capacity::{check_holding_capacity, ds_value, qud_by_story};
+
+        if self.model.stories.is_empty() {
+            return Err(
+                "階が未定義です。解析タブの「階の自動生成」を実行してください。".to_string(),
+            );
+        }
+        let po = self
+            .results
+            .as_ref()
+            .and_then(|r| r.pushover.as_ref())
+            .ok_or_else(|| {
+                "プッシュオーバー未実行です。解析タブからプッシュオーバーを実行してください。"
+                    .to_string()
+            })?;
+        let st = self.current_static().ok_or_else(|| {
+            "静的解析結果がありません。地震静的(Ai)を実行してください。".to_string()
+        })?;
+
+        let metrics = crate::summary::compute_story_metrics(
+            &self.model,
+            &st.disp,
+            self.analysis_cfg.seismic_dir,
+        );
+
+        // 地震重量: 下階→上階順（model.stories は生成時から下階→上階順に格納される）。
+        let weights: Vec<f64> = self
+            .model
+            .stories
+            .iter()
+            .map(|s| s.seismic_weight.unwrap_or(0.0))
+            .collect();
+        if weights.iter().any(|w| *w <= 0.0) {
+            return Err(
+                "地震重量が未設定です。解析タブの「階の自動生成」を実行してください。".to_string(),
+            );
+        }
+
+        // T(1 次周期): 固有値解析があればそれを使用、なければ略算式。
+        let t = self
+            .results
+            .as_ref()
+            .and_then(|r| r.modal.as_ref())
+            .and_then(|m| m.period.first().copied())
+            .unwrap_or_else(|| {
+                let height_m = self
+                    .model
+                    .stories
+                    .last()
+                    .map(|s| s.elevation)
+                    .unwrap_or(0.0)
+                    / 1000.0;
+                squid_n_load::ai::approx_t(height_m, 0.0)
+            });
+        let rt = squid_n_load::ai::rt(t, squid_n_load::ai::tc_of(self.analysis_cfg.soil));
+        let qud = qud_by_story(&weights, self.analysis_cfg.z, rt, t);
+
+        let ds = ds_value(self.design_frame, self.design_rank);
+        let ds_vec = vec![ds; weights.len()];
+        let heights: Vec<f64> = metrics.iter().map(|m| m.height).collect();
+        let rs: Vec<f64> = metrics.iter().map(|m| m.rs).collect();
+        let re: Vec<f64> = metrics.iter().map(|m| m.re).collect();
+        let fes: Vec<f64> = metrics.iter().map(|m| m.fes).collect();
+
+        Ok(check_holding_capacity(
+            po,
+            &qud,
+            &ds_vec,
+            &fes,
+            &rs,
+            &re,
+            &heights,
+            Vec::new(),
+        ))
     }
 
     /// T3: 固有値解析を実行し、結果を `self.results` に格納する。
@@ -455,7 +674,7 @@ impl App {
                     bundle.statics.push((LoadCaseId(0), res));
                     bundle.member_forces = member_forces;
                     self.results = Some(bundle);
-                    self.last_lc = Some(LoadCaseId(0));
+                    self.last_static = Some(StaticKey::Case(LoadCaseId(0)));
                     self.staleness.mark_fresh();
                     self.run_design_check();
                 }
@@ -666,6 +885,27 @@ impl eframe::App for App {
                     self.save_project_dialog(true);
                     ui.close();
                 }
+                ui.separator();
+                if ui
+                    .button("📥 ST-Bridge 読込…")
+                    .on_hover_text(
+                        "ST-Bridge 2.0 サブセット（節点・部材・断面・材料・節点荷重）。支点・部材荷重・組合せは含まれません",
+                    )
+                    .clicked()
+                {
+                    self.import_stbridge_dialog();
+                    ui.close();
+                }
+                if ui
+                    .button("📤 ST-Bridge 書出…")
+                    .on_hover_text(
+                        "ST-Bridge 2.0 サブセット（節点・部材・断面・材料・節点荷重）。支点・部材荷重・組合せは含まれません",
+                    )
+                    .clicked()
+                {
+                    self.export_stbridge_dialog();
+                    ui.close();
+                }
             });
             ui.separator();
             let tabs = [
@@ -847,6 +1087,27 @@ impl App {
         }
     }
 
+    /// 「ST-Bridge 読込…」ダイアログを表示して読み込む。
+    fn import_stbridge_dialog(&mut self) {
+        if let Some(path) = rfd::FileDialog::new()
+            .add_filter("ST-Bridge", &["stb", "xml"])
+            .pick_file()
+        {
+            self.import_stbridge_from(path);
+        }
+    }
+
+    /// 「ST-Bridge 書出…」ダイアログを表示して保存先を尋ねる。
+    fn export_stbridge_dialog(&mut self) {
+        if let Some(path) = rfd::FileDialog::new()
+            .add_filter("ST-Bridge", &["stb", "xml"])
+            .set_file_name("model.stb")
+            .save_file()
+        {
+            self.export_stbridge_to(path);
+        }
+    }
+
     /// 左ペイン：ナビゲータ（階/部材群/荷重ケース/結果ケースのツリー）。
     fn navigator_panel(&mut self, ui: &mut egui::Ui) {
         ui.group(|ui| {
@@ -858,7 +1119,7 @@ impl App {
                 .default_open(true)
                 .id_salt("nav_groups");
             header.show(ui, |ui| {
-                let steel_count = self
+                let steel_ids: Vec<ElemId> = self
                     .model
                     .elements
                     .iter()
@@ -868,25 +1129,41 @@ impl App {
                             .map(|m| is_steel(&m.name))
                             .unwrap_or(false)
                     })
-                    .count();
-                let rc_count = self.model.elements.len().saturating_sub(steel_count);
+                    .map(|e| e.id)
+                    .collect();
+                let rc_ids: Vec<ElemId> = self
+                    .model
+                    .elements
+                    .iter()
+                    .map(|e| e.id)
+                    .filter(|id| !steel_ids.contains(id))
+                    .collect();
+                // selected 表示は簡易判定（先頭要素が当該グループに属するか）。
+                let is_steel_sel = self
+                    .selection
+                    .members
+                    .first()
+                    .map(|id| steel_ids.contains(id))
+                    .unwrap_or(false);
                 if ui
-                    .selectable_label(
-                        self.nav.focus_member.is_none(),
-                        format!("鋼材部材 ({})", steel_count),
-                    )
+                    .selectable_label(is_steel_sel, format!("鋼材部材 ({})", steel_ids.len()))
+                    .on_hover_text("クリックで3Dビューにハイライト")
                     .clicked()
                 {
-                    self.nav.focus_member = None;
+                    self.selection.members = steel_ids.clone();
                 }
+                let is_rc_sel = self
+                    .selection
+                    .members
+                    .first()
+                    .map(|id| rc_ids.contains(id))
+                    .unwrap_or(false);
                 if ui
-                    .selectable_label(
-                        self.nav.focus_member.is_none(),
-                        format!("RC部材 ({})", rc_count),
-                    )
+                    .selectable_label(is_rc_sel, format!("RC部材 ({})", rc_ids.len()))
+                    .on_hover_text("クリックで3Dビューにハイライト")
                     .clicked()
                 {
-                    self.nav.focus_member = None;
+                    self.selection.members = rc_ids.clone();
                 }
             });
 
@@ -949,17 +1226,39 @@ impl App {
                     });
             });
 
-            // 結果メモ（簡易：静的ケース数を列挙）
+            // 結果ケース：静的解析結果／荷重組合せ結果をクリックで表示対象に選択できる。
             let header = egui::CollapsingHeader::new("結果ケース")
                 .default_open(true)
                 .id_salt("nav_result_cases");
             header.show(ui, |ui| {
                 if let Some(r) = &self.results {
-                    if r.statics.is_empty() && r.modal.is_none() {
+                    if r.statics.is_empty() && r.combos.is_empty() && r.modal.is_none() {
                         ui.label("（未実行）");
                     } else {
-                        for (i, (id, _)) in r.statics.iter().enumerate() {
-                            ui.label(format!("静的 #{} LC {}", i, id.0));
+                        for (id, _) in r.statics.iter() {
+                            let lc_name = self
+                                .model
+                                .load_cases
+                                .iter()
+                                .find(|lc| lc.id == *id)
+                                .map(|lc| lc.name.as_str())
+                                .unwrap_or("");
+                            let is_sel = self.nav.focus_result == Some(StaticKey::Case(*id));
+                            if ui
+                                .selectable_label(is_sel, format!("静的 LC {} {}", id.0, lc_name))
+                                .clicked()
+                            {
+                                self.nav.focus_result = Some(StaticKey::Case(*id));
+                            }
+                        }
+                        for (i, (name, _)) in r.combos.iter().enumerate() {
+                            let is_sel = self.nav.focus_result == Some(StaticKey::Combo(i));
+                            if ui
+                                .selectable_label(is_sel, format!("組合せ {}", name))
+                                .clicked()
+                            {
+                                self.nav.focus_result = Some(StaticKey::Combo(i));
+                            }
                         }
                         if r.modal.is_some() {
                             ui.label("固有値");
@@ -970,9 +1269,23 @@ impl App {
                 }
             });
 
-            // 階/レベル（未実装だがグループ表示のみ用意）
+            // 階/レベル（階の自動生成結果を上階→下階順に表示）
             let _ = ui.collapsing("階/レベル", |ui| {
-                ui.label("（未実装: P4 以降）");
+                if self.model.stories.is_empty() {
+                    ui.colored_label(crate::theme::GRAY_600, "未定義");
+                    if ui.small_button("🏢 解析タブで自動生成").clicked() {
+                        self.active_tab = Tab::Analysis;
+                    }
+                } else {
+                    for s in self.model.stories.iter().rev() {
+                        ui.label(format!(
+                            "{}  Z={:.0}mm  W={:.1}kN",
+                            s.name,
+                            s.elevation,
+                            s.seismic_weight.unwrap_or(0.0) / 1000.0
+                        ));
+                    }
+                }
             });
         });
     }
@@ -1122,6 +1435,10 @@ impl App {
                 {
                     if let Some(lc) = selected_lc {
                         self.run_linear_static(lc);
+                        if self.last_error.is_none() {
+                            self.active_tab = Tab::Results;
+                            self.results_view = ResultsView::Spatial;
+                        }
                     }
                 }
             });
@@ -1130,6 +1447,52 @@ impl App {
                     crate::theme::GRAY_600,
                     "荷重ケースがありません。荷重タブで作成してください。",
                 );
+            }
+        });
+        ui.add_space(6.0);
+
+        // ── 荷重組合せ ────────────────────────────────────────────
+        ui.group(|ui| {
+            ui.strong("荷重組合せ");
+            if self.model.combinations.is_empty() {
+                ui.colored_label(
+                    crate::theme::GRAY_600,
+                    "荷重組合せがありません。荷重タブで作成してください。",
+                );
+            } else {
+                if self.analysis_combo_idx >= self.model.combinations.len() {
+                    self.analysis_combo_idx = 0;
+                }
+                ui.horizontal(|ui| {
+                    ui.label("組合せ:");
+                    let text = self
+                        .model
+                        .combinations
+                        .get(self.analysis_combo_idx)
+                        .map(|c| c.name.clone())
+                        .unwrap_or_else(|| "（なし）".to_string());
+                    egui::ComboBox::from_id_salt("analysis_combo")
+                        .selected_text(text)
+                        .show_ui(ui, |ui| {
+                            for (i, combo) in self.model.combinations.iter().enumerate() {
+                                if ui
+                                    .selectable_label(
+                                        self.analysis_combo_idx == i,
+                                        format!("[{}] {}", i, combo.name),
+                                    )
+                                    .clicked()
+                                {
+                                    self.analysis_combo_idx = i;
+                                }
+                            }
+                        });
+                    if ui.button("▶ 実行").clicked() {
+                        self.run_combination(self.analysis_combo_idx);
+                        if self.last_error.is_none() {
+                            self.active_tab = Tab::Results;
+                        }
+                    }
+                });
             }
         });
         ui.add_space(6.0);
@@ -1192,6 +1555,10 @@ impl App {
             });
             if ui.button("▶ 実行").clicked() {
                 self.run_seismic(self.analysis_cfg.seismic_dir);
+                if self.last_error.is_none() {
+                    self.active_tab = Tab::Results;
+                    self.results_view = ResultsView::Spatial;
+                }
             }
         });
         ui.add_space(6.0);
@@ -1470,6 +1837,7 @@ impl App {
         // 遅延アクション（借用チェーン回避：UI 内で self.model を immutable borrow 中に
         // mut borrow できないため、複製ボタンクリックは一旦 here に保存）
         let mut duplicate_member = None;
+        let mut highlight_section_members: Option<Vec<ElemId>> = None;
         ui.group(|ui| {
             ui.strong("インスペクタ");
             ui.separator();
@@ -1558,6 +1926,29 @@ impl App {
                 );
             }
 
+            // 選択された断面の諸元（断面テーブルの行選択と連動）
+            if let Some(sec_id) = self.nav.focus_section {
+                if let Some(sec) = self.model.sections.iter().find(|s| s.id == sec_id) {
+                    ui.separator();
+                    ui.strong("断面（選択中）");
+                    ui.label(format!("名前: {} ({})", sec.name, sec_id.0));
+                    ui.label(format!("  A = {:.3e} mm²", sec.area));
+                    ui.label(format!("  Iy= {:.3e} mm⁴", sec.iy));
+                    ui.label(format!("  Iz= {:.3e} mm⁴", sec.iz));
+                    let used: Vec<ElemId> = self
+                        .model
+                        .elements
+                        .iter()
+                        .filter(|e| e.section == Some(sec_id))
+                        .map(|e| e.id)
+                        .collect();
+                    ui.label(format!("使用部材数: {}", used.len()));
+                    if ui.button("🔍 使用部材を3Dハイライト").clicked() {
+                        highlight_section_members = Some(used);
+                    }
+                }
+            }
+
             ui.separator();
             // 選択された節点の諸元
             if let Some(node_id) = self.nav.focus_node {
@@ -1585,6 +1976,10 @@ impl App {
                 Box::new(squid_n_edit::DuplicateSectionForMember { member }),
             );
             self.staleness.mark_edited();
+        }
+        // 遅延実行: 断面の使用部材ハイライトボタン
+        if let Some(members) = highlight_section_members {
+            self.selection.members = members;
         }
     }
 
@@ -1755,5 +2150,124 @@ mod tests {
             "/nonexistent/dir/does_not_exist.scz",
         ));
         assert!(app.last_error.is_some());
+    }
+
+    #[test]
+    fn test_export_and_import_stbridge_roundtrip() {
+        let dir = std::env::temp_dir().join("squid_n_app_test_stbridge");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("roundtrip.stb");
+
+        let mut app = App::default();
+        app.load_model(crate::sample::portal_frame());
+        let original = app.model.clone();
+        app.export_stbridge_to(path.clone());
+        assert!(app.last_error.is_none(), "{:?}", app.last_error);
+
+        let mut app2 = App::default();
+        app2.import_stbridge_from(path.clone());
+        assert!(app2.last_error.is_none(), "{:?}", app2.last_error);
+        assert!(app2.model.validate().is_ok());
+        // ST-Bridge プロジェクト(.scz)とは別物なので project_path は更新されない。
+        assert!(app2.project_path.is_none());
+
+        // サブセットのため完全一致(eq_ignoring_dofmap)は求めない
+        // （拘束条件・部材荷重は ST-Bridge の対象外で失われる）が、
+        // 節点数・部材数はまず一致するはず。
+        assert_eq!(app2.model.nodes.len(), original.nodes.len());
+        assert_eq!(app2.model.elements.len(), original.elements.len());
+
+        // 座標・部材の接続関係（節点参照・断面・材料・部材軸）はこの門型ラーメンでは
+        // 完全にビット一致する（列/梁の判定に依らず節点順序が保たれるケース）。
+        for (a, b) in app2.model.nodes.iter().zip(original.nodes.iter()) {
+            assert_eq!(a.coord, b.coord);
+        }
+        assert_eq!(app2.model.elements, original.elements);
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn test_import_stbridge_missing_file_sets_error() {
+        let mut app = App::default();
+        app.import_stbridge_from(std::path::PathBuf::from(
+            "/nonexistent/dir/does_not_exist.stb",
+        ));
+        assert!(app.last_error.is_some());
+    }
+
+    #[test]
+    fn test_combination_flow() {
+        let mut app = App::default();
+        app.load_model(crate::sample::portal_frame());
+
+        let combo = squid_n_core::model::LoadCombination {
+            name: "G+Kx".into(),
+            terms: vec![(LoadCaseId(0), 1.0), (LoadCaseId(1), 1.0)],
+        };
+        app.undo.run(
+            &mut app.model,
+            Box::new(squid_n_edit::AddCombination { combo }),
+        );
+
+        app.run_combination(0);
+        assert!(app.last_error.is_none(), "{:?}", app.last_error);
+        let bundle = app.results.as_ref().unwrap();
+        assert_eq!(bundle.combos.len(), 1);
+        assert!(!bundle.checks.is_empty());
+        assert_eq!(app.last_static, Some(StaticKey::Combo(0)));
+    }
+
+    #[test]
+    fn test_current_static_priority() {
+        let mut app = App::default();
+        app.load_model(crate::sample::portal_frame());
+        app.run_linear_static(LoadCaseId(0));
+        assert!(app.last_error.is_none(), "{:?}", app.last_error);
+        let expected_disp = app.results.as_ref().unwrap().statics[0].1.disp.clone();
+
+        // ナビゲータで存在しない Combo を選択していても last_static にフォールバックする
+        app.nav.focus_result = Some(StaticKey::Combo(9));
+        let fallback = app
+            .current_static()
+            .expect("無効な選択時は last_static にフォールバックするはず");
+        assert_eq!(fallback.disp, expected_disp);
+
+        // Case を選択すれば該当ケースの結果が返る
+        app.nav.focus_result = Some(StaticKey::Case(LoadCaseId(0)));
+        let by_case = app
+            .current_static()
+            .expect("Case 選択時は該当ケースの結果が返るはず");
+        assert_eq!(by_case.disp, expected_disp);
+    }
+
+    #[test]
+    fn test_holding_capacity_flow() {
+        let mut app = App::default();
+        app.load_model(crate::sample::portal_frame());
+
+        // 階が未定義 → Err
+        assert!(app.compute_holding_capacity().is_err());
+
+        app.generate_stories_action();
+        assert!(app.last_error.is_none(), "{:?}", app.last_error);
+
+        app.run_seismic(SeismicDir::X);
+        assert!(app.last_error.is_none(), "{:?}", app.last_error);
+
+        // プッシュオーバー未実行 → Err
+        assert!(app.compute_holding_capacity().is_err());
+
+        app.analysis_cfg.push_steps = 10;
+        app.run_pushover();
+        assert!(app.last_error.is_none(), "{:?}", app.last_error);
+
+        let result = app
+            .compute_holding_capacity()
+            .expect("前提が揃えば Ok のはず");
+        assert_eq!(result.stories.len(), 1);
+        assert!(result.stories[0].qun > 0.0);
+        // Qu はプッシュオーバー最終点の層せん断（capacity_curve.story_shear）から取得される。
+        assert!(result.stories[0].qu > 0.0, "{}", result.stories[0].qu);
     }
 }

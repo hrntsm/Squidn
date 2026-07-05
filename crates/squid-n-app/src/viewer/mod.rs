@@ -599,11 +599,7 @@ pub fn viewer_panel(ui: &mut egui::Ui, app: &mut App) {
 
     // 節点座標（変形・モード時は変位を加味）
     let disp = match mode {
-        ViewMode::Deformed => app
-            .results
-            .as_ref()
-            .and_then(|r| r.statics.first())
-            .map(|(_, s)| s.disp.clone()),
+        ViewMode::Deformed => app.current_static().map(|s| s.disp.clone()),
         ViewMode::Mode => app
             .results
             .as_ref()
@@ -1021,7 +1017,7 @@ fn draw_cmq_diagram(painter: &egui::Painter, app: &App, pts: &[[f32; 2]]) {
                 painter.clip_rect().min.y + 30.0,
             ),
             egui::Align2::LEFT_TOP,
-            "CMQ データがありません（床荷重分配を実行してください）",
+            "CMQ データがありません（スラブ入力 UI が未実装のため、床荷重分配（CMQ）は現在 GUI から生成できません）",
             egui::FontId::proportional(13.0),
             theme::GRAY_600,
         );
