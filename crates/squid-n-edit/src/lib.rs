@@ -1243,6 +1243,72 @@ fn shift_load_case_ids(model: &mut Model, mut f: impl FnMut(&mut LoadCaseId)) {
     }
 }
 
+/// 荷重組合せ追加。末尾に追加する。逆操作は末尾の組合せ削除。
+///
+/// `LoadCombination` は ID を持たず配列インデックスのみで管理されるため、
+/// 他の追加系コマンド（[`AddLoadCase`] 等）と異なり ID 採番は発生しない。
+/// 参照する `LoadCaseId` の存在チェックは行わない（[`Model::validate`] も
+/// 組合せの `LoadCaseId` 参照はダングリングチェックの対象外であり、既存の
+/// [`DeleteLoadCase`] が参照側で削除を防ぐことで整合性を保っている）。
+pub struct AddCombination {
+    pub combo: squid_n_core::model::LoadCombination,
+}
+
+impl EditCommand for AddCombination {
+    fn apply(&self, model: &mut Model) -> Box<dyn EditCommand> {
+        model.combinations.push(self.combo.clone());
+        let index = model.combinations.len() - 1;
+        Box::new(DeleteCombination { index })
+    }
+
+    fn label(&self) -> &str {
+        "荷重組合せ追加"
+    }
+}
+
+/// 荷重組合せを index 指定で削除。逆操作は [`InsertCombination`]（同じ位置への復元）。
+/// 組合せは他のデータから参照されないため ID 再採番は不要。index が範囲外なら Noop。
+pub struct DeleteCombination {
+    pub index: usize,
+}
+
+impl EditCommand for DeleteCombination {
+    fn apply(&self, model: &mut Model) -> Box<dyn EditCommand> {
+        if self.index >= model.combinations.len() {
+            return Box::new(Noop);
+        }
+        let removed = model.combinations.remove(self.index);
+        Box::new(InsertCombination {
+            index: self.index,
+            combo: removed,
+        })
+    }
+
+    fn label(&self) -> &str {
+        "荷重組合せ削除"
+    }
+}
+
+/// 指定インデックスへ荷重組合せを再挿入する（[`DeleteCombination`] の逆操作専用）。
+pub struct InsertCombination {
+    pub index: usize,
+    pub combo: squid_n_core::model::LoadCombination,
+}
+
+impl EditCommand for InsertCombination {
+    fn apply(&self, model: &mut Model) -> Box<dyn EditCommand> {
+        if self.index > model.combinations.len() {
+            return Box::new(Noop);
+        }
+        model.combinations.insert(self.index, self.combo.clone());
+        Box::new(DeleteCombination { index: self.index })
+    }
+
+    fn label(&self) -> &str {
+        "荷重組合せ削除の取り消し"
+    }
+}
+
 /// 階定義の一括適用（階自動生成の結果を反映する）。
 ///
 /// `model.stories`・各節点の所属階・剛床拘束(`Constraint::RigidDiaphragm`)を
@@ -2070,5 +2136,80 @@ mod tests {
         });
         stack.run(&mut model, Box::new(DeleteLoadCase { id: LoadCaseId(0) }));
         assert_eq!(model.load_cases.len(), 1, "組合せ参照中のケースは削除不可");
+    }
+
+    #[test]
+    fn test_add_delete_combination_roundtrip() {
+        use squid_n_core::ids::LoadCaseId;
+        use squid_n_core::model::LoadCombination;
+        let mut model = empty_model();
+        model.combinations.push(LoadCombination {
+            name: "既存".into(),
+            terms: vec![(LoadCaseId(0), 1.0)],
+        });
+        let mut stack = UndoStack::new();
+
+        let combo = LoadCombination {
+            name: "1.0DL+1.0LL".into(),
+            terms: vec![(LoadCaseId(0), 1.0), (LoadCaseId(1), 1.0)],
+        };
+        stack.run(
+            &mut model,
+            Box::new(AddCombination {
+                combo: combo.clone(),
+            }),
+        );
+        assert_eq!(model.combinations.len(), 2);
+        assert_eq!(model.combinations[1], combo);
+
+        stack.undo(&mut model);
+        assert_eq!(model.combinations.len(), 1);
+
+        stack.redo(&mut model);
+        assert_eq!(model.combinations.len(), 2);
+        assert_eq!(model.combinations[1], combo);
+    }
+
+    #[test]
+    fn test_delete_combination_roundtrip_restores_position() {
+        use squid_n_core::ids::LoadCaseId;
+        use squid_n_core::model::LoadCombination;
+        let mut model = empty_model();
+        for (name, coef) in [("A", 1.0), ("B", 2.0), ("C", 3.0)] {
+            model.combinations.push(LoadCombination {
+                name: name.into(),
+                terms: vec![(LoadCaseId(0), coef)],
+            });
+        }
+        let before = model.clone();
+        let mut stack = UndoStack::new();
+
+        // 中間（B）を削除
+        stack.run(&mut model, Box::new(DeleteCombination { index: 1 }));
+        assert_eq!(model.combinations.len(), 2);
+        assert_eq!(model.combinations[0].name, "A");
+        assert_eq!(model.combinations[1].name, "C");
+
+        // undo で元の位置（index 1）に復元
+        stack.undo(&mut model);
+        assert!(model.eq_ignoring_dofmap(&before));
+        assert_eq!(model.combinations[1].name, "B");
+
+        stack.redo(&mut model);
+        assert_eq!(model.combinations.len(), 2);
+        assert_eq!(model.combinations[0].name, "A");
+        assert_eq!(model.combinations[1].name, "C");
+    }
+
+    #[test]
+    fn test_delete_combination_out_of_range_is_noop() {
+        let mut model = empty_model();
+        let mut stack = UndoStack::new();
+        stack.run(&mut model, Box::new(DeleteCombination { index: 0 }));
+        assert!(model.combinations.is_empty());
+        assert!(stack.can_undo());
+        // Noop の undo でも状態は変わらない
+        stack.undo(&mut model);
+        assert!(model.combinations.is_empty());
     }
 }
