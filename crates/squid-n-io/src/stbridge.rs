@@ -265,6 +265,8 @@ pub fn import_stbridge(xml: &str) -> Result<Model, StbError> {
                             as_z: 0.0,
                             panel_thickness: None,
                             thickness: None,
+                            // ST-Bridge インポート断面はパラメトリック形状を持たない。
+                            shape: None,
                         });
                     }
                     "StbColumn" => {
@@ -447,6 +449,7 @@ mod tests {
             as_z: 0.0,
             panel_thickness: None,
             thickness: None,
+            shape: None,
         });
         // 柱2本（鉛直）＋大梁1本（水平）。
         m.elements.push(ElementData {

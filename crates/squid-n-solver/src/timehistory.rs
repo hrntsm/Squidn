@@ -77,24 +77,49 @@ pub struct ResponseResult {
 }
 
 /// UI 描画用の代表応答時刻歴（`time` と同じ長さ）。
+/// 記録方向は入力加速度の絶対値和（Σ|ẍg|）が大きい方向を解析開始時に自動選択する
+/// （`choose_record_dir_y` 参照）。X・Y いずれの加振でも代表応答がゼロにならない。
 #[derive(Clone, Debug, Default)]
 pub struct ResponseHistory {
-    /// 記録節点（最も標高が高い、X 方向自由度を持つ節点）。
+    /// 記録節点（最も標高が高い、記録方向の自由度を持つ節点）。
     pub node: Option<squid_n_core::ids::NodeId>,
-    /// 記録節点の X 方向相対変位 [mm]。
-    pub node_disp_x: Vec<f64>,
-    /// ベースシア(X) [N]（全慣性力の合計、符号付き）。
-    pub base_shear_x: Vec<f64>,
+    /// 記録方向が Y なら true（X なら false）。
+    pub record_dir_y: bool,
+    /// 記録節点の記録方向相対変位 [mm]。
+    pub node_disp: Vec<f64>,
+    /// ベースシア(記録方向) [N]（全慣性力の合計、符号付き）。
+    pub base_shear: Vec<f64>,
     /// 最上階の層間変形角 [rad]（符号付き。階が未定義なら 0）。
     pub top_drift_angle: Vec<f64>,
 }
 
-/// 記録節点を選ぶ: X 方向が自由な節点のうち最も標高(Z)が高いもの。
-fn pick_record_node(model: &Model, dofmap: &DofMap) -> Option<squid_n_core::ids::NodeId> {
+/// 記録方向を自動選択する: `accel_y` が Some かつ Σ|accel_y| > Σ|accel_x| なら Y、
+/// そうでなければ X（従来互換）。
+fn choose_record_dir_y(wave: &GroundMotion) -> bool {
+    let sum_x: f64 = wave.accel_x.iter().map(|v| v.abs()).sum();
+    let sum_y: f64 = wave
+        .accel_y
+        .as_ref()
+        .map(|a| a.iter().map(|v| v.abs()).sum())
+        .unwrap_or(0.0);
+    wave.accel_y.is_some() && sum_y > sum_x
+}
+
+/// 記録節点を選ぶ: 記録方向（`dir_idx`: 0=X, 1=Y）が自由な節点のうち
+/// 最も標高(Z)が高いもの。
+fn pick_record_node(
+    model: &Model,
+    dofmap: &DofMap,
+    dir_idx: usize,
+) -> Option<squid_n_core::ids::NodeId> {
     model
         .nodes
         .iter()
-        .filter(|n| dofmap.active(n.id.index() * DOF_PER_NODE).is_some())
+        .filter(|n| {
+            dofmap
+                .active(n.id.index() * DOF_PER_NODE + dir_idx)
+                .is_some()
+        })
         .max_by(|a, b| {
             a.coord[2]
                 .partial_cmp(&b.coord[2])
@@ -103,8 +128,8 @@ fn pick_record_node(model: &Model, dofmap: &DofMap) -> Option<squid_n_core::ids:
         .map(|n| n.id)
 }
 
-/// 最上階の現在の層間変形角（符号付き）。階が未定義なら 0。
-fn current_top_drift(model: &Model, dofmap: &DofMap, u_free: &[f64]) -> f64 {
+/// 最上階の現在の層間変形角（符号付き、記録方向 `dir_idx`）。階が未定義なら 0。
+fn current_top_drift(model: &Model, dofmap: &DofMap, u_free: &[f64], dir_idx: usize) -> f64 {
     let Some(si) = model.stories.len().checked_sub(1) else {
         return 0.0;
     };
@@ -124,45 +149,49 @@ fn current_top_drift(model: &Model, dofmap: &DofMap, u_free: &[f64]) -> f64 {
         model.stories[si - 1].node_ids.first().copied()
     };
     if let (Some(tn), Some(bn)) = (top, bot) {
-        (node_disp_x(u_free, dofmap, tn) - node_disp_x(u_free, dofmap, bn)) / height_mm
+        (node_disp(u_free, dofmap, tn, dir_idx) - node_disp(u_free, dofmap, bn, dir_idx))
+            / height_mm
     } else {
         0.0
     }
 }
 
 /// 1 ステップ分の代表応答を記録する。
-/// `a_red` は縮約空間の相対加速度、`xg_x` は当該時刻の地動加速度(X)。
+/// `dir_idx` は記録方向（0=X, 1=Y）、`m_r` は当該方向の M·r、`rmr` は当該方向の
+/// rᵀ·M·r（合計質量）、`a_red` は縮約空間の相対加速度、`xg` は当該時刻の
+/// 記録方向の地動加速度。
 #[allow(clippy::too_many_arguments)]
 fn record_history_step(
     history: &mut ResponseHistory,
     model: &Model,
     dofmap: &DofMap,
     reducer: &Reducer,
-    m_r_x: &[f64],
-    rmr_x: f64,
+    dir_idx: usize,
+    m_r: &[f64],
+    rmr: f64,
     u_free: &[f64],
     a_red: &[f64],
-    xg_x: f64,
+    xg: f64,
 ) {
     let disp = history
         .node
-        .map(|n| node_disp_x(u_free, dofmap, n))
+        .map(|n| node_disp(u_free, dofmap, n, dir_idx))
         .unwrap_or(0.0);
-    history.node_disp_x.push(disp);
+    history.node_disp.push(disp);
     let a_free = reducer.expand_u(a_red);
-    let ma: f64 = m_r_x.iter().zip(a_free.iter()).map(|(m, a)| m * a).sum();
-    history.base_shear_x.push(-(ma + xg_x * rmr_x));
+    let ma: f64 = m_r.iter().zip(a_free.iter()).map(|(m, a)| m * a).sum();
+    history.base_shear.push(-(ma + xg * rmr));
     history
         .top_drift_angle
-        .push(current_top_drift(model, dofmap, u_free));
+        .push(current_top_drift(model, dofmap, u_free, dir_idx));
 }
 
-/// rᵀ·M·r （X 方向合計質量）。ベースシア計算に使う。
-fn total_mass_x(m_r_x: &[f64], dofmap: &DofMap, n_nodes: usize) -> f64 {
+/// rᵀ·M·r （記録方向 `dir_idx` の合計質量）。ベースシア計算に使う。
+fn total_mass(m_r: &[f64], dofmap: &DofMap, n_nodes: usize, dir_idx: usize) -> f64 {
     let mut s = 0.0;
     for ni in 0..n_nodes {
-        if let Some(a) = dofmap.active(ni * DOF_PER_NODE) {
-            s += m_r_x[a as usize];
+        if let Some(a) = dofmap.active(ni * DOF_PER_NODE + dir_idx) {
+            s += m_r[a as usize];
         }
     }
     s
@@ -675,24 +704,35 @@ fn run_steps_hht(
     let mut time = Vec::with_capacity(wave.accel_x.len() - start_step as usize + 1);
     time.push(start_step as f64 * dt);
 
-    // UI 用の代表応答記録
+    // UI 用の代表応答記録（記録方向は入力加速度の絶対値和が大きい方を自動選択）
+    let record_dir_y = choose_record_dir_y(wave);
+    let dir_idx = if record_dir_y { 1 } else { 0 };
+    let m_r_record = if record_dir_y { m_r_y } else { m_r_x };
     let mut history = ResponseHistory {
-        node: pick_record_node(model, dofmap),
+        node: pick_record_node(model, dofmap, dir_idx),
+        record_dir_y,
         ..Default::default()
     };
-    let rmr_x = total_mass_x(m_r_x, dofmap, model.nodes.len());
-    let xg_init = wave
-        .accel_x
-        .get(start_step as usize)
-        .copied()
-        .unwrap_or(0.0);
+    let rmr_record = total_mass(m_r_record, dofmap, model.nodes.len(), dir_idx);
+    let xg_init = if record_dir_y {
+        wave.accel_y
+            .as_ref()
+            .and_then(|a| a.get(start_step as usize).copied())
+            .unwrap_or(0.0)
+    } else {
+        wave.accel_x
+            .get(start_step as usize)
+            .copied()
+            .unwrap_or(0.0)
+    };
     record_history_step(
         &mut history,
         model,
         dofmap,
         reducer,
-        m_r_x,
-        rmr_x,
+        dir_idx,
+        m_r_record,
+        rmr_record,
         &u_free_init,
         &a,
         xg_init,
@@ -755,14 +795,22 @@ fn run_steps_hht(
             peak_disp_free[i] = peak_disp_free[i].max(u_free[i].abs());
         }
         update_story_drift(model, dofmap, &u_free, &mut story_drift_angle);
-        let xg_next = wave.accel_x.get(n + 1).copied().unwrap_or(0.0);
+        let xg_next = if record_dir_y {
+            wave.accel_y
+                .as_ref()
+                .and_then(|a| a.get(n + 1).copied())
+                .unwrap_or(0.0)
+        } else {
+            wave.accel_x.get(n + 1).copied().unwrap_or(0.0)
+        };
         record_history_step(
             &mut history,
             model,
             dofmap,
             reducer,
-            m_r_x,
-            rmr_x,
+            dir_idx,
+            m_r_record,
+            rmr_record,
             &u_free,
             &a,
             xg_next,
@@ -842,24 +890,35 @@ fn run_steps(
     let mut time = Vec::with_capacity(wave.accel_x.len() - start_step as usize + 1);
     time.push(start_step as f64 * dt);
 
-    // UI 用の代表応答記録
+    // UI 用の代表応答記録（記録方向は入力加速度の絶対値和が大きい方を自動選択）
+    let record_dir_y = choose_record_dir_y(wave);
+    let dir_idx = if record_dir_y { 1 } else { 0 };
+    let m_r_record = if record_dir_y { m_r_y } else { m_r_x };
     let mut history = ResponseHistory {
-        node: pick_record_node(model, dofmap),
+        node: pick_record_node(model, dofmap, dir_idx),
+        record_dir_y,
         ..Default::default()
     };
-    let rmr_x = total_mass_x(m_r_x, dofmap, model.nodes.len());
-    let xg_init = wave
-        .accel_x
-        .get(start_step as usize)
-        .copied()
-        .unwrap_or(0.0);
+    let rmr_record = total_mass(m_r_record, dofmap, model.nodes.len(), dir_idx);
+    let xg_init = if record_dir_y {
+        wave.accel_y
+            .as_ref()
+            .and_then(|a| a.get(start_step as usize).copied())
+            .unwrap_or(0.0)
+    } else {
+        wave.accel_x
+            .get(start_step as usize)
+            .copied()
+            .unwrap_or(0.0)
+    };
     record_history_step(
         &mut history,
         model,
         dofmap,
         reducer,
-        m_r_x,
-        rmr_x,
+        dir_idx,
+        m_r_record,
+        rmr_record,
         &u_free_init,
         &a,
         xg_init,
@@ -916,14 +975,22 @@ fn run_steps(
             peak_disp_free[i] = peak_disp_free[i].max(u_free[i].abs());
         }
         update_story_drift(model, dofmap, &u_free, &mut story_drift_angle);
-        let xg_next = wave.accel_x.get(n + 1).copied().unwrap_or(0.0);
+        let xg_next = if record_dir_y {
+            wave.accel_y
+                .as_ref()
+                .and_then(|a| a.get(n + 1).copied())
+                .unwrap_or(0.0)
+        } else {
+            wave.accel_x.get(n + 1).copied().unwrap_or(0.0)
+        };
         record_history_step(
             &mut history,
             model,
             dofmap,
             reducer,
-            m_r_x,
-            rmr_x,
+            dir_idx,
+            m_r_record,
+            rmr_record,
             &u_free,
             &a,
             xg_next,
@@ -989,7 +1056,9 @@ fn update_story_drift(
             model.stories[si - 1].node_ids.first().copied()
         };
         if let (Some(tn), Some(bn)) = (top, bot) {
-            let du = (node_disp_x(u_free, dofmap, tn) - node_disp_x(u_free, dofmap, bn)).abs();
+            // 層間変形角は従来通り X 方向（0）で評価する（ResponseHistory の
+            // 記録方向とは独立）。
+            let du = (node_disp(u_free, dofmap, tn, 0) - node_disp(u_free, dofmap, bn, 0)).abs();
             let angle = du / height_mm;
             if angle > story_drift_angle[si] {
                 story_drift_angle[si] = angle;
@@ -998,9 +1067,15 @@ fn update_story_drift(
     }
 }
 
-fn node_disp_x(u_free: &[f64], dofmap: &DofMap, node_id: squid_n_core::ids::NodeId) -> f64 {
+/// 節点の並進自由度 `dir_idx`（0=X, 1=Y, 2=Z）の相対変位を返す。
+fn node_disp(
+    u_free: &[f64],
+    dofmap: &DofMap,
+    node_id: squid_n_core::ids::NodeId,
+    dir_idx: usize,
+) -> f64 {
     let ni = node_id.index();
-    let g = ni * DOF_PER_NODE + 0;
+    let g = ni * DOF_PER_NODE + dir_idx;
     if let Some(a) = dofmap.active(g) {
         u_free[a as usize]
     } else {
@@ -1159,22 +1234,34 @@ pub fn nonlinear_time_history_analysis(
         update_story_drift(model, dofmap, &u_free_init, &mut story_drift_angle);
     }
 
-    // UI 用の代表応答記録
+    // UI 用の代表応答記録（記録方向は入力加速度の絶対値和が大きい方を自動選択）
+    let record_dir_y = choose_record_dir_y(wave);
+    let dir_idx = if record_dir_y { 1 } else { 0 };
+    let m_r_record: &[f64] = if record_dir_y { &m_r_y } else { &m_r_x };
     let mut history = ResponseHistory {
-        node: pick_record_node(model, dofmap),
+        node: pick_record_node(model, dofmap, dir_idx),
+        record_dir_y,
         ..Default::default()
     };
-    let rmr_x = total_mass_x(&m_r_x, dofmap, model.nodes.len());
+    let rmr_record = total_mass(m_r_record, dofmap, model.nodes.len(), dir_idx);
     {
         let u_free_init = reducer.expand_u(&u);
-        let xg_init = wave.accel_x.first().copied().unwrap_or(0.0);
+        let xg_init = if record_dir_y {
+            wave.accel_y
+                .as_ref()
+                .and_then(|a| a.first().copied())
+                .unwrap_or(0.0)
+        } else {
+            wave.accel_x.first().copied().unwrap_or(0.0)
+        };
         record_history_step(
             &mut history,
             model,
             dofmap,
             reducer,
-            &m_r_x,
-            rmr_x,
+            dir_idx,
+            m_r_record,
+            rmr_record,
             &u_free_init,
             &a,
             xg_init,
@@ -1298,14 +1385,22 @@ pub fn nonlinear_time_history_analysis(
                 peak_disp_free[i] = peak_disp_free[i].max(u_free[i].abs());
             }
             update_story_drift(model, dofmap, &u_free, &mut story_drift_angle);
-            let xg_next = wave.accel_x.get(n + 1).copied().unwrap_or(0.0);
+            let xg_next = if record_dir_y {
+                wave.accel_y
+                    .as_ref()
+                    .and_then(|a| a.get(n + 1).copied())
+                    .unwrap_or(0.0)
+            } else {
+                wave.accel_x.get(n + 1).copied().unwrap_or(0.0)
+            };
             record_history_step(
                 &mut history,
                 model,
                 dofmap,
                 reducer,
-                &m_r_x,
-                rmr_x,
+                dir_idx,
+                m_r_record,
+                rmr_record,
                 &u_free,
                 &a,
                 xg_next,
@@ -1425,6 +1520,9 @@ mod tests {
     /// Ux のみ自由。
     const FREE_UX: Dof6Mask = Dof6Mask(0b111110);
 
+    /// Uy のみ自由（Y 方向専用モデル用）。
+    const FREE_UY: Dof6Mask = Dof6Mask(0b111101);
+
     /// SDOF: m=1.0 N·s²/mm, k=1000 N/mm（§8.1）。
     /// ω = √(k/m) = 31.6228 rad/s, T = 0.198692 s。
     fn sdof_model() -> Model {
@@ -1473,6 +1571,72 @@ mod tests {
                 as_z: 1e12,
                 panel_thickness: None,
                 thickness: None,
+                shape: None,
+            }],
+            materials: vec![Material {
+                id: MaterialId(0),
+                name: "mat".into(),
+                young: k * 1000.0 / 1.0,
+                poisson: 0.0,
+                density: 0.0,
+                shear: None,
+                fc: None,
+                fy: None,
+            }],
+            ..Default::default()
+        }
+    }
+
+    /// SDOF（Y 方向自由度のみ）: `sdof_model()` と同形状・同剛性の梁を、
+    /// 拘束を Uy のみ自由に変えたもの。Y 方向加振時の記録方向自動選択を
+    /// 検証するために使う。
+    fn sdof_model_y() -> Model {
+        let k = 1000.0_f64;
+        let m = 1.0_f64;
+        Model {
+            nodes: vec![
+                Node {
+                    id: NodeId(0),
+                    coord: [0.0, 0.0, 0.0],
+                    restraint: Dof6Mask::FIXED,
+                    mass: None,
+                    story: None,
+                },
+                Node {
+                    id: NodeId(1),
+                    coord: [1000.0, 0.0, 0.0],
+                    restraint: FREE_UY,
+                    mass: Some([0.0, m, 0.0, 0.0, 0.0, 0.0]),
+                    story: None,
+                },
+            ],
+            elements: vec![ElementData {
+                id: ElemId(1),
+                kind: ElementKind::Beam,
+                nodes: smallvec::smallvec![NodeId(0), NodeId(1)],
+                section: Some(SectionId(0)),
+                material: Some(MaterialId(0)),
+                local_axis: LocalAxis {
+                    ref_vector: [0.0, 0.0, 1.0],
+                },
+                end_cond: [EndCondition::Fixed, EndCondition::Fixed],
+                force_regime: ForceRegime::Auto,
+                rigid_zone: Default::default(),
+            }],
+            sections: vec![Section {
+                id: SectionId(0),
+                name: "spring".into(),
+                area: 1.0,
+                iy: 1.0,
+                iz: 1.0,
+                j: 1.0,
+                depth: 1.0,
+                width: 1.0,
+                as_y: 1e12,
+                as_z: 1e12,
+                panel_thickness: None,
+                thickness: None,
+                shape: None,
             }],
             materials: vec![Material {
                 id: MaterialId(0),
@@ -1692,6 +1856,7 @@ mod tests {
                 as_z: 1e12,
                 panel_thickness: None,
                 thickness: None,
+                shape: None,
             }],
             materials: vec![Material {
                 id: MaterialId(0),
@@ -1799,6 +1964,7 @@ mod tests {
                 as_z: 1e12,
                 panel_thickness: None,
                 thickness: None,
+                shape: None,
             }],
             materials: vec![Material {
                 id: MaterialId(0),
@@ -2248,6 +2414,71 @@ mod tests {
         assert_eq!(result_hht.time.len(), n_steps + 1);
     }
 
+    /// Y 方向のみの加振（accel_x 全ゼロ、accel_y 正弦波）で記録方向が自動的に
+    /// Y へ切り替わり（`record_dir_y == true`）、代表応答（`node_disp`）が
+    /// 非ゼロになることを検証する。Y 方向にのみ自由度を持つ SDOF モデル
+    /// （`sdof_model_y`）を使用。
+    #[test]
+    fn test_y_direction_wave_selects_y_record_dir() {
+        let model = sdof_model_y();
+        let dofmap = DofMap::build(&model);
+        let reducer = Reducer::build(&model, &dofmap);
+
+        let omega = (1000.0_f64 / 1.0).sqrt();
+        let damping = Damping::StiffnessProportional {
+            h: 0.02,
+            omega,
+            basis: StiffnessKind::Initial,
+        };
+
+        let dt = 0.001;
+        let n_steps = 500; // 0.5s
+        let accel_y: Vec<f64> = (0..n_steps)
+            .map(|i| {
+                let t = i as f64 * dt;
+                500.0 * (2.0 * std::f64::consts::PI * 2.0 * t).sin()
+            })
+            .collect();
+        let wave = GroundMotion {
+            dt,
+            accel_x: vec![0.0; n_steps],
+            accel_y: Some(accel_y),
+        };
+        let newmark = NewmarkCfg {
+            beta: 0.25,
+            gamma: 0.5,
+            dt,
+        };
+
+        let result = linear_time_history_analysis(
+            &model,
+            &dofmap,
+            &reducer,
+            &wave,
+            &newmark,
+            &damping,
+            &[0.0],
+            &[0.0],
+            false,
+        )
+        .expect("Y-direction time history should converge");
+
+        // accel_x が全ゼロ、accel_y が非ゼロなので記録方向は Y。
+        assert!(
+            result.history.record_dir_y,
+            "record_dir_y should be true when only accel_y is nonzero"
+        );
+        // 代表応答（Y 方向変位）が非ゼロ応答を持つ。
+        assert!(
+            result.history.node_disp.iter().any(|v| v.abs() > 1e-6),
+            "node_disp should show nonzero Y-direction response"
+        );
+        // X 方向は自由度自体が存在しないため応答なし。
+        assert_eq!(result.peak_disp[1][0], 0.0);
+        // Y 方向は実際に応答している。
+        assert!(result.peak_disp[1][1] > 0.0);
+    }
+
     // ===== 非線形時刻歴応答解析テスト =====
 
     use squid_n_core::ids::StoryId;
@@ -2297,6 +2528,7 @@ mod tests {
                 as_z: 0.0,
                 panel_thickness: None,
                 thickness: None,
+                shape: None,
             }],
             materials: vec![Material {
                 id: MaterialId(0),

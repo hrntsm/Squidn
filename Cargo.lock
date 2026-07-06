@@ -1320,6 +1320,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "75e75c7e982b943380665c5901fe0b69d5df2627644e0e50199c52b64d8d5a1c"
 dependencies = [
  "cubecl-core",
+ "cubecl-cuda",
  "cubecl-runtime",
  "cubecl-wgpu",
 ]
@@ -1332,6 +1333,7 @@ checksum = "51d402af454241d28d303a4cf4d2a861fae18404d65964c31934f746a40a6cf4"
 dependencies = [
  "derive-new",
  "embassy-futures",
+ "futures-lite",
  "getrandom 0.2.17",
  "log",
  "portable-atomic",
@@ -1360,6 +1362,38 @@ dependencies = [
 ]
 
 [[package]]
+name = "cubecl-cpp"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4ded461feb0ff342a4f675131dc0ae8ad94e58f66bad11e57f852cb7f190a731"
+dependencies = [
+ "bytemuck",
+ "cubecl-common",
+ "cubecl-core",
+ "cubecl-runtime",
+ "derive-new",
+ "half",
+ "log",
+]
+
+[[package]]
+name = "cubecl-cuda"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "88dfdfe616124d2abe5e82052ff56f86843c369440e181d6936f7409e161dd82"
+dependencies = [
+ "bytemuck",
+ "cubecl-common",
+ "cubecl-core",
+ "cubecl-cpp",
+ "cubecl-runtime",
+ "cudarc",
+ "derive-new",
+ "half",
+ "log",
+]
+
+[[package]]
 name = "cubecl-macros"
 version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1381,6 +1415,7 @@ version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3468467f412dff4bbf97fb5061a3557445f017299e2fb73ef7b96c6cdb799bc3"
 dependencies = [
+ "async-channel",
  "async-lock",
  "cfg_aliases 0.2.1",
  "cubecl-common",
@@ -1413,6 +1448,15 @@ dependencies = [
  "log",
  "web-time",
  "wgpu 22.1.0",
+]
+
+[[package]]
+name = "cudarc"
+version = "0.12.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "38cd60a9a42ec83a2ed7effb0b1f073270264ea99da7acfc44f7e8d74dee0384"
+dependencies = [
+ "libloading",
 ]
 
 [[package]]
@@ -4475,6 +4519,7 @@ version = "0.8.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5ca0ecfa931c29007047d1bc58e623ab12e5590e8c7cc53200d5202b69266d8a"
 dependencies = [
+ "libc",
  "rand_chacha 0.3.1",
  "rand_core 0.6.4",
 ]
@@ -4514,6 +4559,9 @@ name = "rand_core"
 version = "0.6.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ec0be4795e2f6a28069bec0b5ff3e2ac9bafc99e6a9a7dc3547996c5c816922c"
+dependencies = [
+ "getrandom 0.2.17",
+]
 
 [[package]]
 name = "rand_core"
@@ -5283,6 +5331,7 @@ version = "0.0.1"
 dependencies = [
  "approx",
  "serde",
+ "serde_json",
  "smallvec",
  "thiserror 1.0.69",
 ]
@@ -5296,6 +5345,8 @@ dependencies = [
  "squid-n-core",
  "squid-n-element",
  "squid-n-load",
+ "squid-n-material",
+ "squid-n-skeleton",
  "squid-n-solver",
 ]
 
@@ -5332,6 +5383,7 @@ version = "0.0.1"
 dependencies = [
  "approx",
  "cubecl",
+ "cubecl-runtime",
  "faer",
  "squid-n-math",
  "wgpu 29.0.3",
@@ -5387,12 +5439,14 @@ dependencies = [
 name = "squid-n-mcp"
 version = "0.0.1"
 dependencies = [
+ "arrow",
  "rmcp",
- "schemars 0.8.22",
+ "schemars 1.2.1",
  "serde",
  "serde_json",
  "smallvec",
  "squid-n-core",
+ "squid-n-design-jp",
  "squid-n-edit",
  "squid-n-io",
  "squid-n-solver",

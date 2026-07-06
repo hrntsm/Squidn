@@ -311,4 +311,33 @@ mod tests {
         assert!(model.eq_ignoring_dofmap(&back));
         let _ = std::fs::remove_file(&path);
     }
+
+    /// UI設計 §4.2: Section は SectionShape の派生。`to_section` で生成した断面を
+    /// 持つモデルを保存→読込しても `shape` が失われず、Some のまま完全一致することを確認する。
+    #[test]
+    fn test_roundtrip_preserves_section_shape() {
+        use squid_n_core::section_shape::SectionShape;
+
+        let shape = SectionShape::SteelH {
+            height: 400.0,
+            width: 200.0,
+            web_thick: 9.0,
+            flange_thick: 12.0,
+        };
+        let section = shape.to_section(SectionId(0), "H-400x200x9x12".to_string());
+        assert!(section.shape.is_some());
+
+        let mut model = make_3node_model();
+        model.sections.push(section.clone());
+
+        let dir = std::env::temp_dir();
+        let path = dir.join("p_shape_roundtrip.scz");
+        save_scz(&path, &model).unwrap();
+        let back = load_scz(&path).unwrap();
+
+        assert_eq!(back.sections.len(), 1);
+        assert_eq!(back.sections[0].shape, Some(shape));
+        assert!(model.eq_ignoring_dofmap(&back));
+        let _ = std::fs::remove_file(&path);
+    }
 }

@@ -647,6 +647,7 @@ mod tests {
             as_z: 0.0,
             panel_thickness: None,
             thickness: None,
+            shape: None,
         }
     }
 

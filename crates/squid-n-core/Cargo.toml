@@ -10,4 +10,5 @@ smallvec  = { workspace = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]
-approx = { workspace = true }
+approx      = { workspace = true }
+serde_json  = { workspace = true }

@@ -5,6 +5,7 @@
 //! 出さない。利用側は [`CatalogShape`]（大分類）→ `family`（まとまり）→
 //! [`CatalogEntry`]（断面名）の3段階で選び、[`to_section`] で `Section` を生成する。
 
+use crate::shape::SectionShape;
 use squid_n_core::ids::SectionId;
 use squid_n_core::model::Section;
 use std::sync::OnceLock;
@@ -104,6 +105,10 @@ pub fn entries_in(shape: CatalogShape, family: &str) -> Vec<&'static CatalogEntr
 }
 
 /// カタログ断面から `Section` を生成する。
+///
+/// 断面諸元（area/iy/iz/j 等）は常にカタログの表値をそのまま用いる（再計算しない）。
+/// `shape` は幅厚比などの寸法参照用にベストエフォートで `entry.name` から復元するもので、
+/// 数値プロパティには一切影響しない（パースできない名前・フラットバーは `None`）。
 pub fn to_section(entry: &CatalogEntry, id: SectionId) -> Section {
     Section {
         id,
@@ -118,7 +123,68 @@ pub fn to_section(entry: &CatalogEntry, id: SectionId) -> Section {
         as_z: entry.as_z,
         panel_thickness: None,
         thickness: None,
+        shape: parse_shape_from_name(entry.shape, &entry.name),
     }
+}
+
+/// `entry.name` の寸法表記から `SectionShape` をベストエフォートで復元する。
+///
+/// 実データ（`data/japan_steel_sections.csv`）で確認した命名規則:
+/// - H形: `"H-{h}x{b}x{tw}x{tf}x{r}"`（例: `"H-400x200x9x12x13"`）。末尾のフィレット半径 r は無視。
+/// - 角形鋼管: `"Box-{h}x{w}x{t}"`（RHS/SHS 系, 例: `"Box-100x100x12"`）または
+///   `"Box-{h}x{w}x{t}x{r}"`（BCP/BCR/JIS_Rectangle/JIS_Square/STKR 系, 角R付き,
+///   例: `"Box-1000x1000x22x77"`）。末尾の角R があれば無視。
+/// - 丸鋼管: `"O-{outer_dia}x{t}"`（例: `"O-400x19"`）。
+/// - フラットバー（`"FL {t}x{b}"`）はパース対象外（対応する `SectionShape` が無い）。
+///
+/// 上記いずれの数値パースにも失敗した場合は `None`。
+fn parse_shape_from_name(shape: CatalogShape, name: &str) -> Option<SectionShape> {
+    match shape {
+        CatalogShape::H => {
+            let dims = parse_dims_after_prefix(name, "H-")?;
+            if dims.len() < 4 {
+                return None;
+            }
+            Some(SectionShape::SteelH {
+                height: dims[0],
+                width: dims[1],
+                web_thick: dims[2],
+                flange_thick: dims[3],
+            })
+        }
+        CatalogShape::Box => {
+            let dims = parse_dims_after_prefix(name, "Box-")?;
+            if dims.len() < 3 {
+                return None;
+            }
+            Some(SectionShape::SteelBox {
+                height: dims[0],
+                width: dims[1],
+                thick: dims[2],
+            })
+        }
+        CatalogShape::Pipe => {
+            let dims = parse_dims_after_prefix(name, "O-")?;
+            if dims.len() < 2 {
+                return None;
+            }
+            Some(SectionShape::SteelPipe {
+                outer_dia: dims[0],
+                thick: dims[1],
+            })
+        }
+        CatalogShape::Flat => None,
+    }
+}
+
+/// `prefix` を取り除いた残りを `'x'` 区切りで数値配列にパースする。
+/// プレフィックス自体に `'x'` を含む場合（例: `"Box-"`）があるため、必ず先に
+/// プレフィックスを剥がしてから分割する。
+fn parse_dims_after_prefix(name: &str, prefix: &str) -> Option<Vec<f64>> {
+    let rest = name.strip_prefix(prefix)?;
+    rest.split('x')
+        .map(|s| s.trim().parse::<f64>().ok())
+        .collect()
 }
 
 fn parse_csv() -> Vec<CatalogEntry> {
@@ -238,5 +304,82 @@ mod tests {
         assert_eq!(sec.name, e.name);
         assert_eq!(sec.area, e.area);
         assert_eq!(sec.depth, e.depth);
+    }
+
+    #[test]
+    fn test_to_section_shape_does_not_override_catalog_values() {
+        // shape を付与しても area 等はカタログ値のまま（再計算しない）ことを確認する。
+        let list = entries_in(CatalogShape::H, "H(const)");
+        let e = list
+            .iter()
+            .find(|e| e.name == "H-400x200x9x12x13")
+            .expect("section not found");
+        let sec = to_section(e, SectionId(0));
+        assert_eq!(sec.area, e.area);
+        assert_eq!(sec.iy, e.iy);
+        assert_eq!(sec.iz, e.iz);
+        assert_eq!(sec.j, e.j);
+        assert!(matches!(sec.shape, Some(SectionShape::SteelH { .. })));
+    }
+
+    #[test]
+    fn test_parse_shape_h_ignores_fillet_radius() {
+        // "H-400x200x9x12x13" の末尾 13 はフィレット半径 r であり SteelH には含めない。
+        let shape = parse_shape_from_name(CatalogShape::H, "H-400x200x9x12x13").unwrap();
+        assert_eq!(
+            shape,
+            SectionShape::SteelH {
+                height: 400.0,
+                width: 200.0,
+                web_thick: 9.0,
+                flange_thick: 12.0,
+            }
+        );
+    }
+
+    #[test]
+    fn test_parse_shape_box_without_corner_radius() {
+        // SHS/RHS 系は "Box-{h}x{w}x{t}" の3値のみ。
+        let shape = parse_shape_from_name(CatalogShape::Box, "Box-100x100x12").unwrap();
+        assert_eq!(
+            shape,
+            SectionShape::SteelBox {
+                height: 100.0,
+                width: 100.0,
+                thick: 12.0,
+            }
+        );
+    }
+
+    #[test]
+    fn test_parse_shape_box_ignores_corner_radius() {
+        // BCP/BCR/STKR/JIS_* 系は末尾に角R "Box-{h}x{w}x{t}x{r}" が付く。
+        let shape = parse_shape_from_name(CatalogShape::Box, "Box-1000x1000x22x77").unwrap();
+        assert_eq!(
+            shape,
+            SectionShape::SteelBox {
+                height: 1000.0,
+                width: 1000.0,
+                thick: 22.0,
+            }
+        );
+    }
+
+    #[test]
+    fn test_parse_shape_pipe() {
+        let shape = parse_shape_from_name(CatalogShape::Pipe, "O-400x19").unwrap();
+        assert_eq!(
+            shape,
+            SectionShape::SteelPipe {
+                outer_dia: 400.0,
+                thick: 19.0,
+            }
+        );
+    }
+
+    #[test]
+    fn test_parse_shape_flat_is_none() {
+        // フラットバーに対応する SectionShape 派生は無いため常に None。
+        assert_eq!(parse_shape_from_name(CatalogShape::Flat, "FL 12x100"), None);
     }
 }

@@ -202,6 +202,7 @@ mod tests {
                 as_z: 800.0,
                 panel_thickness: None,
                 thickness: None,
+                shape: None,
             }],
             materials: vec![Material {
                 id: MaterialId(0),
@@ -309,6 +310,7 @@ mod tests {
                 as_z: 800.0,
                 panel_thickness: None,
                 thickness: None,
+                shape: None,
             }],
             materials: vec![Material {
                 id: MaterialId(0),
@@ -447,6 +449,7 @@ mod tests {
                 as_z: 83.33,
                 panel_thickness: None,
                 thickness: None,
+                shape: None,
             }],
             materials: vec![Material {
                 id: MaterialId(0),
@@ -605,6 +608,7 @@ mod tests {
                 as_z: 83.33,
                 panel_thickness: None,
                 thickness: None,
+                shape: None,
             }],
             materials: vec![Material {
                 id: MaterialId(0),
@@ -696,6 +700,7 @@ mod tests {
                 as_z: 0.0,
                 panel_thickness: None,
                 thickness: Some(10.0),
+                shape: None,
             }],
             materials: vec![Material {
                 id: MaterialId(0),
@@ -911,6 +916,7 @@ mod tests {
                 as_z: 0.0,
                 panel_thickness: None,
                 thickness: Some(t),
+                shape: None,
             }],
             materials: vec![Material {
                 id: MaterialId(0),
@@ -998,6 +1004,7 @@ mod tests {
                 as_z: 0.0,
                 panel_thickness: None,
                 thickness: Some(10.0),
+                shape: None,
             }],
             materials: vec![Material {
                 id: MaterialId(0),
@@ -1102,6 +1109,7 @@ mod tests {
                 as_z: 0.0,
                 panel_thickness: None,
                 thickness: Some(10.0),
+                shape: None,
             }],
             materials: vec![Material {
                 id: MaterialId(0),
@@ -1239,6 +1247,7 @@ mod tests {
                 as_z: 0.0,
                 panel_thickness: None,
                 thickness: Some(t),
+                shape: None,
             }],
             materials: vec![Material {
                 id: MaterialId(0),

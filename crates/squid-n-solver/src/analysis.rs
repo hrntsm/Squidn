@@ -230,6 +230,28 @@ impl<'m> Analysis<'m> {
         )
     }
 
+    /// 時刻歴応答解析（HHT-α 法、線形）。α=0 で Newmark-β（平均加速度法）に一致。
+    pub fn time_history_hht(
+        &self,
+        wave: &GroundMotion,
+        hht: crate::timehistory::HhtCfg,
+        damping: Damping,
+    ) -> Result<ResponseResult, squid_n_math::solver::SolveError> {
+        let n_indep = self.n_indep;
+        let init = vec![0.0; n_indep];
+        crate::timehistory::linear_hht_alpha_analysis(
+            self.model,
+            &self.dofmap,
+            &self.reducer,
+            wave,
+            &hht,
+            &damping,
+            &init,
+            &init,
+            false,
+        )
+    }
+
     /// Run seismic static analysis: approx or semi-precise Ai distribution.
     /// SemiPrecise uses eigen T, Approx uses approximate formula.
     ///
@@ -511,6 +533,7 @@ mod tests {
                 as_z: 83.33,
                 panel_thickness: None,
                 thickness: None,
+                shape: None,
             }],
             materials: vec![Material {
                 id: MaterialId(0),

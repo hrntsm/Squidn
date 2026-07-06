@@ -201,6 +201,10 @@ pub struct Section {
     pub panel_thickness: Option<f64>,
     #[serde(default)]
     pub thickness: Option<f64>,
+    /// パラメトリック形状定義（UI設計 §4.2: Section は SectionShape の派生）。
+    /// 形状から生成されなかった断面（カタログ数値直入力・ST-Bridge 読込等）は None。
+    #[serde(default)]
+    pub shape: Option<crate::section_shape::SectionShape>,
 }
 
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -575,6 +579,7 @@ mod tests {
             as_z: 0.0,
             panel_thickness: None,
             thickness: None,
+            shape: None,
         };
         assert_eq!(sec.depth, 0.0);
         assert!(sec.panel_thickness.is_none());

@@ -5,7 +5,7 @@ use squid_n_design_jp::eccentricity::story_eccentricity;
 use squid_n_design_jp::holding_capacity::{eccentricity_ratio, fes, stiffness_ratios};
 use squid_n_solver::analysis::SeismicDir;
 
-use crate::app::{App, ResultsBundle};
+use crate::app::{App, ResultsBundle, StaticCaseKey};
 
 /// 層ごとの二次設計指標（層間変形角・剛性率・偏心率・Fes）。
 #[derive(Clone, Debug)]
@@ -157,13 +157,19 @@ pub fn build_report_csv(app: &App) -> String {
         }
     }
 
-    for (lc_id, st) in &results.statics {
-        let lc_name = model
-            .load_cases
-            .iter()
-            .find(|c| c.id == *lc_id)
-            .map(|c| c.name.clone())
-            .unwrap_or_else(|| format!("LC{}", lc_id.0));
+    for (key, st) in &results.statics {
+        // ユーザー荷重ケースは「LC {id} {名前}」、地震静的は方向名でラベル付けする
+        // （StaticCaseKey により両者は別キーで共存するため、ラベルも区別できる）。
+        let label = match key {
+            StaticCaseKey::User(lc_id) => model
+                .load_cases
+                .iter()
+                .find(|c| c.id == *lc_id)
+                .map(|c| format!("LC {} {}", lc_id.0, c.name))
+                .unwrap_or_else(|| format!("LC {}", lc_id.0)),
+            StaticCaseKey::Seismic(SeismicDir::X) => "地震静的 X".to_string(),
+            StaticCaseKey::Seismic(SeismicDir::Y) => "地震静的 Y".to_string(),
+        };
         let max_d = st
             .disp
             .iter()
@@ -171,7 +177,7 @@ pub fn build_report_csv(app: &App) -> String {
             .fold(0.0f64, |m, v| m.max(v.abs()));
         out.push_str(&format!(
             "\n[静的解析: {}]\n最大変位[mm],{:.4}\n",
-            lc_name, max_d
+            label, max_d
         ));
     }
 
@@ -238,7 +244,7 @@ pub fn build_report_csv(app: &App) -> String {
     if let Some(th) = &results.time_history {
         let peak = th
             .history
-            .node_disp_x
+            .node_disp
             .iter()
             .fold(0.0f64, |m, v| m.max(v.abs()));
         out.push_str(&format!(

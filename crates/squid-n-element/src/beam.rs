@@ -70,6 +70,7 @@ fn get_section(model: &Model, sid: Option<squid_n_core::ids::SectionId>) -> Sect
         as_z: 0.0,
         panel_thickness: None,
         thickness: None,
+        shape: None,
     })
 }
 
@@ -944,6 +945,7 @@ mod tests {
             as_z: 0.0,
             panel_thickness: None,
             thickness: None,
+            shape: None,
         };
         let beam_sec = Section {
             id: SectionId(1),
@@ -958,6 +960,7 @@ mod tests {
             as_z: 0.0,
             panel_thickness: None,
             thickness: None,
+            shape: None,
         };
         let mat = Material {
             id: MaterialId(0),
@@ -1051,6 +1054,7 @@ mod tests {
             as_z: 0.0,
             panel_thickness: None,
             thickness: None,
+            shape: None,
         };
         let mk_node = |id: u32, c: [f64; 3]| Node {
             id: NodeId(id),

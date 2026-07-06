@@ -11,6 +11,8 @@ pub mod eccentricity;
 pub mod holding_capacity;
 #[cfg(feature = "p7")]
 pub mod panel_shear;
+#[cfg(feature = "p7")]
+pub mod rc_capacity;
 
 pub use allowable_stress::*;
 

@@ -545,6 +545,7 @@ mod tests {
             as_z: 0.0,
             panel_thickness: None,
             thickness: None,
+            shape: None,
         };
         // 右側柱用 section（iz を上書き）
         let sec_right = Section {
@@ -568,6 +569,7 @@ mod tests {
             as_z: 0.0,
             panel_thickness: None,
             thickness: None,
+            shape: None,
         };
 
         // 材料（共通）

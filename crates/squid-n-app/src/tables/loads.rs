@@ -2,8 +2,8 @@ use crate::app::App;
 use squid_n_core::ids::{ElemId, LoadCaseId, NodeId};
 use squid_n_core::model::{ElementKind, MemberLoad, MemberLoadKind};
 use squid_n_edit::{
-    AddLoadCase, AddMemberLoad, DeleteLoadCase, DeleteMemberLoad, DeleteNodalLoad, SetLoadCaseName,
-    SetNodalLoad,
+    AddCombination, AddLoadCase, AddMemberLoad, DeleteCombination, DeleteLoadCase,
+    DeleteMemberLoad, DeleteNodalLoad, SetLoadCaseName, SetNodalLoad,
 };
 
 #[derive(Clone)]
@@ -35,6 +35,13 @@ impl Default for MemberLoadDraft {
 
 pub fn loads_table(ui: &mut egui::Ui, app: &mut App) {
     use egui_extras::{Column, TableBuilder};
+
+    // --- スラブ荷重（床荷重）への案内 ---
+    ui.label(format!(
+        "スラブ: {} 枚（モデルタブの「スラブ」で床荷重を追加できます。分配結果は結果タブ/モデルタブの3Dビューで表示モード「CMQ図」を選ぶと確認できます）",
+        app.model.slabs.len()
+    ));
+    ui.add_space(4.0);
 
     // --- 荷重ケース一覧（名称編集・追加・削除・編集対象の選択） ---
     ui.horizontal(|ui| {
@@ -144,13 +151,20 @@ pub fn loads_table(ui: &mut egui::Ui, app: &mut App) {
         if app.nav.focus_load_case == Some(lc_id) {
             app.nav.focus_load_case = None;
         }
-        if app.last_lc == Some(lc_id) {
-            app.last_lc = None;
+        if app.last_static
+            == Some(crate::app::StaticKey::Case(
+                crate::app::StaticCaseKey::User(lc_id),
+            ))
+        {
+            app.last_static = None;
         }
     }
     if had_name {
         app.staleness.mark_edited();
     }
+
+    ui.add_space(8.0);
+    combinations_section(ui, app);
 
     ui.add_space(8.0);
 
@@ -166,8 +180,15 @@ pub fn loads_table(ui: &mut egui::Ui, app: &mut App) {
         .focus_load_case
         .and_then(|id| app.model.load_cases.iter().position(|lc| lc.id == id))
         .or_else(|| {
-            app.last_lc
-                .and_then(|id| app.model.load_cases.iter().position(|lc| lc.id == id))
+            app.last_static.and_then(|key| match key {
+                // 地震静的(Seismic)はユーザー荷重ケースに対応しないため None
+                // （呼び出し元のフォールバックで先頭ケースが選ばれる）。
+                crate::app::StaticKey::Case(crate::app::StaticCaseKey::User(id)) => {
+                    app.model.load_cases.iter().position(|lc| lc.id == id)
+                }
+                crate::app::StaticKey::Case(crate::app::StaticCaseKey::Seismic(_))
+                | crate::app::StaticKey::Combo(_) => None,
+            })
         })
         .unwrap_or(0);
     let lc_id = app.model.load_cases[lc_idx].id;
@@ -488,5 +509,168 @@ pub fn loads_table(ui: &mut egui::Ui, app: &mut App) {
         app.undo
             .run(&mut app.model, Box::new(AddMemberLoad { lc: lc_id, load }));
         app.staleness.mark_edited();
+    }
+}
+
+/// 荷重ケース名を引く（見つからなければ空文字）。
+fn load_case_name(model: &squid_n_core::model::Model, id: LoadCaseId) -> String {
+    model
+        .load_cases
+        .iter()
+        .find(|lc| lc.id == id)
+        .map(|lc| lc.name.clone())
+        .unwrap_or_default()
+}
+
+/// 荷重ケース選択 ComboBox。`allow_none` の場合のみ「（なし）」を選択できる。
+fn combo_case_selector(
+    ui: &mut egui::Ui,
+    id_salt: &str,
+    label: &str,
+    model: &squid_n_core::model::Model,
+    selected: &mut Option<LoadCaseId>,
+    allow_none: bool,
+) {
+    ui.horizontal(|ui| {
+        ui.label(label);
+        let text = selected
+            .and_then(|id| model.load_cases.iter().find(|lc| lc.id == id))
+            .map(|lc| format!("[{}] {}", lc.id.0, lc.name))
+            .unwrap_or_else(|| "（なし）".to_string());
+        egui::ComboBox::from_id_salt(id_salt)
+            .selected_text(text)
+            .show_ui(ui, |ui| {
+                if allow_none
+                    && ui
+                        .selectable_label(selected.is_none(), "（なし）")
+                        .clicked()
+                {
+                    *selected = None;
+                }
+                for lc in &model.load_cases {
+                    if ui
+                        .selectable_label(
+                            *selected == Some(lc.id),
+                            format!("[{}] {}", lc.id.0, lc.name),
+                        )
+                        .clicked()
+                    {
+                        *selected = Some(lc.id);
+                    }
+                }
+            });
+    });
+}
+
+/// 荷重組合せセクション：既存組合せの一覧・削除と、標準組合せの自動生成 UI。
+fn combinations_section(ui: &mut egui::Ui, app: &mut App) {
+    ui.strong("荷重組合せ");
+
+    if app.model.load_cases.is_empty() {
+        ui.label("荷重ケースがありません。組合せを作成するにはまず荷重ケースを追加してください。");
+        return;
+    }
+
+    // --- 既存組合せの一覧（内訳表示・削除） ---
+    let mut pending_delete: Option<usize> = None;
+    if app.model.combinations.is_empty() {
+        ui.label("組合せがありません。下の「自動生成」で作成できます。");
+    } else {
+        for (i, combo) in app.model.combinations.iter().enumerate() {
+            ui.horizontal(|ui| {
+                let terms_str = combo
+                    .terms
+                    .iter()
+                    .map(|(id, factor)| {
+                        format!(
+                            "{:.2}×[{}]{}",
+                            factor,
+                            id.0,
+                            load_case_name(&app.model, *id)
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" + ");
+                ui.label(format!("{}: {}", combo.name, terms_str));
+                if ui
+                    .button("🗑")
+                    .on_hover_text("この荷重組合せを削除")
+                    .clicked()
+                {
+                    pending_delete = Some(i);
+                }
+            });
+        }
+    }
+    if let Some(idx) = pending_delete {
+        app.undo
+            .run(&mut app.model, Box::new(DeleteCombination { index: idx }));
+        app.staleness.mark_edited();
+    }
+
+    // --- 自動生成 ---
+    ui.add_space(4.0);
+    ui.strong("自動生成");
+    combo_case_selector(
+        ui,
+        "combo_draft_dl",
+        "DL用:",
+        &app.model,
+        &mut app.combo_draft.dl,
+        false,
+    );
+    combo_case_selector(
+        ui,
+        "combo_draft_ll",
+        "LL用:",
+        &app.model,
+        &mut app.combo_draft.ll,
+        false,
+    );
+    combo_case_selector(
+        ui,
+        "combo_draft_seismic_x",
+        "地震X用:",
+        &app.model,
+        &mut app.combo_draft.seismic_x,
+        true,
+    );
+    combo_case_selector(
+        ui,
+        "combo_draft_seismic_y",
+        "地震Y用:",
+        &app.model,
+        &mut app.combo_draft.seismic_y,
+        true,
+    );
+    combo_case_selector(
+        ui,
+        "combo_draft_snow",
+        "積雪用:",
+        &app.model,
+        &mut app.combo_draft.snow,
+        true,
+    );
+
+    let can_generate = app.combo_draft.dl.is_some() && app.combo_draft.ll.is_some();
+    if ui
+        .add_enabled(can_generate, egui::Button::new("⚙ 標準組合せを生成"))
+        .on_hover_text("DL/LL（必須）と地震X/Y・積雪（任意）から長期・短期の標準組合せを生成します")
+        .clicked()
+    {
+        if let (Some(dl), Some(ll)) = (app.combo_draft.dl, app.combo_draft.ll) {
+            let combos = squid_n_load::combo::auto_combinations(
+                dl,
+                ll,
+                app.combo_draft.seismic_x,
+                app.combo_draft.seismic_y,
+                app.combo_draft.snow,
+            );
+            for combo in combos {
+                app.undo
+                    .run(&mut app.model, Box::new(AddCombination { combo }));
+            }
+            app.staleness.mark_edited();
+        }
     }
 }

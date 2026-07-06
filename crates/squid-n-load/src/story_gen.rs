@@ -249,6 +249,7 @@ mod tests {
             as_z: 8000.0,
             panel_thickness: None,
             thickness: None,
+            shape: None,
         });
         model.materials.push(Material {
             id: MaterialId(0),

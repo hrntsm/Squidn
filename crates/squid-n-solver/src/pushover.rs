@@ -136,6 +136,74 @@ fn compute_base_shear(model: &Model, dofmap: &DofMap, f_int: &[f64], dir: Seismi
     v
 }
 
+/// 層せん断力を内力の釣合いから求める（P5 §7.4、P7 の Qu 突合に使用）。
+///
+/// 第 i 層のせん断力 Q_i = 第 i 層以上の階に属する節点へ作用する
+/// 載荷方向水平内力の合計（上層から累積）。階に属さない中間節点は
+/// 集計対象外（階の自動生成はレベル単位で節点をクラスタリングするため、
+/// 通常のフレームでは全自由節点がいずれかの階に属する）。
+/// stories が空なら空ベクトルを返す。
+fn compute_story_shear(model: &Model, dofmap: &DofMap, f_int: &[f64], dir: SeismicDir) -> Vec<f64> {
+    let dir_idx = match dir {
+        SeismicDir::X => 0,
+        SeismicDir::Y => 1,
+    };
+    let n = model.stories.len();
+    let mut level_force = vec![0.0; n];
+    for (i, story) in model.stories.iter().enumerate() {
+        for nid in &story.node_ids {
+            let g = nid.index() * 6 + dir_idx;
+            if let Some(a) = dofmap.active(g) {
+                if let Some(&v) = f_int.get(a as usize) {
+                    level_force[i] += v;
+                }
+            }
+        }
+    }
+    let mut shear = vec![0.0; n];
+    let mut acc = 0.0;
+    for i in (0..n).rev() {
+        acc += level_force[i];
+        shear[i] = acc;
+    }
+    shear
+}
+
+/// 層間変位を剛床マスター節点の水平変位差から求める。
+/// 第 i 層の層間変位 = マスター変位(第 i 層) − マスター変位(1 つ下の階)。
+/// 最下層は基部（変位 0）との差。マスターが無い／拘束済みの階は変位 0 とみなす。
+fn compute_story_drift(
+    model: &Model,
+    dofmap: &DofMap,
+    total_disp: &[f64],
+    dir: SeismicDir,
+) -> Vec<f64> {
+    let dir_idx = match dir {
+        SeismicDir::X => 0,
+        SeismicDir::Y => 1,
+    };
+    let mut prev = 0.0;
+    model
+        .stories
+        .iter()
+        .map(|story| {
+            let d = story
+                .diaphragms
+                .first()
+                .and_then(|dia| {
+                    let g = dia.master.index() * 6 + dir_idx;
+                    dofmap
+                        .active(g)
+                        .and_then(|a| total_disp.get(a as usize).copied())
+                })
+                .unwrap_or(0.0);
+            let drift = d - prev;
+            prev = d;
+            drift
+        })
+        .collect()
+}
+
 fn get_roof_disp(total_disp: &[f64], model: &Model, dofmap: &DofMap, dir: SeismicDir) -> f64 {
     if let Some(story) = model.stories.last() {
         if let Some(dia) = story.diaphragms.first() {
@@ -223,6 +291,7 @@ pub fn pushover_analysis(
     let thresholds = compute_hinge_thresholds(model);
     let mut hinges = Vec::new();
     let mut capacity_curve = Vec::new();
+    let mut steps: Vec<PushoverStep> = Vec::new();
     let mut total_disp = vec![0.0; n_active];
     let n_steps = max_steps.clamp(1, 100);
     let dlambda = 1.0 / n_steps as f64;
@@ -292,12 +361,21 @@ pub fn pushover_analysis(
                 // 変位制御フェーズと統一し反力ベースで求める）。
                 let f_int_now = compute_f_int(model, dofmap, &behaviors);
                 let base_shear = compute_base_shear(model, dofmap, &f_int_now, dir);
+                let story_drift = compute_story_drift(model, dofmap, &total_disp, dir);
                 capacity_curve.push(CapacityPoint {
                     step: step as u32,
                     roof_disp: roof,
                     base_shear,
-                    story_shear: vec![],
-                    story_drift: vec![],
+                    story_shear: compute_story_shear(model, dofmap, &f_int_now, dir),
+                    story_drift: story_drift.clone(),
+                });
+                steps.push(PushoverStep {
+                    // 荷重制御フェーズ: 参照外力ベクトル q に対する倍率 current_lambda を
+                    // そのまま荷重係数として記録する。
+                    load_factor: current_lambda,
+                    top_disp: roof,
+                    base_shear,
+                    story_drifts: story_drift,
                 });
                 track_hinges(
                     model,
@@ -403,13 +481,23 @@ pub fn pushover_analysis(
                         let roof = get_roof_disp(&total_disp, model, dofmap, dir);
                         let f_int_now = compute_f_int(model, dofmap, &behaviors);
                         let base_shear = compute_base_shear(model, dofmap, &f_int_now, dir);
+                        let story_drift = compute_story_drift(model, dofmap, &total_disp, dir);
                         let cstep = (n_steps + 1 + step) as u32;
                         capacity_curve.push(CapacityPoint {
                             step: cstep,
                             roof_disp: roof,
                             base_shear,
-                            story_shear: vec![],
-                            story_drift: vec![],
+                            story_shear: compute_story_shear(model, dofmap, &f_int_now, dir),
+                            story_drift: story_drift.clone(),
+                        });
+                        steps.push(PushoverStep {
+                            // 変位制御フェーズ: 荷重制御フェーズで λ=1 まで到達した後の継続で、
+                            // 目標頂部変位をペナルティ法で強制するため比例載荷の λ という概念が
+                            // 存在しない。荷重制御完了時点の値(1.0)をそのまま保持して記録する。
+                            load_factor: 1.0,
+                            top_disp: roof,
+                            base_shear,
+                            story_drifts: story_drift,
                         });
                         track_hinges(model, dofmap, &behaviors, &thresholds, cstep, &mut hinges);
                         step_ok = true;
@@ -489,12 +577,20 @@ pub fn pushover_analysis(
                     let roof = get_roof_disp(&total_disp, model, dofmap, dir);
                     let f_int_now = compute_f_int(model, dofmap, &behaviors);
                     let base_shear = compute_base_shear(model, dofmap, &f_int_now, dir);
+                    let story_drift = compute_story_drift(model, dofmap, &total_disp, dir);
                     capacity_curve.push(CapacityPoint {
                         step: (n_steps + 1 + _step) as u32,
                         roof_disp: roof,
                         base_shear,
-                        story_shear: vec![],
-                        story_drift: vec![],
+                        story_shear: compute_story_shear(model, dofmap, &f_int_now, dir),
+                        story_drift: story_drift.clone(),
+                    });
+                    steps.push(PushoverStep {
+                        // 弧長法: 各増分後に更新される荷重倍率 arc_lambda をそのまま記録する。
+                        load_factor: arc_lambda,
+                        top_disp: roof,
+                        base_shear,
+                        story_drifts: story_drift,
                     });
                 }
                 _ => {
@@ -513,7 +609,7 @@ pub fn pushover_analysis(
         .map(|c| c.base_shear)
         .fold(0.0_f64, f64::max);
     Ok(PushoverResult {
-        steps: vec![],
+        steps,
         capacity_curve,
         hinges,
         mechanism,
@@ -776,6 +872,7 @@ mod tests {
                 as_z: 0.0,
                 panel_thickness: None,
                 thickness: None,
+                shape: None,
             }],
             materials: vec![Material {
                 id: MaterialId(0),
@@ -842,6 +939,21 @@ mod tests {
             !result.hinges.is_empty(),
             "at least one hinge should form in the column under lateral push"
         );
+
+        // steps は capacity_curve と同じ収束ステップ数だけ積まれること。
+        assert_eq!(
+            result.steps.len(),
+            result.capacity_curve.len(),
+            "steps should have one entry per capacity_curve point"
+        );
+        // 各 step の story_drifts は層数（本モデルは1層）と一致すること。
+        for s in &result.steps {
+            assert_eq!(
+                s.story_drifts.len(),
+                model.stories.len(),
+                "story_drifts length should match number of stories"
+            );
+        }
     }
 
     #[test]
@@ -906,6 +1018,7 @@ mod tests {
             as_z: 0.0,
             panel_thickness: None,
             thickness: None,
+            shape: None,
         };
         let mat = Material {
             id: MaterialId(0),
@@ -1129,6 +1242,7 @@ mod tests {
                 as_z: 0.0,
                 panel_thickness: None,
                 thickness: None,
+                shape: None,
             }],
             materials: vec![Material {
                 id: MaterialId(0),
@@ -1310,6 +1424,7 @@ mod tests {
                 as_z: 0.0,
                 panel_thickness: None,
                 thickness: None,
+                shape: None,
             }],
             materials: vec![Material {
                 id: MaterialId(0),

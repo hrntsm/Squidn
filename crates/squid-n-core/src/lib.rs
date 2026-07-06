@@ -2,6 +2,7 @@ pub mod dof;
 pub mod error;
 pub mod ids;
 pub mod model;
+pub mod section_shape;
 pub mod units;
 
 pub use dof::*;
