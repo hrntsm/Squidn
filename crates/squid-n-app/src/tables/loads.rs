@@ -213,6 +213,14 @@ pub fn loads_table(ui: &mut egui::Ui, app: &mut App) {
     combinations_section(ui, app);
 
     ui.add_space(8.0);
+    egui::CollapsingHeader::new("荷重計算条件")
+        .id_salt("load_cfg_section")
+        .default_open(false)
+        .show(ui, |ui| {
+            crate::tables::load_cfg::load_cfg_panel(ui, app);
+        });
+
+    ui.add_space(8.0);
 
     // --- 節点荷重詳細（選択中の荷重ケース） ---
     ui.strong("節点荷重");
@@ -227,12 +235,13 @@ pub fn loads_table(ui: &mut egui::Ui, app: &mut App) {
         .and_then(|id| app.model.load_cases.iter().position(|lc| lc.id == id))
         .or_else(|| {
             app.last_static.and_then(|key| match key {
-                // 地震静的(Seismic)はユーザー荷重ケースに対応しないため None
-                // （呼び出し元のフォールバックで先頭ケースが選ばれる）。
+                // 地震静的(Seismic)・風静的(Wind)はユーザー荷重ケースに対応しないため
+                // None（呼び出し元のフォールバックで先頭ケースが選ばれる）。
                 crate::app::StaticKey::Case(crate::app::StaticCaseKey::User(id)) => {
                     app.model.load_cases.iter().position(|lc| lc.id == id)
                 }
                 crate::app::StaticKey::Case(crate::app::StaticCaseKey::Seismic(_))
+                | crate::app::StaticKey::Case(crate::app::StaticCaseKey::Wind(_))
                 | crate::app::StaticKey::Combo(_) => None,
             })
         })
@@ -698,25 +707,49 @@ fn combinations_section(ui: &mut egui::Ui, app: &mut App) {
         true,
     );
 
+    ui.checkbox(&mut app.analysis_cfg.heavy_snow_zone, "多雪区域")
+        .on_hover_text("有効にすると長期 G+P+0.7S、短期地震/暴風 G+P+0.35S±K/W の組合せも生成します（施行令86条・82条）");
+
     let can_generate = app.combo_draft.dl.is_some() && app.combo_draft.ll.is_some();
-    if ui
-        .add_enabled(can_generate, egui::Button::new("⚙ 標準組合せを生成"))
-        .on_hover_text("DL/LL（必須）と地震X/Y・積雪（任意）から長期・短期の標準組合せを生成します")
-        .clicked()
-    {
-        if let (Some(dl), Some(ll)) = (app.combo_draft.dl, app.combo_draft.ll) {
-            let combos = squid_n_load::combo::auto_combinations(
-                dl,
-                ll,
-                app.combo_draft.seismic_x,
-                app.combo_draft.seismic_y,
-                app.combo_draft.snow,
-            );
-            for combo in combos {
-                app.undo
-                    .run(&mut app.model, Box::new(AddCombination { combo }));
+    ui.horizontal(|ui| {
+        if ui
+            .add_enabled(can_generate, egui::Button::new("⚙ 標準組合せを生成"))
+            .on_hover_text(
+                "DL/LL（必須）と地震X/Y・積雪（任意）から長期・短期の標準組合せを生成します",
+            )
+            .clicked()
+        {
+            if let (Some(dl), Some(ll)) = (app.combo_draft.dl, app.combo_draft.ll) {
+                let input = squid_n_load::combo::ComboInput {
+                    dl,
+                    ll,
+                    seismic_x: app.combo_draft.seismic_x,
+                    seismic_y: app.combo_draft.seismic_y,
+                    wind_x: None,
+                    wind_y: None,
+                    snow: app.combo_draft.snow,
+                    heavy_snow_zone: app.analysis_cfg.heavy_snow_zone,
+                };
+                let combos = squid_n_load::combo::standard_combinations(&input);
+                for combo in combos {
+                    app.undo
+                        .run(&mut app.model, Box::new(AddCombination { combo }));
+                }
+                app.staleness.mark_edited();
             }
-            app.staleness.mark_edited();
         }
+        if ui
+            .button("⚙ 種別から自動生成")
+            .on_hover_text(
+                "荷重ケースの種別から固定(必須)・積載(必須)・積雪・風を各先頭1件選んで標準組合せを生成します。\
+                 種別が特定できない場合はエラーになります",
+            )
+            .clicked()
+        {
+            app.auto_generate_combinations_action();
+        }
+    });
+    if let Some(err) = &app.last_error {
+        ui.colored_label(crate::theme::ERROR_RED, err);
     }
 }

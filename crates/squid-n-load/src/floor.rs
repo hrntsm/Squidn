@@ -1729,7 +1729,9 @@ mod tests {
         for l in &loads {
             match l.target {
                 LoadTarget::Edge(e) => assert!(e == 0 || e == 1 || e == 3),
-                LoadTarget::Node(_) => panic!("edge-supported cantilever should not emit node targets"),
+                LoadTarget::Node(_) => {
+                    panic!("edge-supported cantilever should not emit node targets")
+                }
             }
         }
     }
@@ -1773,6 +1775,8 @@ mod tests {
             expected_total
         );
         // フォールバックにより4辺全てに荷重が付き得る(少なくとも1辺は非ゼロ)。
-        assert!(loads.iter().all(|l| matches!(l.target, LoadTarget::Edge(_))));
+        assert!(loads
+            .iter()
+            .all(|l| matches!(l.target, LoadTarget::Edge(_))));
     }
 }

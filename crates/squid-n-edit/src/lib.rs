@@ -1640,6 +1640,268 @@ impl EditCommand for RestoreLoadCaseContent {
     }
 }
 
+/// 荷重計算条件（`LoadCfg`）を全置換する。`None` は「既定値扱い」を意味する
+/// （`Model.load_cfg` の規約どおり）。逆操作は置換前の値への復元。
+pub struct SetLoadCfg {
+    pub cfg: Option<squid_n_core::model::LoadCfg>,
+}
+
+impl EditCommand for SetLoadCfg {
+    fn apply(&self, model: &mut Model) -> Box<dyn EditCommand> {
+        let old = std::mem::replace(&mut model.load_cfg, self.cfg.clone());
+        Box::new(SetLoadCfg { cfg: old })
+    }
+
+    fn label(&self) -> &str {
+        "荷重計算条件変更"
+    }
+}
+
+/// 壁要素（`ElementKind::Wall`/`Shell`）の自重算定属性（`WallAttr`）を
+/// 追加/更新する。`attr.elem` に一致する既存エントリがあれば置換し、
+/// 無ければ末尾に追加する。逆操作は変更前の状態への復元
+/// （既存エントリの置換なら変更前の `WallAttr` で [`SetWallAttr`] を再実行、
+/// 新規追加なら [`RemoveWallAttr`] で取り消す）。
+pub struct SetWallAttr {
+    pub attr: squid_n_core::model::WallAttr,
+}
+
+impl EditCommand for SetWallAttr {
+    fn apply(&self, model: &mut Model) -> Box<dyn EditCommand> {
+        if let Some(pos) = model
+            .wall_attrs
+            .iter()
+            .position(|a| a.elem == self.attr.elem)
+        {
+            let old = model.wall_attrs[pos].clone();
+            model.wall_attrs[pos] = self.attr.clone();
+            Box::new(SetWallAttr { attr: old })
+        } else {
+            model.wall_attrs.push(self.attr.clone());
+            Box::new(RemoveWallAttr {
+                elem: self.attr.elem,
+            })
+        }
+    }
+
+    fn label(&self) -> &str {
+        "壁属性変更"
+    }
+}
+
+/// 壁属性エントリを削除する（`elem` に一致するものを削除）。一致するエントリが
+/// 無ければ Noop。逆操作は削除前の値を復元する [`SetWallAttr`]
+/// （このエントリの `elem` は削除時点で存在しないため、`SetWallAttr` は
+/// 「既存エントリなし→末尾追加」の枝を通り、元の位置には戻らないが、
+/// `wall_attrs` は `ElemId` をキーとする集合的なデータであり配列順に意味は
+/// 無いため問題ない）。
+pub struct RemoveWallAttr {
+    pub elem: ElemId,
+}
+
+impl EditCommand for RemoveWallAttr {
+    fn apply(&self, model: &mut Model) -> Box<dyn EditCommand> {
+        if let Some(pos) = model.wall_attrs.iter().position(|a| a.elem == self.elem) {
+            let old = model.wall_attrs.remove(pos);
+            Box::new(SetWallAttr { attr: old })
+        } else {
+            Box::new(Noop)
+        }
+    }
+
+    fn label(&self) -> &str {
+        "壁属性削除"
+    }
+}
+
+/// フレーム外雑壁（`MiscWall`）を追加。末尾に追加する。逆操作は末尾の雑壁削除。
+pub struct AddMiscWall {
+    pub wall: squid_n_core::model::MiscWall,
+}
+
+impl EditCommand for AddMiscWall {
+    fn apply(&self, model: &mut Model) -> Box<dyn EditCommand> {
+        model.misc_walls.push(self.wall.clone());
+        let index = model.misc_walls.len() - 1;
+        Box::new(DeleteMiscWall { index })
+    }
+
+    fn label(&self) -> &str {
+        "雑壁追加"
+    }
+}
+
+/// 雑壁を index 指定で削除。逆操作は [`InsertMiscWall`]（同じ位置への復元）。
+/// `MiscWall` は他データから参照されないため ID 再採番は不要。index が範囲外なら Noop。
+pub struct DeleteMiscWall {
+    pub index: usize,
+}
+
+impl EditCommand for DeleteMiscWall {
+    fn apply(&self, model: &mut Model) -> Box<dyn EditCommand> {
+        if self.index >= model.misc_walls.len() {
+            return Box::new(Noop);
+        }
+        let removed = model.misc_walls.remove(self.index);
+        Box::new(InsertMiscWall {
+            index: self.index,
+            wall: removed,
+        })
+    }
+
+    fn label(&self) -> &str {
+        "雑壁削除"
+    }
+}
+
+/// 指定インデックスへ雑壁を再挿入する（[`DeleteMiscWall`] の逆操作専用）。
+pub struct InsertMiscWall {
+    pub index: usize,
+    pub wall: squid_n_core::model::MiscWall,
+}
+
+impl EditCommand for InsertMiscWall {
+    fn apply(&self, model: &mut Model) -> Box<dyn EditCommand> {
+        if self.index > model.misc_walls.len() {
+            return Box::new(Noop);
+        }
+        model.misc_walls.insert(self.index, self.wall.clone());
+        Box::new(DeleteMiscWall { index: self.index })
+    }
+
+    fn label(&self) -> &str {
+        "雑壁削除の取り消し"
+    }
+}
+
+/// 雑壁の内容を index 指定で置換する（フィールド編集用）。逆操作は変更前の
+/// 内容への復元。index が範囲外なら Noop。
+pub struct SetMiscWall {
+    pub index: usize,
+    pub wall: squid_n_core::model::MiscWall,
+}
+
+impl EditCommand for SetMiscWall {
+    fn apply(&self, model: &mut Model) -> Box<dyn EditCommand> {
+        if self.index >= model.misc_walls.len() {
+            return Box::new(Noop);
+        }
+        let old = std::mem::replace(&mut model.misc_walls[self.index], self.wall.clone());
+        Box::new(SetMiscWall {
+            index: self.index,
+            wall: old,
+        })
+    }
+
+    fn label(&self) -> &str {
+        "雑壁変更"
+    }
+}
+
+/// 階の主要構造種別（`StoryStructure`）変更。逆操作は変更前の値への復元。
+/// 存在しない `StoryId` は Noop。
+pub struct SetStoryStructure {
+    pub story: StoryId,
+    pub structure: squid_n_core::model::StoryStructure,
+}
+
+impl EditCommand for SetStoryStructure {
+    fn apply(&self, model: &mut Model) -> Box<dyn EditCommand> {
+        let idx = self.story.index();
+        if idx >= model.stories.len() || model.stories[idx].id != self.story {
+            return Box::new(Noop);
+        }
+        let old = model.stories[idx].structure;
+        model.stories[idx].structure = self.structure;
+        Box::new(SetStoryStructure {
+            story: self.story,
+            structure: old,
+        })
+    }
+
+    fn label(&self) -> &str {
+        "階構造種別変更"
+    }
+}
+
+/// 階の種別（一般/PH/地下、`StoryLevelKind`）変更。逆操作は変更前の値への復元。
+/// 存在しない `StoryId` は Noop。
+pub struct SetStoryLevelKind {
+    pub story: StoryId,
+    pub level_kind: squid_n_core::model::StoryLevelKind,
+}
+
+impl EditCommand for SetStoryLevelKind {
+    fn apply(&self, model: &mut Model) -> Box<dyn EditCommand> {
+        let idx = self.story.index();
+        if idx >= model.stories.len() || model.stories[idx].id != self.story {
+            return Box::new(Noop);
+        }
+        let old = model.stories[idx].level_kind;
+        model.stories[idx].level_kind = self.level_kind;
+        Box::new(SetStoryLevelKind {
+            story: self.story,
+            level_kind: old,
+        })
+    }
+
+    fn label(&self) -> &str {
+        "階種別変更"
+    }
+}
+
+/// スラブ種別（`SlabKind`: 一般/片持ち/出隅）変更。逆操作は変更前の値への復元。
+/// 存在しない `SlabId` は Noop。
+pub struct SetSlabKind {
+    pub id: SlabId,
+    pub kind: squid_n_core::model::SlabKind,
+}
+
+impl EditCommand for SetSlabKind {
+    fn apply(&self, model: &mut Model) -> Box<dyn EditCommand> {
+        let idx = self.id.index();
+        if idx >= model.slabs.len() || model.slabs[idx].id != self.id {
+            return Box::new(Noop);
+        }
+        let old = model.slabs[idx].kind;
+        model.slabs[idx].kind = self.kind;
+        Box::new(SetSlabKind {
+            id: self.id,
+            kind: old,
+        })
+    }
+
+    fn label(&self) -> &str {
+        "スラブ種別変更"
+    }
+}
+
+/// スラブの一方向伝達方向（`one_way`）変更。逆操作は変更前の値への復元。
+/// 存在しない `SlabId` は Noop。
+pub struct SetSlabOneWay {
+    pub id: SlabId,
+    pub one_way: Option<squid_n_core::model::OneWayDir>,
+}
+
+impl EditCommand for SetSlabOneWay {
+    fn apply(&self, model: &mut Model) -> Box<dyn EditCommand> {
+        let idx = self.id.index();
+        if idx >= model.slabs.len() || model.slabs[idx].id != self.id {
+            return Box::new(Noop);
+        }
+        let old = model.slabs[idx].one_way;
+        model.slabs[idx].one_way = self.one_way;
+        Box::new(SetSlabOneWay {
+            id: self.id,
+            one_way: old,
+        })
+    }
+
+    fn label(&self) -> &str {
+        "スラブ伝達方向変更"
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2932,5 +3194,265 @@ mod tests {
         stack.undo(&mut model);
         stack.undo(&mut model);
         assert!(model.eq_ignoring_dofmap(&before));
+    }
+
+    #[test]
+    fn test_set_load_cfg_roundtrip() {
+        use squid_n_core::model::LoadCfg;
+        let mut model = empty_model();
+        assert!(model.load_cfg.is_none());
+        let mut stack = UndoStack::new();
+
+        let cfg = LoadCfg {
+            steel_weight_factor: 1.05,
+            ..Default::default()
+        };
+        stack.run(
+            &mut model,
+            Box::new(SetLoadCfg {
+                cfg: Some(cfg.clone()),
+            }),
+        );
+        assert_eq!(model.load_cfg, Some(cfg));
+
+        stack.undo(&mut model);
+        assert!(model.load_cfg.is_none());
+
+        stack.redo(&mut model);
+        assert_eq!(model.load_cfg.as_ref().unwrap().steel_weight_factor, 1.05);
+    }
+
+    #[test]
+    fn test_set_wall_attr_add_replace_and_remove_roundtrip() {
+        use squid_n_core::model::WallAttr;
+        let mut model = empty_model();
+        let mut stack = UndoStack::new();
+
+        let attr1 = WallAttr {
+            elem: ElemId(0),
+            opening_area: 100.0,
+            opening_weight: 50.0,
+            three_side_slit: false,
+        };
+        stack.run(
+            &mut model,
+            Box::new(SetWallAttr {
+                attr: attr1.clone(),
+            }),
+        );
+        assert_eq!(model.wall_attrs, vec![attr1.clone()]);
+
+        // 既存エントリを置換
+        let attr2 = WallAttr {
+            elem: ElemId(0),
+            opening_area: 200.0,
+            opening_weight: 80.0,
+            three_side_slit: true,
+        };
+        stack.run(
+            &mut model,
+            Box::new(SetWallAttr {
+                attr: attr2.clone(),
+            }),
+        );
+        assert_eq!(model.wall_attrs, vec![attr2.clone()]);
+
+        stack.undo(&mut model);
+        assert_eq!(model.wall_attrs, vec![attr1.clone()]);
+
+        // 削除
+        stack.run(&mut model, Box::new(RemoveWallAttr { elem: ElemId(0) }));
+        assert!(model.wall_attrs.is_empty());
+
+        stack.undo(&mut model);
+        assert_eq!(model.wall_attrs, vec![attr1]);
+    }
+
+    #[test]
+    fn test_remove_wall_attr_missing_is_noop() {
+        let mut model = empty_model();
+        let mut stack = UndoStack::new();
+        stack.run(&mut model, Box::new(RemoveWallAttr { elem: ElemId(0) }));
+        assert!(model.wall_attrs.is_empty());
+        assert!(stack.can_undo());
+        stack.undo(&mut model);
+        assert!(model.wall_attrs.is_empty());
+    }
+
+    fn sample_misc_wall(weight: f64) -> squid_n_core::model::MiscWall {
+        squid_n_core::model::MiscWall {
+            start: [0.0, 0.0, 0.0],
+            end: [3000.0, 0.0, 0.0],
+            height: 3000.0,
+            weight_per_area: weight,
+            transfer: Default::default(),
+        }
+    }
+
+    #[test]
+    fn test_add_delete_misc_wall_roundtrip() {
+        let mut model = empty_model();
+        let mut stack = UndoStack::new();
+
+        stack.run(
+            &mut model,
+            Box::new(AddMiscWall {
+                wall: sample_misc_wall(1.0),
+            }),
+        );
+        stack.run(
+            &mut model,
+            Box::new(AddMiscWall {
+                wall: sample_misc_wall(2.0),
+            }),
+        );
+        assert_eq!(model.misc_walls.len(), 2);
+
+        let before = model.clone();
+        stack.run(&mut model, Box::new(DeleteMiscWall { index: 0 }));
+        assert_eq!(model.misc_walls.len(), 1);
+        assert_eq!(model.misc_walls[0].weight_per_area, 2.0);
+
+        stack.undo(&mut model);
+        assert!(model.eq_ignoring_dofmap(&before));
+
+        stack.redo(&mut model);
+        assert_eq!(model.misc_walls.len(), 1);
+    }
+
+    #[test]
+    fn test_set_misc_wall_roundtrip() {
+        let mut model = empty_model();
+        model.misc_walls.push(sample_misc_wall(1.0));
+        let mut stack = UndoStack::new();
+
+        stack.run(
+            &mut model,
+            Box::new(SetMiscWall {
+                index: 0,
+                wall: sample_misc_wall(9.0),
+            }),
+        );
+        assert_eq!(model.misc_walls[0].weight_per_area, 9.0);
+
+        stack.undo(&mut model);
+        assert_eq!(model.misc_walls[0].weight_per_area, 1.0);
+    }
+
+    #[test]
+    fn test_set_misc_wall_out_of_range_is_noop() {
+        let mut model = empty_model();
+        let mut stack = UndoStack::new();
+        stack.run(
+            &mut model,
+            Box::new(SetMiscWall {
+                index: 0,
+                wall: sample_misc_wall(1.0),
+            }),
+        );
+        assert!(model.misc_walls.is_empty());
+    }
+
+    #[test]
+    fn test_set_story_structure_roundtrip() {
+        use squid_n_core::model::StoryStructure;
+        let mut model = empty_model();
+        model.stories.push(make_story(0, None));
+        assert_eq!(model.stories[0].structure, StoryStructure::Rc);
+        let mut stack = UndoStack::new();
+
+        stack.run(
+            &mut model,
+            Box::new(SetStoryStructure {
+                story: StoryId(0),
+                structure: StoryStructure::S,
+            }),
+        );
+        assert_eq!(model.stories[0].structure, StoryStructure::S);
+
+        stack.undo(&mut model);
+        assert_eq!(model.stories[0].structure, StoryStructure::Rc);
+
+        stack.redo(&mut model);
+        assert_eq!(model.stories[0].structure, StoryStructure::S);
+    }
+
+    #[test]
+    fn test_set_story_level_kind_roundtrip() {
+        use squid_n_core::model::StoryLevelKind;
+        let mut model = empty_model();
+        model.stories.push(make_story(0, None));
+        let mut stack = UndoStack::new();
+
+        stack.run(
+            &mut model,
+            Box::new(SetStoryLevelKind {
+                story: StoryId(0),
+                level_kind: StoryLevelKind::Penthouse { k: 0.5 },
+            }),
+        );
+        assert_eq!(
+            model.stories[0].level_kind,
+            StoryLevelKind::Penthouse { k: 0.5 }
+        );
+
+        stack.undo(&mut model);
+        assert_eq!(model.stories[0].level_kind, StoryLevelKind::Normal);
+    }
+
+    #[test]
+    fn test_set_story_structure_invalid_id_is_noop() {
+        use squid_n_core::model::StoryStructure;
+        let mut model = empty_model();
+        model.stories.push(make_story(0, None));
+        let mut stack = UndoStack::new();
+        stack.run(
+            &mut model,
+            Box::new(SetStoryStructure {
+                story: StoryId(99),
+                structure: StoryStructure::S,
+            }),
+        );
+        assert_eq!(model.stories[0].structure, StoryStructure::Rc);
+    }
+
+    #[test]
+    fn test_set_slab_kind_and_one_way_roundtrip() {
+        use squid_n_core::model::{DistributionMethod, OneWayDir, SlabKind};
+        let mut model = empty_model();
+        let mut stack = UndoStack::new();
+        stack.run(
+            &mut model,
+            Box::new(AddSlab {
+                boundary: vec![NodeId(0), NodeId(1), NodeId(2), NodeId(3)],
+                joists: vec![],
+                loads: vec![],
+                method: DistributionMethod::TriTrapezoid,
+            }),
+        );
+        assert_eq!(model.slabs[0].kind, SlabKind::Interior);
+        assert_eq!(model.slabs[0].one_way, None);
+
+        stack.run(
+            &mut model,
+            Box::new(SetSlabKind {
+                id: SlabId(0),
+                kind: SlabKind::Cantilever,
+            }),
+        );
+        assert_eq!(model.slabs[0].kind, SlabKind::Cantilever);
+        stack.undo(&mut model);
+        assert_eq!(model.slabs[0].kind, SlabKind::Interior);
+
+        stack.run(
+            &mut model,
+            Box::new(SetSlabOneWay {
+                id: SlabId(0),
+                one_way: Some(OneWayDir::X),
+            }),
+        );
+        assert_eq!(model.slabs[0].one_way, Some(OneWayDir::X));
+        stack.undo(&mut model);
+        assert_eq!(model.slabs[0].one_way, None);
     }
 }

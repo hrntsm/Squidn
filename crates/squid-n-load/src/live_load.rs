@@ -186,11 +186,7 @@ mod tests {
 
         // 低減率も対応して確認。
         assert_eq!(
-            column_live_load_reduction(floors_supported_by_column(
-                &model,
-                bottom,
-                &gen.node_story
-            )),
+            column_live_load_reduction(floors_supported_by_column(&model, bottom, &gen.node_story)),
             0.90
         );
         assert_eq!(

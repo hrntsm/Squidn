@@ -114,11 +114,7 @@ fn nearest_node(model: &Model, pt: [f64; 3]) -> Option<NodeId> {
     model
         .nodes
         .iter()
-        .min_by(|a, b| {
-            dist3(a.coord, pt)
-                .partial_cmp(&dist3(b.coord, pt))
-                .unwrap()
-        })
+        .min_by(|a, b| dist3(a.coord, pt).partial_cmp(&dist3(b.coord, pt)).unwrap())
         .map(|n| n.id)
 }
 

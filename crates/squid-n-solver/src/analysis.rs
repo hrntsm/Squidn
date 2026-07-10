@@ -680,8 +680,14 @@ impl<'m> Analysis<'m> {
             SeismicDir::Y => 0,
         };
         let excluded: HashSet<NodeId> = model.generated_masters.iter().copied().collect();
-        let (h_mm, wind_stories) =
-            wind_story_geometry(model, &normal_stories, base, axis, &excluded, cfg.parapet_mm)?;
+        let (h_mm, wind_stories) = wind_story_geometry(
+            model,
+            &normal_stories,
+            base,
+            axis,
+            &excluded,
+            cfg.parapet_mm,
+        )?;
 
         let wcfg = squid_n_load::wind::WindCfg {
             v0: cfg.v0,
