@@ -134,6 +134,13 @@ pub struct ResultsBundle {
     pub modal: Option<squid_n_solver::eigen::ModalResult>,
     pub member_forces: Vec<(ElemId, squid_n_element::beam::MemberForces)>,
     pub checks: Vec<(ElemId, f64, squid_n_design_jp::CheckResult)>,
+    /// 節点単位の検定結果（柱梁接合部・パネルゾーン・冷間成形耐力比など）。
+    /// ラベルは「接合部(RC)」等の種別表示用。
+    pub joint_checks: Vec<(
+        squid_n_core::ids::NodeId,
+        String,
+        squid_n_design_jp::CheckResult,
+    )>,
     pub pushover: Option<squid_n_solver::pushover::PushoverResult>,
     pub time_history: Option<squid_n_solver::timehistory::ResponseResult>,
 }
@@ -689,6 +696,13 @@ impl App {
                     self.results = Some(bundle);
                     self.last_static = Some(StaticKey::Combo(pos));
                     self.staleness.mark_fresh();
+                    // 荷重継続性区分（長期/短期）は組合せ内容から自動判定する
+                    // （マニュアル「荷重の組合せ」: G+P=長期、地震・積雪・風入り=短期）。
+                    self.design_term = if squid_n_load::combo::is_short_term_combo(&combo.name) {
+                        LoadTerm::Short
+                    } else {
+                        LoadTerm::Long
+                    };
                     self.run_design_check();
                 }
                 Err(e) => self.last_error = Some(format!("荷重組合せ解析エラー: {:?}", e)),
@@ -843,7 +857,9 @@ impl App {
                             continue;
                         };
                         // F 値は材料名の前方一致で引く(例 "SN400B"→235)。引けなければ 235。
-                        let f_value = steel_f_value_prefix(&mat.name).unwrap_or(235.0);
+                        // 板厚は形状の最大板厚（板厚 40mm 超は F 値低減の区分）。
+                        let f_value = steel_f_value_prefix(&mat.name, steel_max_thickness(shape))
+                            .unwrap_or(235.0);
                         s_member_rank_scaled(wt, f_value, &RankCriteria::default())
                     } else {
                         // RC 部材: RcRect のみ対応。RcCircle・形状未設定・
@@ -1454,18 +1470,22 @@ impl App {
     }
 
     /// T7: 解析結果の member_forces から検定結果を生成する。
-    /// 危険断面位置（§6.2.3、既定は柱フェイスと中央）の内力で検定する。
+    /// 危険断面位置（§6.2.3、既定は柱フェイスと中央）の内力に対し、
+    /// 材種・部材種別に応じた検定を適用する（RESP-D マニュアル 04 断面検定準拠）。
     /// 節点芯は剛域が有る場合は検定対象外（節点芯の応力をそのまま使わない、
-    /// 設計書 §6.2.3）。材種に応じて SteelDesign / RcDesign を適用する。
+    /// 設計書 §6.2.3）。
+    ///
+    /// - 部材種別は部材軸の鉛直成分から判定（柱/梁/ブレース）。
+    /// - せん断スパン比 M/(Q·d) 用の代表値は、マニュアルの規定
+    ///   「モーメントが最大となる検定位置の値を採用」に従い部材単位で求める。
+    /// - 柱は軸力＋二軸曲げ（n, my, mz）を検定に渡す。
+    /// - 検定器は形状優先（SRC/CFT）、それ以外は材料名で鋼/RC を選択する。
     pub fn run_design_check(&mut self) {
         // rigid_zone（face_i/j）から危険断面位置を決めるため、算定前に自動剛域を
         // 反映する（設計書 §6.2.1、冪等なので他の解析エントリと重複して呼んでも安全）。
         self.apply_rigid_zones_for_analysis();
         let Some(results) = &self.results else {
             return;
-        };
-        let ctx = DesignCtx {
-            term: self.design_term,
         };
         let mut checks: Vec<(ElemId, f64, squid_n_design_jp::CheckResult)> = Vec::new();
         for (elem_id, mf) in &results.member_forces {
@@ -1485,33 +1505,83 @@ impl App {
                 continue;
             };
 
-            let checker: Box<dyn DesignCheck> = if is_steel(&mat.name) {
-                Box::new(SteelDesign)
-            } else {
-                Box::new(RcDesign)
+            let kind = member_kind_of(elem, &self.model);
+            let length = elem_geometric_length(elem, &self.model);
+            // せん断スパン比 M/(Q·d) の代表値: |Mz| 最大の検定位置の (|M|, |Q|)。
+            let shear_span = mf
+                .at
+                .iter()
+                .map(|(_, f)| (f[5].abs(), f[1].abs()))
+                .max_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+            // 端部・中央の強軸曲げ（横座屈 C 係数・たわみ検定用）。
+            let m_at = |target: f64| {
+                mf.at
+                    .iter()
+                    .find(|(p, _)| (p - target).abs() < 1e-9)
+                    .map(|(_, f)| f[5])
+            };
+            let end_moments_z = match (m_at(0.0), m_at(1.0)) {
+                (Some(a), Some(b)) => Some((a, b)),
+                _ => None,
+            };
+            let ctx = DesignCtx {
+                term: self.design_term,
+                kind,
+                length,
+                lb: None,
+                lk: None,
+                shear_span,
+                rc_damage_control: true,
+                end_moments_z,
+                mid_moment_z: m_at(0.5),
             };
 
-            let geom_len = elem_geometric_length(elem, &self.model);
-            let positions = design_positions(elem, geom_len);
+            // 検定器の選択: 複合断面（SRC/CFT）は形状優先、それ以外は材料名で鋼/RC。
+            let checker: Box<dyn DesignCheck> = match sec.shape {
+                Some(squid_n_core::section_shape::SectionShape::SrcRect { .. }) => {
+                    Box::new(squid_n_design_jp::SrcDesign)
+                }
+                Some(squid_n_core::section_shape::SectionShape::CftBox { .. })
+                | Some(squid_n_core::section_shape::SectionShape::CftPipe { .. }) => {
+                    Box::new(squid_n_design_jp::CftDesign)
+                }
+                _ if is_steel(&mat.name) => Box::new(SteelDesign),
+                _ => Box::new(RcDesign),
+            };
+
+            let positions = design_positions(elem, length);
 
             for (pos, forces) in &mf.at {
                 if !is_near_design_position(*pos, &positions) {
                     continue;
                 }
-                // [N, Qy, Qz, Mx, My, Mz] -> MemberForcesAt
-                // 暫定: 強軸まわりとして Mz[5] と Qy[1] を使用
+                // [N, Qy, Qz, Mx, My, Mz] -> MemberForcesAt（N は引張正の部材内力）
                 let mfa = MemberForcesAt {
                     pos: *pos,
                     n: forces[0],
-                    q: forces[1],
-                    m: forces[5],
+                    qy: forces[1],
+                    qz: forces[2],
+                    my: forces[4],
+                    mz: forces[5],
                 };
                 let cr = checker.check(&mfa, sec, mat, &ctx);
                 checks.push((*elem_id, *pos, cr));
             }
         }
+        // 節点単位の検定（RC 柱梁接合部・S パネルゾーン・冷間成形耐力比・耐震壁）。
+        let mf_slices: Vec<(ElemId, squid_n_design_jp::joint_wiring::ForcesAt)> = results
+            .member_forces
+            .iter()
+            .map(|(id, mf)| (*id, mf.at.as_slice()))
+            .collect();
+        let joint_checks = squid_n_design_jp::joint_wiring::collect_joint_checks(
+            &self.model,
+            &mf_slices,
+            self.design_term,
+        );
         if let Some(bundle) = self.results.as_mut() {
             bundle.checks = checks;
+            bundle.joint_checks = joint_checks;
         }
     }
 
@@ -1855,7 +1925,8 @@ fn parse_wave_csv(content: &str, dir: ThDir) -> Result<(Vec<f64>, Option<Vec<f64
     }
 }
 
-/// 鋼材判定（Material.name に "S" で始まる JIS 鋼種名が含まれるか）。
+/// 鋼材判定（Material.name が JIS 鋼種名で始まるか）。
+/// 鉄筋（SD/SR）は RC 扱いのため含めない。
 fn is_steel(name: &str) -> bool {
     let upper = name.to_uppercase();
     upper.starts_with("SS")
@@ -1863,6 +1934,45 @@ fn is_steel(name: &str) -> bool {
         || upper.starts_with("SM")
         || upper.starts_with("STK")
         || upper.starts_with("ST")
+        || upper.starts_with("SA")
+        || upper.starts_with("BC")
+}
+
+/// 部材種別判定（部材軸の鉛直成分による幾何判定）。
+///
+/// - |ez| ≥ 0.8: 柱（軸力＋二軸曲げの複合検定）
+/// - |ez| ≤ 0.2: 梁（強軸曲げ＋せん断）
+/// - それ以外: ブレース（軸力検定）
+fn member_kind_of(
+    elem: &squid_n_core::model::ElementData,
+    model: &squid_n_core::model::Model,
+) -> squid_n_design_jp::MemberKind {
+    use squid_n_design_jp::MemberKind;
+    let coords: Vec<[f64; 3]> = elem
+        .nodes
+        .iter()
+        .filter_map(|nid| model.nodes.get(nid.index()))
+        .map(|n| n.coord)
+        .take(2)
+        .collect();
+    let (Some(p0), Some(p1)) = (coords.first(), coords.get(1)) else {
+        return MemberKind::Beam;
+    };
+    let dx = p1[0] - p0[0];
+    let dy = p1[1] - p0[1];
+    let dz = p1[2] - p0[2];
+    let len = (dx * dx + dy * dy + dz * dz).sqrt();
+    if len < 1e-9 {
+        return MemberKind::Beam;
+    }
+    let ez = (dz / len).abs();
+    if ez >= 0.8 {
+        squid_n_design_jp::MemberKind::Column
+    } else if ez <= 0.2 {
+        squid_n_design_jp::MemberKind::Beam
+    } else {
+        squid_n_design_jp::MemberKind::Brace
+    }
 }
 
 /// `SectionShape::RcRect` の配筋情報から RC 終局耐力算定（rank-auto）用の入力を組み立てる。
@@ -1952,14 +2062,52 @@ fn rc_sigma_0_from_gravity_or_last_static(
         .map(|(_, s)| s.member_forces.as_slice())
         .unwrap_or(fallback_member_forces);
 
+    // 軸力 N は引張正の部材内力（beam.rs recover_forces）。圧縮（N<0）のみ
+    // σ0 に反映し、引張は 0 とする（安全側）。
     member_forces
         .iter()
         .find(|(id, _)| *id == elem_id)
         .and_then(|(_, mf)| mf.at.first())
         .map(|(_, f)| f[0])
-        .filter(|n| *n > 0.0)
-        .map(|n| n / (b * d))
+        .filter(|n| *n < 0.0)
+        .map(|n| -n / (b * d))
         .unwrap_or(0.0)
+}
+
+/// 鋼断面形状の最大板厚 [mm]（F 値の板厚区分判定用）。
+/// 形状情報のない断面・RC 断面は 0（板厚 40mm 以下の区分扱い）。
+fn steel_max_thickness(shape: &squid_n_core::section_shape::SectionShape) -> f64 {
+    use squid_n_core::section_shape::SectionShape;
+    match *shape {
+        SectionShape::SteelH {
+            web_thick,
+            flange_thick,
+            ..
+        }
+        | SectionShape::SteelChannel {
+            web_thick,
+            flange_thick,
+            ..
+        }
+        | SectionShape::SteelTee {
+            web_thick,
+            flange_thick,
+            ..
+        } => web_thick.max(flange_thick),
+        SectionShape::SteelBox { thick, .. }
+        | SectionShape::SteelAngle { thick, .. }
+        | SectionShape::SteelPipe { thick, .. }
+        | SectionShape::CftBox { thick, .. }
+        | SectionShape::CftPipe { thick, .. } => thick,
+        SectionShape::SrcRect {
+            steel_web_thick,
+            steel_flange_thick,
+            ..
+        } => steel_web_thick.max(steel_flange_thick),
+        SectionShape::RcRect { .. }
+        | SectionShape::RcCircle { .. }
+        | SectionShape::RcWall { .. } => 0.0,
+    }
 }
 
 /// 部材両端節点間の幾何長 \[mm\]（内法補正なしの簡易値。剛域等は考慮しない）。
@@ -4459,6 +4607,7 @@ mod tests {
                 dia: 10.0,
                 pitch: 150.0,
                 legs: 2,
+                grade: None,
             },
         };
         // 材料名は "FC24"（is_steel が false になる、かつ fc 設定あり）を想定。
@@ -4558,6 +4707,7 @@ mod tests {
                 dia: 10.0,
                 pitch: 150.0,
                 legs: 2,
+                grade: None,
             },
         };
         let rc_shape = SectionShape::RcRect {
@@ -4775,6 +4925,7 @@ mod tests {
                 dia: 10.0,
                 pitch: 150.0,
                 legs: 2,
+                grade: None,
             },
         };
         let rc_shape = SectionShape::RcRect {
@@ -4850,8 +5001,13 @@ mod tests {
             .find(|(id, _)| *id == ElemId(0))
             .expect("elem 0 の内力があるはず");
         let n_raw = mf.at.first().expect("eval_sections[0] があるはず").1[0];
-        // 圧縮なので符号規約上「圧縮正」の n_raw は正で、大きさは P と厳密に一致する。
-        assert!((n_raw - p).abs() < 1e-6, "n_raw={} (expected {})", n_raw, p);
+        // 軸力は引張正の部材内力なので、圧縮 P に対して n_raw = -P となる。
+        assert!(
+            (n_raw + p).abs() < 1e-6,
+            "n_raw={} (expected {})",
+            n_raw,
+            -p
+        );
 
         let statics = &app.results.as_ref().unwrap().statics;
         let gravity_lc = app.model.load_cases.first().map(|c| c.id);
@@ -4911,6 +5067,7 @@ mod tests {
                 dia: 10.0,
                 pitch: 150.0,
                 legs: 2,
+                grade: None,
             },
         };
         let rc_shape = SectionShape::RcRect {

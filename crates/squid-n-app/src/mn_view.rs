@@ -352,7 +352,12 @@ fn section_depth(shape: &SectionShape) -> f64 {
         | SectionShape::SteelTee { height, .. } => height,
         SectionShape::SteelAngle { leg_a, .. } => leg_a,
         SectionShape::SteelPipe { outer_dia, .. } => outer_dia,
-        SectionShape::RcRect { d, .. } | SectionShape::RcCircle { d, .. } => d,
+        SectionShape::RcRect { d, .. }
+        | SectionShape::RcCircle { d, .. }
+        | SectionShape::SrcRect { d, .. } => d,
+        SectionShape::CftBox { height, .. } => height,
+        SectionShape::CftPipe { outer_dia, .. } => outer_dia,
+        SectionShape::RcWall { thickness, .. } => thickness,
     }
 }
 

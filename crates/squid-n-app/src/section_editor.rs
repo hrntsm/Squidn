@@ -536,6 +536,7 @@ fn build_rebar(d: &SectionEditorDraft) -> RcRebar {
             dia: d.shear_dia,
             pitch: d.shear_pitch,
             legs: d.shear_legs,
+            grade: None,
         },
     }
 }

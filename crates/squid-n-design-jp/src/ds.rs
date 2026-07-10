@@ -195,7 +195,21 @@ pub fn max_width_thickness(shape: &squid_n_core::section_shape::SectionShape) ->
             thick,
         } => ratio(leg_a.max(leg_b), thick),
         SectionShape::SteelPipe { .. } => None,
-        SectionShape::RcRect { .. } | SectionShape::RcCircle { .. } => None,
+        // CFT 角形: 鋼管部分の幅厚比（充填効果による緩和は未考慮＝安全側）。
+        SectionShape::CftBox {
+            height,
+            width,
+            thick,
+        } => {
+            let hi = ratio(height - 2.0 * thick, thick)?;
+            let wi = ratio(width - 2.0 * thick, thick)?;
+            Some(hi.max(wi))
+        }
+        SectionShape::CftPipe { .. } => None,
+        SectionShape::RcRect { .. }
+        | SectionShape::RcCircle { .. }
+        | SectionShape::SrcRect { .. }
+        | SectionShape::RcWall { .. } => None,
     }
 }
 
@@ -383,6 +397,7 @@ mod tests {
                 dia: 10.0,
                 pitch: 100.0,
                 legs: 2,
+                grade: None,
             },
         }
     }

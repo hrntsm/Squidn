@@ -1241,7 +1241,7 @@ fn compute_time_history_job(
     Ok(JobOutcome::TimeHistory { summary })
 }
 
-/// 鋼材判定（Material.name に "S" で始まる JIS 鋼種名が含まれるか）。
+/// 鋼材判定（Material.name が JIS 鋼種名で始まるか。鉄筋 SD/SR は RC 扱い）。
 /// squid-n-app の `is_steel`（app.rs）と同じロジック
 /// （squid-n-mcp は squid-n-app に依存しないため複製している）。
 fn is_steel(name: &str) -> bool {
@@ -1251,6 +1251,42 @@ fn is_steel(name: &str) -> bool {
         || upper.starts_with("SM")
         || upper.starts_with("STK")
         || upper.starts_with("ST")
+        || upper.starts_with("SA")
+        || upper.starts_with("BC")
+}
+
+/// 部材種別判定（部材軸の鉛直成分による幾何判定）。
+/// squid-n-app の `member_kind_of`（app.rs）と同じロジック。
+fn member_kind_of(
+    elem: &squid_n_core::model::ElementData,
+    model: &Model,
+) -> squid_n_design_jp::MemberKind {
+    use squid_n_design_jp::MemberKind;
+    let coords: Vec<[f64; 3]> = elem
+        .nodes
+        .iter()
+        .filter_map(|nid| model.nodes.get(nid.index()))
+        .map(|n| n.coord)
+        .take(2)
+        .collect();
+    let (Some(p0), Some(p1)) = (coords.first(), coords.get(1)) else {
+        return MemberKind::Beam;
+    };
+    let dx = p1[0] - p0[0];
+    let dy = p1[1] - p0[1];
+    let dz = p1[2] - p0[2];
+    let len = (dx * dx + dy * dy + dz * dz).sqrt();
+    if len < 1e-9 {
+        return MemberKind::Beam;
+    }
+    let ez = (dz / len).abs();
+    if ez >= 0.8 {
+        MemberKind::Column
+    } else if ez <= 0.2 {
+        MemberKind::Beam
+    } else {
+        MemberKind::Brace
+    }
 }
 
 /// 部材両端節点間の幾何長 \[mm\]（内法補正なしの簡易値。剛域等は考慮しない）。
@@ -1317,9 +1353,6 @@ fn compute_design_check_job(model: &Model, load_case: Option<u32>) -> Result<Job
         .linear_static(lc.id)
         .map_err(|e| format!("solve failed: {e}"))?;
 
-    let ctx = squid_n_design_jp::DesignCtx {
-        term: squid_n_design_jp::LoadTerm::Long,
-    };
     let mut member_force_rows: Vec<(u32, f64, [f64; 6])> = Vec::new();
     let mut n_checks = 0usize;
     let mut n_ng = 0usize;
@@ -1343,10 +1376,64 @@ fn compute_design_check_job(model: &Model, load_case: Option<u32>) -> Result<Job
             continue;
         };
 
-        let checker: Box<dyn squid_n_design_jp::DesignCheck> = if is_steel(&mat.name) {
-            Box::new(squid_n_design_jp::SteelDesign)
-        } else {
-            Box::new(squid_n_design_jp::RcDesign)
+        // 部材種別・部材長・せん断スパン比代表値（app.rs の run_design_check と同じ規則）。
+        let kind = member_kind_of(elem, model);
+        let length = {
+            let coords: Vec<[f64; 3]> = elem
+                .nodes
+                .iter()
+                .filter_map(|nid| model.nodes.get(nid.index()))
+                .map(|n| n.coord)
+                .take(2)
+                .collect();
+            match (coords.first(), coords.get(1)) {
+                (Some(p0), Some(p1)) => {
+                    let (dx, dy, dz) = (p1[0] - p0[0], p1[1] - p0[1], p1[2] - p0[2]);
+                    (dx * dx + dy * dy + dz * dz).sqrt()
+                }
+                _ => 0.0,
+            }
+        };
+        let shear_span = mf
+            .at
+            .iter()
+            .map(|(_, f)| (f[5].abs(), f[1].abs()))
+            .max_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+        // 端部・中央の強軸曲げ（横座屈 C 係数・たわみ検定用）。
+        let m_at = |target: f64| {
+            mf.at
+                .iter()
+                .find(|(p, _)| (p - target).abs() < 1e-9)
+                .map(|(_, f)| f[5])
+        };
+        let end_moments_z = match (m_at(0.0), m_at(1.0)) {
+            (Some(a), Some(b)) => Some((a, b)),
+            _ => None,
+        };
+        let ctx = squid_n_design_jp::DesignCtx {
+            term: squid_n_design_jp::LoadTerm::Long,
+            kind,
+            length,
+            lb: None,
+            lk: None,
+            shear_span,
+            rc_damage_control: true,
+            end_moments_z,
+            mid_moment_z: m_at(0.5),
+        };
+
+        // 検定器の選択: 複合断面（SRC/CFT）は形状優先、それ以外は材料名で鋼/RC
+        // （app.rs の run_design_check と同じ規則）。
+        let checker: Box<dyn squid_n_design_jp::DesignCheck> = match sec.shape {
+            Some(squid_n_core::section_shape::SectionShape::SrcRect { .. }) => {
+                Box::new(squid_n_design_jp::SrcDesign)
+            }
+            Some(squid_n_core::section_shape::SectionShape::CftBox { .. })
+            | Some(squid_n_core::section_shape::SectionShape::CftPipe { .. }) => {
+                Box::new(squid_n_design_jp::CftDesign)
+            }
+            _ if is_steel(&mat.name) => Box::new(squid_n_design_jp::SteelDesign),
+            _ => Box::new(squid_n_design_jp::RcDesign),
         };
         // 危険断面位置（§6.2.3、既定は柱フェイスと中央）の内力のみ検定する。
         // 節点芯は剛域が有る場合は検定対象外（app.rs の run_design_check と同じ規則）。
@@ -1356,13 +1443,14 @@ fn compute_design_check_job(model: &Model, load_case: Option<u32>) -> Result<Job
             if !is_near_design_position(*pos, &positions) {
                 continue;
             }
-            // [N, Qy, Qz, Mx, My, Mz] -> MemberForcesAt（暫定: 強軸まわりとして
-            // Mz[5] と Qy[1] を使用。app.rs の run_design_check と同じ簡略化）。
+            // [N, Qy, Qz, Mx, My, Mz] -> MemberForcesAt（N は引張正の部材内力）
             let mfa = squid_n_design_jp::MemberForcesAt {
                 pos: *pos,
                 n: forces[0],
-                q: forces[1],
-                m: forces[5],
+                qy: forces[1],
+                qz: forces[2],
+                my: forces[4],
+                mz: forces[5],
             };
             let cr = checker.check(&mfa, sec, mat, &ctx);
             n_checks += 1;
@@ -1375,11 +1463,35 @@ fn compute_design_check_job(model: &Model, load_case: Option<u32>) -> Result<Job
         }
     }
 
+    // 節点単位の検定（RC 柱梁接合部・S パネルゾーン・冷間成形耐力比・耐震壁）。
+    let mf_slices: Vec<(
+        squid_n_core::ids::ElemId,
+        squid_n_design_jp::joint_wiring::ForcesAt,
+    )> = result
+        .member_forces
+        .iter()
+        .map(|(id, mf)| (*id, mf.at.as_slice()))
+        .collect();
+    let joint_checks = squid_n_design_jp::joint_wiring::collect_joint_checks(
+        model,
+        &mf_slices,
+        squid_n_design_jp::LoadTerm::Long,
+    );
+    let n_joint_checks = joint_checks.len();
+    let n_joint_ng = joint_checks.iter().filter(|(_, _, cr)| !cr.ok).count();
+    for (_, _, cr) in &joint_checks {
+        if cr.ratio > max_ratio {
+            max_ratio = cr.ratio;
+        }
+    }
+
     let summary = serde_json::json!({
         "kind": "DesignCheck",
         "case": lc_id,
         "n_checks": n_checks,
         "n_ng": n_ng,
+        "n_joint_checks": n_joint_checks,
+        "n_joint_ng": n_joint_ng,
         "max_ratio": max_ratio,
     });
     Ok(JobOutcome::DesignCheck {

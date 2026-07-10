@@ -139,10 +139,10 @@ fn push_directional(
     }
 }
 
-/// 旧API（後方互換）。地震± 方向・暴風・多雪区域を扱わない単純版が必要な
-/// 呼び出し元向けに残す。内部では [`standard_combinations`] に委譲する
-/// （地震の ± 両方向・暴風・多雪区域の組合せが追加される点が旧実装からの
-/// 拡張＝レビュー §1.10 の是正）。
+/// 旧API（後方互換）。断面検定などから使う単純版
+/// （長期 G+P / 短期積雪 G+P+S / 短期地震 G+P±K の正負両加力）。
+/// 内部では [`standard_combinations`] に委譲する。暴風（W）・多雪区域の
+/// 係数付き組合せが必要な場合は [`standard_combinations`] を直接使う。
 pub fn auto_combinations(
     dl_case: LoadCaseId,
     ll_case: LoadCaseId,
@@ -163,6 +163,26 @@ pub fn auto_combinations(
     standard_combinations(&input)
 }
 
+/// 荷重組合せ名から断面検定の荷重継続性区分（長期/短期）を判定する。
+///
+/// RESP-D マニュアル「04 断面検定 / 荷重の組合せ」: G+P（多雪区域では
+/// G+P+0.7S も）が長期（常時・積雪時の長期）、地震（K/E）・風（W）を含む
+/// 組合せおよび短期積雪（G+P+S）は短期（令82条）。
+/// [`standard_combinations`] の命名規約（"G + P ± Kx"・"G + P + 0.7S" 等）に
+/// 基づき、追加項の記号で判定する。
+pub fn is_short_term_combo(name: &str) -> bool {
+    let upper = name.to_uppercase();
+    // 地震（K/E）・風（W）を含めば短期。
+    if upper.contains('K') || upper.contains('E') || upper.contains('W') {
+        return true;
+    }
+    // 多雪区域の長期積雪 0.7S は長期（令82条一号）。それ以外の S は短期積雪。
+    if upper.contains("0.7S") {
+        return false;
+    }
+    upper.contains('S')
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -176,9 +196,31 @@ mod tests {
             Some(LoadCaseId(4)),
             None,
         );
-        assert!(combos.len() >= 3);
+        // G+P, G+P±Kx, G+P±Ky の 5 組合せ
+        assert_eq!(combos.len(), 5);
         assert_eq!(combos[0].name, "G + P");
         assert_eq!(combos[1].name, "G + P + Kx");
+        assert_eq!(combos[2].name, "G + P - Kx");
+        assert_eq!(combos[3].name, "G + P + Ky");
+        assert_eq!(combos[4].name, "G + P - Ky");
+        // 負側加力は係数 -1.0
+        assert_eq!(combos[2].terms[2].1, -1.0);
+        assert_eq!(combos[4].terms[2].1, -1.0);
+    }
+
+    #[test]
+    fn test_is_short_term_combo() {
+        assert!(!is_short_term_combo("G + P"));
+        assert!(is_short_term_combo("G + P + Kx"));
+        assert!(is_short_term_combo("G + P - Kx"));
+        assert!(is_short_term_combo("G + P + Ky"));
+        assert!(is_short_term_combo("G + P + S"));
+        assert!(is_short_term_combo("G + P + W"));
+        assert!(is_short_term_combo("G + P + E"));
+        // 多雪区域: 長期 0.7S は長期、0.35S 付き短期は短期。
+        assert!(!is_short_term_combo("G + P + 0.7S"));
+        assert!(is_short_term_combo("G + P + 0.35S + Kx"));
+        assert!(is_short_term_combo("G + P + 0.35S - Wy"));
     }
 
     #[test]

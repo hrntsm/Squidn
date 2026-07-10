@@ -13,12 +13,17 @@ pub struct BarSet {
 
 /// RC せん断補強筋。
 ///
-/// `dia`: 径 [mm], `pitch`: ピッチ [mm], `legs`: 組数。
+/// `dia`: 径 [mm], `pitch`: ピッチ [mm], `legs`: 組数,
+/// `grade`: 材質（None は普通強度＝主筋と同種扱い。高強度せん断補強筋は
+/// 製品名/規格名で指定する。例: "UB785"（ウルボン785）, "KH785"（スーパーフープ）,
+/// "KSS785", "SHD685", "SPR785", "MK785", "SBPD1275" 等）。
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ShearBar {
     pub dia: f64,
     pub pitch: f64,
     pub legs: u32,
+    #[serde(default)]
+    pub grade: Option<String>,
 }
 
 /// RC 配筋情報。
@@ -71,7 +76,43 @@ pub enum SectionShape {
     RcRect { b: f64, d: f64, rebar: RcRebar },
     /// Reinforced concrete circle column (RC 円形).
     RcCircle { d: f64, rebar: RcRebar },
+    /// SRC 矩形断面（RC 矩形 + 内蔵 H 形鉄骨、SRC 規準 1987）。
+    ///
+    /// `steel_grade`: 内蔵鉄骨の鋼種（例 "SN400B"）。コンクリート強度は
+    /// `Material.fc`、主筋グレードは `Material.name` を用いる既存慣習を踏襲する。
+    ///
+    /// 解析用断面性能（`to_section`）は、コンクリート断面にヤング係数比
+    /// `N_S_EQ`（=15、暫定既定）による鉄骨の等価換算剛性を加えて算定する。
+    /// 断面積は質量算定への影響を避けるためコンクリート全断面 `b·d` とする。
+    SrcRect {
+        b: f64,
+        d: f64,
+        rebar: RcRebar,
+        steel_height: f64,
+        steel_width: f64,
+        steel_web_thick: f64,
+        steel_flange_thick: f64,
+        steel_grade: String,
+    },
+    /// CFT 角形（角形鋼管 + 充填コンクリート）。
+    ///
+    /// 解析用断面性能は鋼管部分のみ（充填コンクリートの剛性は暫定的に無視、
+    /// 剛性計算編での複合換算は今後の課題）。検定では `Material.fc` の
+    /// 充填コンクリート強度を用いる。
+    CftBox { height: f64, width: f64, thick: f64 },
+    /// CFT 円形（円形鋼管 + 充填コンクリート）。扱いは `CftBox` と同じ。
+    CftPipe { outer_dia: f64, thick: f64 },
+    /// RC 耐震壁（壁エレメント用）。
+    ///
+    /// `thickness`: 壁板厚 [mm]、`ps`: 壁板の直交する各方向のせん断補強筋比の
+    /// うち小さい方（小数。例 0.0025）。壁の平面寸法は要素の節点座標から得る
+    /// ため形状には持たない。`to_section` の断面性能は名目値（壁は暫定的に
+    /// 等価梁でモデル化されており、実剛性の評価は要素実装側の課題）。
+    RcWall { thickness: f64, ps: f64 },
 }
+
+/// SRC 断面の解析剛性算定に用いる鉄骨の等価ヤング係数比（暫定既定）。
+pub const N_S_EQ: f64 = 15.0;
 
 impl SectionShape {
     /// Compute the cross‑sectional area [mm²].
@@ -112,6 +153,20 @@ impl SectionShape {
             }
             SectionShape::RcRect { b, d, .. } => b * d,
             SectionShape::RcCircle { d, .. } => std::f64::consts::PI * d * d / 4.0,
+            // SRC: 質量算定への影響を避けるためコンクリート全断面とする（doc 参照）。
+            SectionShape::SrcRect { b, d, .. } => b * d,
+            SectionShape::CftBox {
+                height,
+                width,
+                thick,
+            } => width * height - (width - 2.0 * thick) * (height - 2.0 * thick),
+            SectionShape::CftPipe { outer_dia, thick } => {
+                let r = outer_dia / 2.0;
+                let ri = r - thick;
+                std::f64::consts::PI * (r * r - ri * ri)
+            }
+            // 壁: 名目値（1m 幅相当の板断面。解析剛性は要素実装側の課題）。
+            SectionShape::RcWall { thickness, .. } => thickness * 1000.0,
         }
     }
 
@@ -180,6 +235,36 @@ impl SectionShape {
             }
             SectionShape::RcRect { b, d, .. } => b * d.powi(3) / 12.0,
             SectionShape::RcCircle { d, .. } => std::f64::consts::PI * d.powi(4) / 64.0,
+            SectionShape::SrcRect {
+                b,
+                d,
+                steel_height,
+                steel_width,
+                steel_web_thick,
+                steel_flange_thick,
+                ..
+            } => {
+                let i_c = b * d.powi(3) / 12.0;
+                let hw = steel_height - 2.0 * steel_flange_thick;
+                let i_s = (steel_width * steel_height.powi(3)
+                    - (steel_width - steel_web_thick) * hw.powi(3))
+                    / 12.0;
+                i_c + (N_S_EQ - 1.0) * i_s
+            }
+            SectionShape::CftBox {
+                height,
+                width,
+                thick,
+            } => {
+                let hi = height - 2.0 * thick;
+                (width * height.powi(3) - (width - 2.0 * thick) * hi.powi(3)) / 12.0
+            }
+            SectionShape::CftPipe { outer_dia, thick } => {
+                let r = outer_dia / 2.0;
+                let ri = r - thick;
+                std::f64::consts::PI / 4.0 * (r.powi(4) - ri.powi(4))
+            }
+            SectionShape::RcWall { thickness, .. } => 1000.0 * thickness.powi(3) / 12.0,
         }
     }
 
@@ -251,6 +336,33 @@ impl SectionShape {
             SectionShape::SteelPipe { .. } => self.calc_iy(),
             SectionShape::RcRect { b, d, .. } => d * b.powi(3) / 12.0,
             SectionShape::RcCircle { .. } => self.calc_iy(),
+            SectionShape::SrcRect {
+                b,
+                d,
+                steel_height,
+                steel_width,
+                steel_web_thick,
+                steel_flange_thick,
+                ..
+            } => {
+                let i_c = d * b.powi(3) / 12.0;
+                let hw = steel_height - 2.0 * steel_flange_thick;
+                let i_s = (2.0 * steel_flange_thick * steel_width.powi(3)
+                    + hw * steel_web_thick.powi(3))
+                    / 12.0;
+                i_c + (N_S_EQ - 1.0) * i_s
+            }
+            SectionShape::CftBox {
+                height,
+                width,
+                thick,
+            } => {
+                let wi = width - 2.0 * thick;
+                (height * width.powi(3) - (height - 2.0 * thick) * wi.powi(3)) / 12.0
+            }
+            SectionShape::CftPipe { .. } => self.calc_iy(),
+            // 壁: 面外は薄いため名目的に iy と同値の板剛性を返す。
+            SectionShape::RcWall { .. } => self.calc_iy(),
         }
     }
 
@@ -314,6 +426,33 @@ impl SectionShape {
                 beta * b_min.powi(3) * h
             }
             SectionShape::RcCircle { d, .. } => std::f64::consts::PI * d.powi(4) / 32.0,
+            SectionShape::SrcRect { b, d, .. } => {
+                // ねじりは RC 矩形と同じ扱い（内蔵鉄骨の寄与は無視）。
+                let b_min = b.min(d);
+                let h = b.max(d);
+                let r = h / b_min;
+                let beta = if r < 10.0 {
+                    (1.0 / 3.0) * (1.0 - 0.630 / r + 0.052 / r.powi(5))
+                } else {
+                    1.0 / 3.0
+                };
+                beta * b_min.powi(3) * h
+            }
+            SectionShape::CftBox {
+                height,
+                width,
+                thick,
+            } => {
+                let a0 = (height - thick) * (width - thick);
+                let perim = 2.0 * (height + width - 2.0 * thick);
+                4.0 * a0 * a0 * thick / perim
+            }
+            SectionShape::CftPipe { outer_dia, thick } => {
+                let r = outer_dia / 2.0;
+                let ri = r - thick;
+                std::f64::consts::PI / 2.0 * (r.powi(4) - ri.powi(4))
+            }
+            SectionShape::RcWall { thickness, .. } => 1000.0 * thickness.powi(3) / 3.0,
         }
     }
 
@@ -347,6 +486,22 @@ impl SectionShape {
                 let as_z = bar_set_area(&rebar.main_y);
                 (d, d, as_y, as_z)
             }
+            SectionShape::SrcRect {
+                b, d, ref rebar, ..
+            } => {
+                let as_y = bar_set_area(&rebar.main_x);
+                let as_z = bar_set_area(&rebar.main_y);
+                (d, b, as_y, as_z)
+            }
+            SectionShape::CftBox { height, width, .. } => (height, width, 0.0, 0.0),
+            SectionShape::CftPipe { outer_dia, .. } => (outer_dia, outer_dia, 0.0, 0.0),
+            SectionShape::RcWall { thickness, .. } => (1000.0, thickness, 0.0, 0.0),
+        };
+        // 板厚系の形状は Section.thickness にも板厚を反映する（検定・表示用）。
+        let thickness = match *self {
+            SectionShape::CftBox { thick, .. } | SectionShape::CftPipe { thick, .. } => Some(thick),
+            SectionShape::RcWall { thickness, .. } => Some(thickness),
+            _ => None,
         };
         Section {
             id,
@@ -360,7 +515,7 @@ impl SectionShape {
             as_y,
             as_z,
             panel_thickness: None,
-            thickness: None,
+            thickness,
             // UI設計 §4.2: Section は SectionShape の派生。生成元の形状を保持する。
             shape: Some(self.clone()),
         }
@@ -457,6 +612,7 @@ mod tests {
                     dia: 10.0,
                     pitch: 100.0,
                     legs: 2,
+                    grade: None,
                 },
             },
         };
@@ -486,6 +642,7 @@ mod tests {
                     dia: 6.0,
                     pitch: 80.0,
                     legs: 1,
+                    grade: None,
                 },
             },
         };
@@ -569,6 +726,7 @@ mod tests {
                     dia: 10.0,
                     pitch: 100.0,
                     legs: 2,
+                    grade: None,
                 },
             },
         };
@@ -598,6 +756,7 @@ mod tests {
                     dia: 10.0,
                     pitch: 100.0,
                     legs: 2,
+                    grade: None,
                 },
             },
         };
@@ -628,6 +787,7 @@ mod tests {
                     dia: 10.0,
                     pitch: 100.0,
                     legs: 1,
+                    grade: None,
                 },
             },
         };

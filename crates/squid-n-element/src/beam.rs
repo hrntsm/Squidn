@@ -429,8 +429,12 @@ impl BeamElement {
 
         let mut at = Vec::new();
         for &xi in &self.eval_sections {
+            // 軸力 N は部材内力（引張正）。スパン内軸方向荷重が無い限り一定で、
+            // i 端側は節点力 f_local[0]（引張時に -N）、j 端側は f_local[6]（+N）。
+            // 旧実装の f0·(1-ξ)+f6·ξ は両端で符号が逆の節点力を線形補間しており、
+            // 中央で N=0 となる誤りだったため、せん断と同じ端別採用に修正。
             let (n, qy, qz, mx, my, mz) = if xi < 0.5 {
-                let n = f_local[0] * (1.0 - xi) + f_local[6] * xi;
+                let n = -f_local[0];
                 let qy = f_local[1];
                 let qz = f_local[2];
                 let mx = f_local[3];
@@ -438,7 +442,7 @@ impl BeamElement {
                 let mz = f_local[5] + f_local[1] * xi * self.length;
                 (n, qy, qz, mx, my, mz)
             } else {
-                let n = f_local[0] * (1.0 - xi) + f_local[6] * xi;
+                let n = f_local[6];
                 let qy = -f_local[7];
                 let qz = -f_local[8];
                 let mx = f_local[9];

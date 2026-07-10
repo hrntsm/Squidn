@@ -168,6 +168,64 @@ pub fn design_table(ui: &mut egui::Ui, app: &mut App) {
         app.nav.focus_member = Some(eid);
     }
 
+    // ── 一次設計: 節点単位の検定（柱梁接合部・パネルゾーン・冷間耐力比・耐震壁） ──
+    let joint_checks: Vec<(squid_n_core::ids::NodeId, String, f64, bool, String)> = app
+        .results
+        .as_ref()
+        .map(|r| {
+            r.joint_checks
+                .iter()
+                .map(|(id, label, cr)| (*id, label.clone(), cr.ratio, cr.ok, cr.basis.clone()))
+                .collect()
+        })
+        .unwrap_or_default();
+    if !joint_checks.is_empty() {
+        ui.add_space(12.0);
+        ui.strong("接合部・耐震壁の検定");
+        let ng = joint_checks.iter().filter(|(_, _, _, ok, _)| !ok).count();
+        ui.label(format!("{} 箇所を検定、NG {} 件", joint_checks.len(), ng));
+        TableBuilder::new(ui)
+            .striped(true)
+            .id_salt("joint_checks")
+            .column(Column::auto())
+            .column(Column::initial(110.0))
+            .column(Column::initial(80.0))
+            .column(Column::initial(60.0))
+            .column(Column::initial(260.0))
+            .header(20.0, |mut h| {
+                for t in &["節点", "種別", "検定比", "判定", "根拠"] {
+                    h.col(|ui| {
+                        ui.strong(*t);
+                    });
+                }
+            })
+            .body(|body| {
+                body.rows(18.0, joint_checks.len(), |mut row| {
+                    let (node_id, label, ratio, ok, basis) = &joint_checks[row.index()];
+                    row.col(|ui| {
+                        ui.label(node_id.0.to_string());
+                    });
+                    row.col(|ui| {
+                        ui.label(label);
+                    });
+                    let ratio_color = crate::theme::status_color(*ratio);
+                    row.col(|ui| {
+                        ui.colored_label(ratio_color, format!("{:.4}", ratio));
+                    });
+                    row.col(|ui| {
+                        if *ok {
+                            ui.label("OK");
+                        } else {
+                            ui.colored_label(crate::theme::ERROR_RED, "NG");
+                        }
+                    });
+                    row.col(|ui| {
+                        ui.label(basis);
+                    });
+                });
+            });
+    }
+
     // ── 二次設計: 層指標（層間変形角・剛性率・偏心率） ────────────
     ui.add_space(12.0);
     ui.strong("層指標（二次設計: 層間変形角・剛性率・偏心率）");

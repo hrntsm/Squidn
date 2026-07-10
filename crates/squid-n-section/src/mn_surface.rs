@@ -652,6 +652,10 @@ pub fn plastic_fibers(
         SectionShape::SteelPipe { outer_dia, .. } => outer_dia,
         SectionShape::RcRect { b, d, .. } => b.max(d),
         SectionShape::RcCircle { d, .. } => d,
+        SectionShape::SrcRect { b, d, .. } => b.max(d),
+        SectionShape::CftBox { height, width, .. } => height.max(width),
+        SectionShape::CftPipe { outer_dia, .. } => outer_dia,
+        SectionShape::RcWall { thickness, .. } => thickness.max(1000.0),
     };
     let target = if fine { max_dim / 40.0 } else { max_dim / 4.0 };
 
@@ -814,6 +818,106 @@ pub fn plastic_fibers(
             mesh_annulus(&mut fibers, d, d / 2.0, n_theta, n_r, conc);
             rebar_fibers_circle(&mut fibers, rebar, d, strength.rebar_fy, strength.steel_e);
         }
+        SectionShape::SrcRect {
+            b,
+            d,
+            ref rebar,
+            steel_height,
+            steel_width,
+            steel_web_thick,
+            steel_flange_thick,
+            ..
+        } => {
+            // RC 部分（コンクリート + 主筋）
+            mesh_rect(&mut fibers, [0.0, 0.0], b, d, target, conc);
+            rebar_fibers_rect(
+                &mut fibers,
+                rebar,
+                b,
+                d,
+                strength.rebar_fy,
+                strength.steel_e,
+            );
+            // 内蔵 H 形鉄骨（断面中心配置。コンクリートとの重複控除は省略＝
+            // 単純累加の近似。鉄骨断面積はコンクリートの数%のため影響軽微）
+            let hw = steel_height - 2.0 * steel_flange_thick;
+            mesh_rect(
+                &mut fibers,
+                [0.0, (steel_height - steel_flange_thick) / 2.0],
+                steel_width,
+                steel_flange_thick,
+                target,
+                steel,
+            );
+            mesh_rect(
+                &mut fibers,
+                [0.0, -(steel_height - steel_flange_thick) / 2.0],
+                steel_width,
+                steel_flange_thick,
+                target,
+                steel,
+            );
+            mesh_rect(&mut fibers, [0.0, 0.0], steel_web_thick, hw, target, steel);
+        }
+        SectionShape::CftBox {
+            height,
+            width,
+            thick,
+        } => {
+            // 鋼管部分（SteelBox と同じ 4 枚の板）
+            let hw = height - 2.0 * thick;
+            mesh_rect(
+                &mut fibers,
+                [0.0, (height - thick) / 2.0],
+                width,
+                thick,
+                target,
+                steel,
+            );
+            mesh_rect(
+                &mut fibers,
+                [0.0, -(height - thick) / 2.0],
+                width,
+                thick,
+                target,
+                steel,
+            );
+            for ysign in [1.0, -1.0] {
+                mesh_rect(
+                    &mut fibers,
+                    [ysign * (width - thick) / 2.0, 0.0],
+                    thick,
+                    hw,
+                    target,
+                    steel,
+                );
+            }
+            // 充填コンクリート
+            mesh_rect(
+                &mut fibers,
+                [0.0, 0.0],
+                width - 2.0 * thick,
+                height - 2.0 * thick,
+                target,
+                conc,
+            );
+        }
+        SectionShape::CftPipe { outer_dia, thick } => {
+            let n_theta = if fine { 48 } else { 8 };
+            let n_r_s = if fine { 4 } else { 1 };
+            let n_r_c = if fine { 12 } else { 2 };
+            // 鋼管
+            mesh_annulus(&mut fibers, outer_dia, thick, n_theta, n_r_s, steel);
+            // 充填コンクリート（中実円 = 厚 di/2 の円環）
+            let di = outer_dia - 2.0 * thick;
+            if di > 0.0 {
+                mesh_annulus(&mut fibers, di, di / 2.0, n_theta, n_r_c, conc);
+            }
+        }
+        SectionShape::RcWall { thickness, .. } => {
+            // 名目: 1m 幅の無筋板（壁の MN 曲線は対象外だがパニックさせない）
+            mesh_rect(&mut fibers, [0.0, 0.0], 1000.0, thickness, target, conc);
+        }
     }
 
     // 非対称断面は断面積重心まわりへ座標補正（曲げの基準軸を図心に取る）
@@ -922,6 +1026,7 @@ mod tests {
                     dia: 10.0,
                     pitch: 100.0,
                     legs: 2,
+                    grade: None,
                 },
             },
         }

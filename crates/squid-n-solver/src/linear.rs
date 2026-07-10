@@ -491,8 +491,10 @@ mod tests {
         );
         assert!(result.member_forces.len() == 1);
         let forces = &result.member_forces[0].1;
-        let fx_i = forces.at[0].1[0];
-        assert!((fx_i + 1000.0).abs() < 1e-6, "fx_i={}", fx_i);
+        // 軸力 N は部材内力（引張正）。先端 +1000N の引張で全断面 N=+1000。
+        for (xi, vals) in &forces.at {
+            assert!((vals[0] - 1000.0).abs() < 1e-6, "N(ξ={})={}", xi, vals[0]);
+        }
     }
 
     /// X 軸上の片持ち梁に「グローバル Y 方向」の先端荷重をかける。
