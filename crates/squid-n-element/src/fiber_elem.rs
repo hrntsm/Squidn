@@ -53,6 +53,9 @@ pub struct FiberBeam {
     /// 要素ローカル系→グローバル系の回転（柱・斜材で必須）。
     /// 内部状態（trial_disp 等）はローカル系で保持し、トレイト境界で回転する。
     pub axis: crate::transform::LocalFrame,
+    /// 塑性化域考慮モデルの中央弾性部剛性（ローカル系 12×12）。
+    /// None = 従来の全長ファイバー積分モデル。
+    pub k_mid: Option<LocalMat>,
     pub committed_disp: [f64; 12],
     pub trial_disp: [f64; 12],
 }
@@ -127,9 +130,100 @@ impl FiberBeam {
             torsion_j,
             g,
             axis,
+            k_mid: None,
             committed_disp: [0.0; 12],
             trial_disp: [0.0; 12],
         }
+    }
+
+    /// 塑性化域考慮のファイバー要素（材端剛塑性ばねモデルと適合する
+    /// ファイバーモデル化）。端部の塑性化領域（長さ `lp`）にファイバー断面を
+    /// 配置（積分点 ξ=∓1、重み Lp）し、中央 [Lp, L−Lp] は断面諸元
+    /// （EA・EIy・EIz）による弾性剛性として厳密に B 積分する。
+    pub fn with_plastic_zone(
+        data: &squid_n_core::model::ElementData,
+        model: &squid_n_core::model::Model,
+        lp: f64,
+    ) -> Self {
+        Self::build_plastic_zone(data, model, lp, 12, 20)
+    }
+
+    /// 塑性化域考慮要素の実体。`nw × nd` は端部断面のファイバ分割数
+    /// （マルチファイバー: 12×20、マルチスプリング: 2×5 の粗い配置）。
+    pub(crate) fn build_plastic_zone(
+        data: &squid_n_core::model::ElementData,
+        model: &squid_n_core::model::Model,
+        lp: f64,
+        nw: usize,
+        nd: usize,
+    ) -> Self {
+        let mut fb = Self::new(data, model);
+        let l = fb.length;
+        if l <= 0.0 {
+            return fb;
+        }
+        // Lp は部材長の 45% までにクランプ（両端合計で全長を超えない）
+        let lp = lp.clamp(1.0e-6 * l, 0.45 * l);
+
+        let sec = data.section.and_then(|sid| model.sections.get(sid.index()));
+        let mat_ref = data
+            .material
+            .and_then(|mid| model.materials.get(mid.index()));
+        let e = mat_ref.map(|m| m.young).unwrap_or(205000.0);
+        let width = sec.map(|s| s.width).unwrap_or(100.0);
+        let depth = sec.map(|s| s.depth).unwrap_or(200.0);
+        let area = sec.map(|s| s.area).unwrap_or(width * depth);
+        let iy = sec.map(|s| s.iy).unwrap_or(1.0);
+        let iz = sec.map(|s| s.iz).unwrap_or(1.0);
+
+        let template: Box<dyn UniaxialMaterial> = if let Some(fc) = mat_ref.and_then(|m| m.fc) {
+            Box::new(squid_n_material::uniaxial::Concrete::new(fc, 2.0))
+        } else {
+            let fy = mat_ref.and_then(|m| m.fy).unwrap_or(1e20);
+            Box::new(squid_n_material::uniaxial::Bilinear::new(e, fy, 0.01))
+        };
+
+        // 端部積分点: ξ=∓1、重み w·(L/2) = Lp → w = 2Lp/L
+        let w_end = 2.0 * lp / l;
+        let n_fibers = nw * nd;
+        fb.gauss_points = vec![
+            GaussPoint::new(
+                -1.0,
+                w_end,
+                squid_n_section::fiber::rect_fiber_section(width, depth, nw, nd, 0),
+                squid_n_section::fiber::uniform_fiber_mats(&*template, n_fibers),
+            ),
+            GaussPoint::new(
+                1.0,
+                w_end,
+                squid_n_section::fiber::rect_fiber_section(width, depth, nw, nd, 0),
+                squid_n_section::fiber::uniform_fiber_mats(&*template, n_fibers),
+            ),
+        ];
+
+        // 中央弾性部 [Lp, L−Lp] の剛性: B(ξ)ᵀ·diag(EA,EIy,EIz)·B(ξ) を
+        // 2点 Gauss（区間 [−h, h]、h = 1−2Lp/L）で厳密積分（被積分関数は ξ の2次）
+        let h = 1.0 - 2.0 * lp / l;
+        let d_el = [e * area, e * iy, e * iz];
+        let mut k_mid = LocalMat::zeros(12);
+        for sgn in [-1.0, 1.0] {
+            let xi = sgn * h / 3.0_f64.sqrt();
+            let w_phys = h * l / 2.0;
+            let b = Self::compute_b_matrix(xi, l);
+            for i in 0..12 {
+                for j in 0..12 {
+                    let mut val = 0.0;
+                    for (p, dp) in d_el.iter().enumerate() {
+                        val += b[p][i] * dp * b[p][j];
+                    }
+                    if val != 0.0 {
+                        k_mid.set(i, j, k_mid.get(i, j) + val * w_phys);
+                    }
+                }
+            }
+        }
+        fb.k_mid = Some(k_mid);
+        fb
     }
 
     fn beam_global_dofs(&self, dof: &DofMap) -> SmallVec<[usize; 24]> {
@@ -227,6 +321,16 @@ impl ElementBehavior for FiberBeam {
             }
         }
 
+        // 塑性化域考慮モデル: 中央弾性部の剛性を加算
+        if let Some(km) = &self.k_mid {
+            for i in 0..12 {
+                for j in 0..12 {
+                    let old = k.get(i, j);
+                    k.set(i, j, old + km.get(i, j));
+                }
+            }
+        }
+
         let ks = self.shear.tangent_stiffness(&ElemState::default());
         for i in 0..12 {
             for j in 0..12 {
@@ -269,6 +373,17 @@ impl ElementBehavior for FiberBeam {
             for i in 0..12 {
                 let val = b[0][i] * n + b[1][i] * my + b[2][i] * mz;
                 f.data[i] += val * w;
+            }
+        }
+
+        // 塑性化域考慮モデル: 中央弾性部の内力（線形: K_mid·u）を加算
+        if let Some(km) = &self.k_mid {
+            for i in 0..12 {
+                let mut si = 0.0;
+                for j in 0..12 {
+                    si += km.get(i, j) * self.trial_disp[j];
+                }
+                f.data[i] += si;
             }
         }
 
@@ -1464,6 +1579,97 @@ mod tests {
         for i in 0..12 {
             assert_relative_eq!(before.0[i], after.0[i], epsilon = 1e-12);
             assert_relative_eq!(before.1[i], after.1[i], epsilon = 1e-12);
+        }
+    }
+    /// plastic_zone 付きのテストモデルから塑性化域考慮 FiberBeam を生成する。
+    fn make_plastic_zone_fiber(lp: f64, fy: Option<f64>) -> FiberBeam {
+        let mut model = build_test_model(Some(0.0));
+        model.elements[0].plastic_zone = Some(lp);
+        model.materials[0].fy = fy;
+        FiberBeam::with_plastic_zone(&model.elements[0], &model, lp)
+    }
+
+    #[test]
+    fn test_plastic_zone_axial_stiffness_exact() {
+        // 軸剛性は端部ファイバ(2Lp) + 中央弾性(L-2Lp) の合成で EA/L に厳密一致する
+        let fb = make_plastic_zone_fiber(300.0, None);
+        let ctx = Ctx {
+            model: &build_test_model(Some(0.0)),
+        };
+        let k = fb.tangent_stiffness(&ElemState::default(), &ctx);
+        let ea_over_l = 205000.0 * 20000.0 / 3000.0;
+        assert_relative_eq!(k.get(0, 0), ea_over_l, max_relative = 1e-9);
+    }
+
+    #[test]
+    fn test_plastic_zone_elastic_stiffness_close_to_full_fiber() {
+        // Lp が小さければ弾性剛性は全長ファイバー積分（=弾性梁）に漸近する。
+        // 端部の1点矩形則による誤差は O(Lp/L)（曲率分布の勾配×区間幅）で、
+        // Lp = L/20 なら数%以内に収まる。
+        let model = build_test_model(Some(0.0));
+        let ctx = Ctx { model: &model };
+        let full = FiberBeam::new(&model.elements[0], &model);
+        let k_full = full.tangent_stiffness(&ElemState::default(), &ctx);
+
+        let pz = make_plastic_zone_fiber(150.0, None); // Lp = L/20
+        let k_pz = pz.tangent_stiffness(&ElemState::default(), &ctx);
+        for (i, j) in [(1usize, 1usize), (2, 2), (4, 4), (5, 5), (1, 5), (2, 4)] {
+            assert_relative_eq!(k_pz.get(i, j), k_full.get(i, j), max_relative = 5e-2);
+        }
+    }
+
+    #[test]
+    fn test_plastic_zone_yield_reduces_stiffness() {
+        // 端部断面が降伏すると接線剛性が低下する（中央は弾性のまま）
+        let mut fb = make_plastic_zone_fiber(300.0, Some(235.0));
+        let model = build_test_model(Some(0.0));
+        let ctx = Ctx { model: &model };
+        let k0 = fb.tangent_stiffness(&ElemState::default(), &ctx);
+
+        // i端に大回転 → 端部断面降伏
+        let du = LocalVec {
+            data: SmallVec::from_slice(&[
+                0.0, 0.0, 0.0, 0.0, 0.05, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+            ]),
+        };
+        fb.update_state(&du, false, &ctx);
+        let k1 = fb.tangent_stiffness(&ElemState::default(), &ctx);
+        assert!(
+            k1.get(4, 4) < 0.9 * k0.get(4, 4),
+            "降伏後の回転剛性は低下するはず: k0={}, k1={}",
+            k0.get(4, 4),
+            k1.get(4, 4)
+        );
+        // 中央弾性部があるため完全にゼロにはならない
+        assert!(k1.get(4, 4) > 0.0);
+    }
+
+    #[test]
+    fn test_plastic_zone_checkpoint_roundtrip() {
+        let mut fb = make_plastic_zone_fiber(300.0, Some(235.0));
+        let model = build_test_model(Some(0.0));
+        let ctx = Ctx { model: &model };
+        let du = LocalVec {
+            data: SmallVec::from_slice(&[
+                0.0, 0.0, 0.0, 0.0, 0.02, 0.0, -1.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+            ]),
+        };
+        fb.update_state(&du, true, &ctx);
+        let cp = fb.serialize_checkpoint();
+
+        let mut fb2 = make_plastic_zone_fiber(300.0, Some(235.0));
+        fb2.deserialize_checkpoint(&cp);
+        let du2 = LocalVec {
+            data: SmallVec::from_slice(&[
+                0.0, 0.0, 0.0, 0.0, 0.01, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+            ]),
+        };
+        fb.update_state(&du2, false, &ctx);
+        fb2.update_state(&du2, false, &ctx);
+        let f1 = fb.internal_force(&ElemState::default(), &ctx);
+        let f2 = fb2.internal_force(&ElemState::default(), &ctx);
+        for i in 0..12 {
+            assert_relative_eq!(f1.data[i], f2.data[i], epsilon = 1e-6);
         }
     }
 }

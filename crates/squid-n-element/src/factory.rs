@@ -144,27 +144,53 @@ pub fn build_nonlinear_behavior(
             ResolvedRegime::ConcentratedSpring => {
                 let elem = crate::beam::BeamElement::new(data, model);
                 let (spring_i, spring_j) = build_rotational_springs(data, model);
+                // 端バネの N-M 相関（2バネ連成: M_lim = My0·(1-|N|/N許容)）。
+                // My0 はバネ生成と同じ弾性断面係数ベース、N許容 = σy·A。
+                let (my0, n_allow) = yield_moment_and_axial(data, model);
                 (
                     Box::new(
                         crate::concentrated::ConcentratedSpringBeam::new_one_component(
                             elem, spring_i, spring_j,
-                        ),
+                        )
+                        .with_mn_interaction(my0, n_allow),
                     ),
                     ElemState::default(),
                 )
             }
-            ResolvedRegime::Fiber => (
-                Box::new(crate::fiber_elem::FiberBeam::new(data, model)),
-                ElemState::default(),
-            ),
+            ResolvedRegime::Fiber => (Box::new(build_fiber(data, model)), ElemState::default()),
         },
-        ElementKind::Fiber => (
-            Box::new(crate::fiber_elem::FiberBeam::new(data, model)),
+        ElementKind::Fiber => (Box::new(build_fiber(data, model)), ElemState::default()),
+        // MS 要素: 端部バネ断面 + 中央弾性の非線形要素（P5.5 §3）
+        ElementKind::Ms => (
+            Box::new(crate::ms::MsElement::new(data, model)),
             ElemState::default(),
         ),
-        // PanelZone / Shell / Ms / Wall は現状の挙動（弾性ベース）を踏襲。
+        // PanelZone / Shell / Wall は現状の挙動（弾性ベース）を踏襲。
         _ => build_behavior(data, model),
     }
+}
+
+/// ファイバー梁の生成。`plastic_zone` が指定されていれば塑性化域考慮モデル
+/// （端部 Lp 区間にファイバー断面、中央弾性）、なければ従来の全長ファイバー積分。
+fn build_fiber(data: &ElementData, model: &Model) -> crate::fiber_elem::FiberBeam {
+    match data.plastic_zone {
+        Some(lp) => crate::fiber_elem::FiberBeam::with_plastic_zone(data, model, lp),
+        None => crate::fiber_elem::FiberBeam::new(data, model),
+    }
+}
+
+/// 集中バネの降伏モーメント My0 と軸許容耐力 N許容 = σy·A（MN 相関用）。
+fn yield_moment_and_axial(data: &ElementData, model: &Model) -> (f64, f64) {
+    let sec = data.section.and_then(|sid| model.sections.get(sid.index()));
+    let mat = data
+        .material
+        .and_then(|mid| model.materials.get(mid.index()));
+    let fy_sigma = mat.and_then(|m| m.fy).unwrap_or(235.0);
+    let depth = sec.map(|s| s.depth.max(s.width)).unwrap_or(100.0);
+    let iz = sec.map(|s| s.iz.max(s.iy)).unwrap_or(1.0e6);
+    let z = if depth > 0.0 { iz / (depth / 2.0) } else { 0.0 };
+    let area = sec.map(|s| s.area).unwrap_or(1.0e4);
+    (fy_sigma * z, fy_sigma * area)
 }
 
 fn build_rotational_springs(
