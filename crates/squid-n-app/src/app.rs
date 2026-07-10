@@ -782,9 +782,8 @@ impl App {
                         };
                         // F 値は材料名の前方一致で引く(例 "SN400B"→235)。引けなければ 235。
                         // 板厚は形状の最大板厚（板厚 40mm 超は F 値低減の区分）。
-                        let f_value =
-                            steel_f_value_prefix(&mat.name, steel_max_thickness(shape))
-                                .unwrap_or(235.0);
+                        let f_value = steel_f_value_prefix(&mat.name, steel_max_thickness(shape))
+                            .unwrap_or(235.0);
                         s_member_rank_scaled(wt, f_value, &RankCriteria::default())
                     } else {
                         // RC 部材: RcRect のみ対応。RcCircle・形状未設定・
@@ -1565,17 +1564,18 @@ fn rc_sigma_0_from_gravity_or_last_static(
         .map(|(_, s)| s.member_forces.as_slice())
         .unwrap_or(fallback_member_forces);
 
+    // 軸力 N は引張正の部材内力（beam.rs recover_forces）。圧縮（N<0）のみ
+    // σ0 に反映し、引張は 0 とする（安全側）。
     member_forces
         .iter()
         .find(|(id, _)| *id == elem_id)
         .and_then(|(_, mf)| mf.at.first())
         .map(|(_, f)| f[0])
-        .filter(|n| *n > 0.0)
-        .map(|n| n / (b * d))
+        .filter(|n| *n < 0.0)
+        .map(|n| -n / (b * d))
         .unwrap_or(0.0)
 }
 
-/// 部材両端節点間の幾何長 \[mm\]（内法補正なしの簡易値。剛域等は考慮しない）。
 /// 鋼断面形状の最大板厚 [mm]（F 値の板厚区分判定用）。
 /// 形状情報のない断面・RC 断面は 0（板厚 40mm 以下の区分扱い）。
 fn steel_max_thickness(shape: &squid_n_core::section_shape::SectionShape) -> f64 {
@@ -1603,6 +1603,7 @@ fn steel_max_thickness(shape: &squid_n_core::section_shape::SectionShape) -> f64
     }
 }
 
+/// 部材両端節点間の幾何長 \[mm\]（内法補正なしの簡易値。剛域等は考慮しない）。
 fn elem_geometric_length(
     elem: &squid_n_core::model::ElementData,
     model: &squid_n_core::model::Model,
@@ -4039,8 +4040,13 @@ mod tests {
             .find(|(id, _)| *id == ElemId(0))
             .expect("elem 0 の内力があるはず");
         let n_raw = mf.at.first().expect("eval_sections[0] があるはず").1[0];
-        // 圧縮なので符号規約上「圧縮正」の n_raw は正で、大きさは P と厳密に一致する。
-        assert!((n_raw - p).abs() < 1e-6, "n_raw={} (expected {})", n_raw, p);
+        // 軸力は引張正の部材内力なので、圧縮 P に対して n_raw = -P となる。
+        assert!(
+            (n_raw + p).abs() < 1e-6,
+            "n_raw={} (expected {})",
+            n_raw,
+            -p
+        );
 
         let statics = &app.results.as_ref().unwrap().statics;
         let gravity_lc = app.model.load_cases.first().map(|c| c.id);
