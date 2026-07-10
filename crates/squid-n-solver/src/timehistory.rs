@@ -1557,6 +1557,7 @@ mod tests {
                 end_cond: [EndCondition::Fixed, EndCondition::Fixed],
                 force_regime: ForceRegime::Auto,
                 rigid_zone: Default::default(),
+                plastic_zone: None,
             }],
             sections: vec![Section {
                 id: SectionId(0),
@@ -1622,6 +1623,7 @@ mod tests {
                 end_cond: [EndCondition::Fixed, EndCondition::Fixed],
                 force_regime: ForceRegime::Auto,
                 rigid_zone: Default::default(),
+                plastic_zone: None,
             }],
             sections: vec![Section {
                 id: SectionId(0),
@@ -1835,6 +1837,7 @@ mod tests {
             end_cond: [EndCondition::Fixed, EndCondition::Fixed],
             force_regime: ForceRegime::Auto,
             rigid_zone: Default::default(),
+            plastic_zone: None,
         };
         let model = Model {
             nodes: vec![
@@ -1943,6 +1946,7 @@ mod tests {
             end_cond: [EndCondition::Fixed, EndCondition::Fixed],
             force_regime: ForceRegime::Auto,
             rigid_zone: Default::default(),
+            plastic_zone: None,
         };
         let model = Model {
             nodes: vec![
@@ -2514,6 +2518,7 @@ mod tests {
                 end_cond: [EndCondition::Fixed, EndCondition::Fixed],
                 force_regime: ForceRegime::Auto,
                 rigid_zone: Default::default(),
+                plastic_zone: None,
             }],
             sections: vec![Section {
                 id: SectionId(0),

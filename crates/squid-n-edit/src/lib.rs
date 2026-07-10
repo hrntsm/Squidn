@@ -1669,6 +1669,7 @@ mod tests {
             end_cond: [EndCondition::Fixed, EndCondition::Fixed],
             force_regime: ForceRegime::Auto,
             rigid_zone: Default::default(),
+            plastic_zone: None,
         });
 
         stack.run(&mut model, Box::new(DeleteNode { id: NodeId(1) }));
@@ -1725,6 +1726,7 @@ mod tests {
             end_cond: [EndCondition::Fixed, EndCondition::Fixed],
             force_regime: ForceRegime::Auto,
             rigid_zone: Default::default(),
+            plastic_zone: None,
         });
 
         // 部材に使われている節点の削除は Noop（先に部材を削除する必要がある）
@@ -1801,6 +1803,7 @@ mod tests {
             end_cond: [EndCondition::Fixed, EndCondition::Fixed],
             force_regime: ForceRegime::Auto,
             rigid_zone: Default::default(),
+            plastic_zone: None,
         };
         stack.run(&mut model, Box::new(AddMember { elem }));
         assert_eq!(model.elements.len(), 1);
@@ -1911,6 +1914,7 @@ mod tests {
             end_cond: [EndCondition::Fixed, EndCondition::Fixed],
             force_regime: ForceRegime::Auto,
             rigid_zone: Default::default(),
+            plastic_zone: None,
         });
 
         let cmd = DuplicateSectionForMember { member: ElemId(0) };
@@ -2004,6 +2008,7 @@ mod tests {
             end_cond: [EndCondition::Fixed, EndCondition::Fixed],
             force_regime: ForceRegime::Auto,
             rigid_zone: Default::default(),
+            plastic_zone: None,
         });
 
         let cmd = DuplicateSectionForMember { member: ElemId(0) };
@@ -2037,6 +2042,7 @@ mod tests {
                 end_cond: [EndCondition::Fixed, EndCondition::Fixed],
                 force_regime: ForceRegime::Auto,
                 rigid_zone: Default::default(),
+                plastic_zone: None,
             });
         }
         model

@@ -547,6 +547,7 @@ mod tests {
                 end_cond: [EndCondition::Fixed, EndCondition::Fixed],
                 force_regime: ForceRegime::Auto,
                 rigid_zone: Default::default(),
+                plastic_zone: None,
             }],
             sections: vec![Section {
                 id: SectionId(0),
@@ -603,6 +604,7 @@ mod tests {
             end_cond: [EndCondition::Fixed, EndCondition::Fixed],
             force_regime: ForceRegime::Auto,
             rigid_zone: Default::default(),
+            plastic_zone: None,
         };
         Model {
             nodes: vec![
@@ -721,6 +723,7 @@ mod tests {
                 end_cond: [EndCondition::Fixed, EndCondition::Fixed],
                 force_regime: ForceRegime::Auto,
                 rigid_zone: Default::default(),
+                plastic_zone: None,
             })
             .collect();
         Model {
@@ -996,6 +999,7 @@ mod tests {
                 end_cond: [EndCondition::Fixed, EndCondition::Fixed],
                 force_regime: ForceRegime::Auto,
                 rigid_zone: Default::default(),
+                plastic_zone: None,
             })
             .collect();
         Model {

@@ -83,6 +83,11 @@ pub struct ElementData {
     /// 部材端の剛域。旧スキーマ（無し）は既定値（剛域長 0）で補完される。
     #[serde(default)]
     pub rigid_zone: RigidZone,
+    /// 塑性化領域長さ Lp [mm]（None = 塑性化域を考慮しない従来モデル）。
+    /// ファイバー要素では端部 Lp 区間に非線形断面を配置し中央を弾性とする
+    /// モデル化（材端剛塑性ばねと適合するファイバーモデル化）に用いる。
+    #[serde(default)]
+    pub plastic_zone: Option<f64>,
 }
 
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -520,6 +525,7 @@ mod tests {
                 end_cond: [EndCondition::Fixed, EndCondition::Fixed],
                 force_regime: ForceRegime::Auto,
                 rigid_zone: Default::default(),
+                plastic_zone: None,
             }],
             ..Default::default()
         };
@@ -583,6 +589,24 @@ mod tests {
         };
         assert_eq!(sec.depth, 0.0);
         assert!(sec.panel_thickness.is_none());
+    }
+
+    #[test]
+    fn test_element_data_plastic_zone_default_missing_field() {
+        // 旧スキーマ（plastic_zone フィールドが無い JSON）からの互換性を確認する。
+        let json = r#"{
+            "id": 0,
+            "kind": "Beam",
+            "nodes": [0, 1],
+            "section": null,
+            "material": null,
+            "local_axis": { "ref_vector": [1.0, 0.0, 0.0] },
+            "end_cond": ["Fixed", "Fixed"],
+            "force_regime": "Auto"
+        }"#;
+        let elem: ElementData = serde_json::from_str(json).unwrap();
+        assert_eq!(elem.plastic_zone, None);
+        assert_eq!(elem.rigid_zone, RigidZone::default());
     }
 
     #[test]

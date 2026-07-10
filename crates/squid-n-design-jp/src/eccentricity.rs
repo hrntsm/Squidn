@@ -668,6 +668,7 @@ mod tests {
                 end_cond: end_fixed,
                 force_regime: ForceRegime::Auto,
                 rigid_zone: RigidZone::default(),
+                plastic_zone: None,
             });
         }
 
@@ -691,6 +692,7 @@ mod tests {
                 end_cond: end_fixed,
                 force_regime: ForceRegime::Auto,
                 rigid_zone: RigidZone::default(),
+                plastic_zone: None,
             });
         }
 

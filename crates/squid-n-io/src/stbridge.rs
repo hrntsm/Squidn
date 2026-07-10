@@ -351,6 +351,7 @@ fn make_member(
         end_cond: [EndCondition::Fixed, EndCondition::Fixed],
         force_regime: ForceRegime::Auto,
         rigid_zone: Default::default(),
+        plastic_zone: None,
     })
 }
 
@@ -464,6 +465,7 @@ mod tests {
             end_cond: [EndCondition::Fixed, EndCondition::Fixed],
             force_regime: ForceRegime::Auto,
             rigid_zone: Default::default(),
+            plastic_zone: None,
         });
         m.elements.push(ElementData {
             id: ElemId(1),
@@ -477,6 +479,7 @@ mod tests {
             end_cond: [EndCondition::Fixed, EndCondition::Fixed],
             force_regime: ForceRegime::Auto,
             rigid_zone: Default::default(),
+            plastic_zone: None,
         });
         m.elements.push(ElementData {
             id: ElemId(2),
@@ -490,6 +493,7 @@ mod tests {
             end_cond: [EndCondition::Fixed, EndCondition::Fixed],
             force_regime: ForceRegime::Auto,
             rigid_zone: Default::default(),
+            plastic_zone: None,
         });
         m.load_cases.push(LoadCase {
             id: LoadCaseId(0),

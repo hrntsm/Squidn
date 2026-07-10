@@ -279,6 +279,7 @@ mod tests {
             end_cond: [EndCondition::Fixed, EndCondition::Fixed],
             force_regime: ForceRegime::UniaxialBendingShear,
             rigid_zone: Default::default(),
+            plastic_zone: None,
         };
         assert!(matches!(
             resolve_force_regime(&elem, &model),
@@ -302,6 +303,7 @@ mod tests {
             end_cond: [EndCondition::Fixed, EndCondition::Fixed],
             force_regime: ForceRegime::Auto,
             rigid_zone: Default::default(),
+            plastic_zone: None,
         };
         assert!(matches!(
             resolve_force_regime(&beam, &model),
@@ -321,6 +323,7 @@ mod tests {
             end_cond: [EndCondition::Fixed, EndCondition::Fixed],
             force_regime: ForceRegime::Auto,
             rigid_zone: Default::default(),
+            plastic_zone: None,
         };
         assert!(matches!(
             resolve_force_regime(&col, &model),
@@ -343,6 +346,7 @@ mod tests {
             end_cond: [EndCondition::Fixed, EndCondition::Fixed],
             force_regime: ForceRegime::Auto,
             rigid_zone: Default::default(),
+            plastic_zone: None,
         };
         let (behavior, _state) = build_behavior(&beam, &model);
         // ConcentratedSpringBeam は recover_forces を override していないので None
@@ -382,6 +386,7 @@ mod tests {
             end_cond: [EndCondition::Fixed, EndCondition::Fixed],
             force_regime: ForceRegime::Auto,
             rigid_zone: Default::default(),
+            plastic_zone: None,
         };
         let (behavior, _state) = build_behavior(&col, &model);
         // Fiber 分岐は暫定 BeamElement（線形解析）→ recover_forces は Some
@@ -407,6 +412,7 @@ mod tests {
             end_cond: [EndCondition::Fixed, EndCondition::Fixed],
             force_regime: ForceRegime::Auto,
             rigid_zone: Default::default(),
+            plastic_zone: None,
         };
         let (behavior, _state) = build_nonlinear_behavior(&beam, &model);
         let snap = behavior.snapshot_state();
@@ -440,6 +446,7 @@ mod tests {
             end_cond: [EndCondition::Fixed, EndCondition::Fixed],
             force_regime: ForceRegime::Auto,
             rigid_zone: Default::default(),
+            plastic_zone: None,
         };
         let (behavior, _state) = build_nonlinear_behavior(&col, &model);
         let snap = behavior.snapshot_state();
