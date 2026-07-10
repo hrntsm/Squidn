@@ -4,6 +4,10 @@
 //! マルチファイバー）ごとの N–My–Mz 相関曲面の違いを、3D ワイヤーフレームと
 //! 任意軸力位置での My–Mz スライス（2D 相関曲線）で比較表示する。
 //!
+//! 下段の2Dプロットは My–Mz 相関曲線に加え、塑性化領域長さ Lp を考慮した
+//! 材端 M-θ 骨格曲線（材端剛塑性ばねモデルと適合するファイバーモデル化の
+//! 考え方）にも切り替えられる。
+//!
 //! 計算コアは `squid_n_section::mn_surface`（既存実装）。本ファイルはその結果を
 //! 可視化するのみで、力学的な計算ロジックは持たない。
 
@@ -12,8 +16,8 @@ use crate::theme;
 use crate::viewer::{project, q_axis_angle, q_mul, q_norm, CameraState};
 use squid_n_core::section_shape::SectionShape;
 use squid_n_section::mn_surface::{
-    build_simple_spring_surface, build_surface, plastic_fibers, slice_at_n, MnSurface,
-    PlasticFiber, StrengthParams, YieldModelKind,
+    build_simple_spring_surface, build_surface, m_phi_curve, m_theta_curve, plastic_fibers,
+    slice_at_n, MnSurface, PlasticFiber, StrengthParams, YieldModelKind,
 };
 
 /// 曲面の格子解像度（経線方向・周方向）。
@@ -45,6 +49,39 @@ struct MnCache {
     fiber_fibers: Vec<PlasticFiber>,
 }
 
+/// 下段2Dプロットの表示モード。
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
+pub enum SlicePlotMode {
+    /// 軸力一定での My-Mz 相関曲線
+    #[default]
+    MyMz,
+    /// 塑性化領域長さ Lp を考慮した材端 M-θ 骨格曲線
+    MTheta,
+}
+
+/// M-θ サブキャッシュのキー。前回と同じ間は `m_phi_curve` の再計算（数十ms）を
+/// 省略する。`MnCache` は section/strength の変化で作り直されるため、そこに
+/// ぶら下げると `ensure_cache` 後に可変参照が必要になり借用が競合する。
+/// そのため `MnViewState` 側に独立したサブキャッシュとして持たせ、
+/// キーに section_idx・strength も含めて一致判定する。
+#[derive(Clone, Copy, PartialEq)]
+struct MThetaKey {
+    section_idx: usize,
+    strength: StrengthParams,
+    n_target: f64,
+    lp: f64,
+    span: f64,
+    bend_dir_z: bool,
+}
+
+/// M-θ プロット用の計算結果（モデル別の [θ(rad), M(N・mm)] 点列。軸力範囲外は `None`）。
+struct MThetaData {
+    fiber: Option<Vec<[f64; 2]>>,
+    ms: Option<Vec<[f64; 2]>>,
+    /// 単純降伏バネ（材端剛塑性ばね）: (0,0)→(θy,Mlim)→(θmax,Mlim) の折れ線
+    simple: Option<Vec<[f64; 2]>>,
+}
+
 /// M-N 相関曲面ビューの状態（`App` が保持する）。
 pub struct MnViewState {
     /// `app.model.sections` のインデックス
@@ -55,10 +92,21 @@ pub struct MnViewState {
     pub show_fiber: bool,
     /// スライス軸力の比率。-1.0(圧縮耐力)〜+1.0(引張耐力)。
     pub n_ratio: f64,
+    /// 下段2Dプロットの表示モード（My-Mz相関 / M-θ骨格）。
+    pub slice_mode: SlicePlotMode,
+    /// 塑性化領域長さ Lp [mm]。0.0 は未設定扱いで、断面選択時に断面せい D の
+    /// 0.5倍を自動設定する（断面切替のたびに再設定する。`ensure_cache` 参照）。
+    pub lp: f64,
+    /// 部材内法スパン L [mm]（M-θ 換算の弾性回転項に使用）。
+    pub span: f64,
+    /// 曲げ方向。false=Myまわり(既定) / true=Mzまわり。
+    pub bend_dir_z: bool,
     /// 3D ビュー用カメラ（`viewer::CameraState` を再利用し、既存3Dビューと
     /// 同じ操作感を持たせる）
     pub camera: CameraState,
     cache: Option<MnCache>,
+    /// M-θ プロット用サブキャッシュ（`MThetaKey` が前回と同じなら再利用）。
+    m_theta_cache: Option<(MThetaKey, MThetaData)>,
 }
 
 impl Default for MnViewState {
@@ -70,8 +118,13 @@ impl Default for MnViewState {
             show_ms: true,
             show_fiber: true,
             n_ratio: 0.0,
+            slice_mode: SlicePlotMode::default(),
+            lp: 0.0,
+            span: 4000.0,
+            bend_dir_z: false,
             camera: CameraState::default(),
             cache: None,
+            m_theta_cache: None,
         }
     }
 }
@@ -198,12 +251,67 @@ fn control_panel(ui: &mut egui::Ui, app: &mut App) {
     ui.add(egui::Slider::new(&mut app.mn_view.n_ratio, -1.0..=1.0));
 
     ui.add_space(8.0);
+    ui.strong("2Dプロット");
+    ui.horizontal(|ui| {
+        let sel_mymz = app.mn_view.slice_mode == SlicePlotMode::MyMz;
+        let sel_mtheta = app.mn_view.slice_mode == SlicePlotMode::MTheta;
+        if ui.selectable_label(sel_mymz, "My-Mz相関").clicked() {
+            app.mn_view.slice_mode = SlicePlotMode::MyMz;
+        }
+        if ui
+            .selectable_label(sel_mtheta, "M-θ骨格（塑性化域）")
+            .clicked()
+        {
+            app.mn_view.slice_mode = SlicePlotMode::MTheta;
+        }
+    });
+    if app.mn_view.slice_mode == SlicePlotMode::MTheta {
+        ui.horizontal(|ui| {
+            ui.label("塑性化領域長さ Lp [mm]:");
+            ui.add(
+                egui::DragValue::new(&mut app.mn_view.lp)
+                    .speed(10.0)
+                    .range(1.0..=5000.0),
+            );
+        });
+        ui.horizontal(|ui| {
+            ui.label("内法スパン L [mm]:");
+            ui.add(
+                egui::DragValue::new(&mut app.mn_view.span)
+                    .speed(50.0)
+                    .range(100.0..=30000.0),
+            );
+        });
+        ui.horizontal(|ui| {
+            ui.label("曲げ方向:");
+            let sel_my = !app.mn_view.bend_dir_z;
+            let sel_mz = app.mn_view.bend_dir_z;
+            if ui.selectable_label(sel_my, "Myまわり").clicked() {
+                app.mn_view.bend_dir_z = false;
+            }
+            if ui.selectable_label(sel_mz, "Mzまわり").clicked() {
+                app.mn_view.bend_dir_z = true;
+            }
+        });
+    }
+
+    ui.add_space(8.0);
     ui.strong("耐力サマリ");
     if let Some(shape) = shape.cloned() {
         let section_idx = app.mn_view.section_idx;
         ensure_cache(&mut app.mn_view, section_idx, &shape);
         if let Some(cache) = &app.mn_view.cache {
             summary_table(ui, cache);
+        }
+        if app.mn_view.slice_mode == SlicePlotMode::MTheta {
+            ui.add_space(4.0);
+            ui.add(egui::Label::new(
+                egui::RichText::new(
+                    "M-θ は逆対称曲げ・反曲点中央・端部塑性化領域 Lp の仮定による骨格曲線",
+                )
+                .size(11.0)
+                .color(theme::GRAY_600),
+            ));
         }
     } else {
         ui.colored_label(theme::GRAY_600, "断面形状が未定義です。");
@@ -234,14 +342,37 @@ fn summary_table(ui: &mut egui::Ui, cache: &MnCache) {
         });
 }
 
+/// 断面せい D [mm]（Lp 自動設定に用いる）。SteelPipe/RcCircle は径、
+/// SteelAngle は leg_a を D とみなす。
+fn section_depth(shape: &SectionShape) -> f64 {
+    match *shape {
+        SectionShape::SteelH { height, .. }
+        | SectionShape::SteelBox { height, .. }
+        | SectionShape::SteelChannel { height, .. }
+        | SectionShape::SteelTee { height, .. } => height,
+        SectionShape::SteelAngle { leg_a, .. } => leg_a,
+        SectionShape::SteelPipe { outer_dia, .. } => outer_dia,
+        SectionShape::RcRect { d, .. } | SectionShape::RcCircle { d, .. } => d,
+    }
+}
+
 /// キャッシュが古ければ再計算する（`section_idx` または `strength` が変化した場合）。
+/// 断面切替時は塑性化領域長さ Lp を新断面の 0.5D へ自動リセットする。
 fn ensure_cache(state: &mut MnViewState, section_idx: usize, shape: &SectionShape) {
+    let section_changed = match &state.cache {
+        Some(c) => c.section_idx != section_idx,
+        None => true,
+    };
     let stale = match &state.cache {
         Some(c) => c.section_idx != section_idx || c.strength != state.strength,
         None => true,
     };
     if !stale {
         return;
+    }
+
+    if section_changed {
+        state.lp = 0.5 * section_depth(shape);
     }
 
     let strength = state.strength;
@@ -272,6 +403,65 @@ fn n_from_ratio(cache: &MnCache, n_ratio: f64) -> f64 {
     } else {
         n_ratio * cache.fiber.n_comp.abs()
     }
+}
+
+/// M-θ サブキャッシュが古ければ（`key` が前回と異なれば）再計算する。
+/// `m_phi_curve` は数十msかかりうるため、毎フレーム呼ばないための入口。
+fn ensure_m_theta_cache(
+    slot: &mut Option<(MThetaKey, MThetaData)>,
+    key: MThetaKey,
+    cache: &MnCache,
+) {
+    if let Some((k, _)) = slot {
+        if *k == key {
+            return;
+        }
+    }
+
+    let (ky, kz) = if key.bend_dir_z {
+        (0.0, 1.0)
+    } else {
+        (1.0, 0.0)
+    };
+    const N_STEPS: usize = 60;
+
+    let fiber_mphi = m_phi_curve(&cache.fiber_fibers, ky, kz, key.n_target, N_STEPS);
+    let fiber = fiber_mphi
+        .as_ref()
+        .map(|c| m_theta_curve(c, key.span, key.lp));
+
+    let ms_mphi = m_phi_curve(&cache.ms_fibers, ky, kz, key.n_target, N_STEPS);
+    let ms = ms_mphi.as_ref().map(|c| m_theta_curve(c, key.span, key.lp));
+
+    // 単純降伏バネ（材端剛塑性ばね）: 弾性部材の EI0 はマルチファイバーモデルの
+    // MPhiCurve を共用する（弾性部材は共通という前提）。
+    let simple = fiber_mphi.as_ref().and_then(|fc| {
+        let mp = if key.bend_dir_z {
+            cache.simple.mp_z
+        } else {
+            cache.simple.mp_y
+        };
+        let n_ref = if key.n_target >= 0.0 {
+            cache.simple.n_tens.max(1.0)
+        } else {
+            cache.simple.n_comp.abs().max(1.0)
+        };
+        let m_lim = mp * (1.0 - key.n_target.abs() / n_ref);
+        if m_lim <= 0.0 {
+            return None;
+        }
+        let ei0 = fc.ei0.max(1.0);
+        let theta_y = m_lim * key.span / (6.0 * ei0);
+        let theta_max = fiber
+            .as_ref()
+            .and_then(|f| f.last())
+            .map(|p| p[0])
+            .unwrap_or(theta_y * 3.0)
+            .max(theta_y);
+        Some(vec![[0.0, 0.0], [theta_y, m_lim], [theta_max, m_lim]])
+    });
+
+    *slot = Some((key, MThetaData { fiber, ms, simple }));
 }
 
 /// 右ペイン: 断面が未選択・形状未定義の場合は案内、それ以外は 3D + 2D を描画する。
@@ -343,8 +533,24 @@ fn visualization(ui: &mut egui::Ui, app: &mut App) {
 
     ui.separator();
 
-    // --- 2D スライスプロット（下4割） ---
-    draw_slice_plot(ui, cache, show, n_target);
+    // --- 2D プロット（下4割）: My-Mz相関 または M-θ骨格に切替 ---
+    match app.mn_view.slice_mode {
+        SlicePlotMode::MyMz => draw_slice_plot(ui, cache, show, n_target),
+        SlicePlotMode::MTheta => {
+            let key = MThetaKey {
+                section_idx: app.mn_view.section_idx,
+                strength: app.mn_view.strength,
+                n_target,
+                lp: app.mn_view.lp,
+                span: app.mn_view.span,
+                bend_dir_z: app.mn_view.bend_dir_z,
+            };
+            ensure_m_theta_cache(&mut app.mn_view.m_theta_cache, key, cache);
+            if let Some((_, data)) = &app.mn_view.m_theta_cache {
+                draw_m_theta_plot(ui, data, show);
+            }
+        }
+    }
 }
 
 /// 3D 領域の描画本体（ワイヤーフレーム3面・座標軸・スライス平面）。
@@ -593,6 +799,49 @@ fn plot_slice_curve(
     }
     let mut xy: Vec<[f64; 2]> = pts.iter().map(|p| [p[0] / 1e6, p[1] / 1e6]).collect();
     xy.push(xy[0]); // 始点を末尾に複製して閉じる
+    plot_ui.line(
+        egui_plot::Line::new(kind.label(), egui_plot::PlotPoints::from(xy))
+            .color(model_color(kind))
+            .width(2.0),
+    );
+}
+
+/// M-θ 骨格曲線プロット（塑性化領域考慮、egui_plot）を描く。
+/// 単純降伏バネは材端剛塑性ばね（弾性部材+剛塑性ヒンジ）の折れ線として、
+/// マルチスプリング／マルチファイバーは `MThetaData` にキャッシュ済みの
+/// 断面 M-φ 由来の骨格曲線として描く。
+fn draw_m_theta_plot(ui: &mut egui::Ui, data: &MThetaData, show: [bool; 3]) {
+    let height = ui.available_height();
+    egui_plot::Plot::new("mn_m_theta")
+        .x_axis_label("θ [×10⁻³ rad]")
+        .y_axis_label("M [kN・m]")
+        .legend(egui_plot::Legend::default())
+        .height(height)
+        .show(ui, |plot_ui| {
+            if show[0] {
+                if let Some(pts) = &data.simple {
+                    plot_m_theta_line(plot_ui, pts, YieldModelKind::SimpleSpring);
+                }
+            }
+            if show[1] {
+                if let Some(pts) = &data.ms {
+                    plot_m_theta_line(plot_ui, pts, YieldModelKind::MultiSpring);
+                }
+            }
+            if show[2] {
+                if let Some(pts) = &data.fiber {
+                    plot_m_theta_line(plot_ui, pts, YieldModelKind::MultiFiber);
+                }
+            }
+        });
+}
+
+/// [θ(rad), M(N・mm)] 点列を表示単位（θ:×10⁻³rad, M:kN・m）へ換算して Line を描く。
+fn plot_m_theta_line(plot_ui: &mut egui_plot::PlotUi<'_>, pts: &[[f64; 2]], kind: YieldModelKind) {
+    if pts.is_empty() {
+        return;
+    }
+    let xy: Vec<[f64; 2]> = pts.iter().map(|p| [p[0] * 1e3, p[1] / 1e6]).collect();
     plot_ui.line(
         egui_plot::Line::new(kind.label(), egui_plot::PlotPoints::from(xy))
             .color(model_color(kind))

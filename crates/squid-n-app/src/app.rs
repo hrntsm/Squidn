@@ -3116,6 +3116,7 @@ mod tests {
             end_cond: [EndCondition::Fixed, EndCondition::Fixed],
             force_regime: ForceRegime::Auto,
             rigid_zone: Default::default(),
+            plastic_zone: None,
         };
         Model {
             nodes: vec![
@@ -3681,6 +3682,7 @@ mod tests {
                 end_cond: [EndCondition::Fixed, EndCondition::Fixed],
                 force_regime: ForceRegime::Auto,
                 rigid_zone: Default::default(),
+                plastic_zone: None,
             });
         }
         model.load_cases.push(LoadCase {
@@ -3876,6 +3878,7 @@ mod tests {
                 end_cond: [EndCondition::Fixed, EndCondition::Fixed],
                 force_regime: ForceRegime::Auto,
                 rigid_zone: Default::default(),
+                plastic_zone: None,
             }],
             load_cases: vec![LoadCase {
                 id: LoadCaseId(0),
@@ -4011,6 +4014,7 @@ mod tests {
                 end_cond: [EndCondition::Fixed, EndCondition::Fixed],
                 force_regime: ForceRegime::Auto,
                 rigid_zone: Default::default(),
+                plastic_zone: None,
             }],
             load_cases: vec![
                 LoadCase {
@@ -4112,6 +4116,7 @@ mod tests {
             end_cond: [EndCondition::Fixed, EndCondition::Fixed],
             force_regime: ForceRegime::Auto,
             rigid_zone: Default::default(),
+            plastic_zone: None,
         };
         let elements = vec![
             mk_beam(0, 0, 1),

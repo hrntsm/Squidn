@@ -26,7 +26,7 @@
 
 use squid_n_core::section_shape::{BarSet, RcRebar, SectionShape};
 
-/// 全塑性計算用のファイバ（またはバネ）。引張/圧縮の限界応力を保持する。
+/// 全塑性計算用のファイバ（またはバネ）。引張/圧縮の限界応力と弾性係数を保持する。
 #[derive(Clone, Debug)]
 pub struct PlasticFiber {
     /// 断面内 y 座標 [mm]（幅方向）
@@ -39,6 +39,16 @@ pub struct PlasticFiber {
     pub sigma_t: f64,
     /// 圧縮限界応力 [N/mm²]（≤0）
     pub sigma_c: f64,
+    /// 弾性係数 [N/mm²]（M-φ 曲線の弾完全塑性評価に使用。剛塑性の曲面算定では不使用）
+    pub young: f64,
+}
+
+/// ファイバ材料（限界応力と弾性係数）。
+#[derive(Clone, Copy)]
+struct FiberMat {
+    sigma_t: f64,
+    sigma_c: f64,
+    young: f64,
 }
 
 /// 降伏判定のモデル化手法。
@@ -72,6 +82,8 @@ pub struct StrengthParams {
     pub rebar_fy: f64,
     /// コンクリート圧縮強度 [N/mm²]（正値で与える）
     pub concrete_fc: f64,
+    /// 鋼材・鉄筋の弾性係数 [N/mm²]
+    pub steel_e: f64,
 }
 
 impl Default for StrengthParams {
@@ -80,8 +92,15 @@ impl Default for StrengthParams {
             steel_fy: 235.0,
             rebar_fy: 345.0,
             concrete_fc: 24.0,
+            steel_e: 205000.0,
         }
     }
+}
+
+/// コンクリートの弾性係数 [N/mm²]（RC規準式、気乾単位体積重量 γ=24 kN/m³ 仮定）:
+/// Ec = 3.35×10⁴ × (γ/24)² × (Fc/60)^(1/3)
+pub fn concrete_young(fc: f64) -> f64 {
+    3.35e4 * (fc.max(1.0) / 60.0).powf(1.0 / 3.0)
 }
 
 /// M-N 相関曲面。`grid[i][j]` は経線方向 i（引張極 α=0 → 圧縮極 α=π）、
@@ -308,21 +327,137 @@ pub fn build_simple_spring_surface(
 }
 
 // ---------------------------------------------------------------------------
+// 塑性化域考慮の M-φ / M-θ（材端剛塑性ばねモデルと適合するファイバーモデル化）
+// ---------------------------------------------------------------------------
+
+/// 一定軸力下の断面 M-φ 曲線（塑性化進展を追う弾完全塑性評価）。
+pub struct MPhiCurve {
+    /// [φ (1/mm), M (N·mm)] の点列（φ=0 から単調増加）
+    pub points: Vec<[f64; 2]>,
+    /// 初期断面曲げ剛性 EI₀ [N·mm²]（最初の載荷ステップの割線剛性）
+    pub ei0: f64,
+}
+
+/// 曲げ方向 (ky, kz)（正規化）・一定軸力 `n_target` の下で、曲率 φ を漸増させた
+/// 断面 M-φ 曲線を返す。各ファイバは弾完全塑性 σ = clamp(E·ε, σc, σt) とし、
+/// 各 φ で軸ひずみ ε0 を二分法で調整して軸力を `n_target` に一致させる。
+///
+/// 断面内の降伏の進展（塑性化域の広がり）が M-φ の丸みとして現れる:
+/// マルチファイバーは滑らか、マルチスプリングは少数バネの逐次降伏で折れ線状になる。
+/// φ の上限は最外縁ひずみが降伏ひずみの約12倍となる曲率とし、`n_steps` 等分で返す。
+/// `n_target` が軸耐力範囲外、またはファイバが空なら `None`。
+pub fn m_phi_curve(
+    fibers: &[PlasticFiber],
+    ky: f64,
+    kz: f64,
+    n_target: f64,
+    n_steps: usize,
+) -> Option<MPhiCurve> {
+    let (nc, nt) = axial_capacity(fibers);
+    if fibers.is_empty() || n_target <= nc || n_target >= nt {
+        return None;
+    }
+
+    // てこ距離（中立軸直交方向の縁距離）と降伏ひずみの代表値
+    let d_max = fibers
+        .iter()
+        .map(|f| (ky * f.z - kz * f.y).abs())
+        .fold(0.0, f64::max)
+        .max(1.0);
+    let eps_y_max = fibers
+        .iter()
+        .map(|f| (f.sigma_t.abs().max(f.sigma_c.abs())) / f.young.max(1.0))
+        .fold(0.0, f64::max)
+        .max(1e-6);
+    let phi_max = 12.0 * eps_y_max / d_max;
+
+    // 一定軸力を満たす ε0 を二分法で求め、そのときの M（曲げ方向成分）を返す
+    let section_m = |phi: f64| -> f64 {
+        let force = |e0: f64| -> (f64, f64) {
+            let mut n = 0.0;
+            let mut m = 0.0;
+            for f in fibers {
+                let d = ky * f.z - kz * f.y;
+                let eps = e0 + phi * d;
+                let sigma = (f.young * eps).clamp(f.sigma_c, f.sigma_t);
+                n += sigma * f.area;
+                m += sigma * f.area * d;
+            }
+            (n, m)
+        };
+        // 探索区間: 全ファイバが引張/圧縮降伏しきる ε0 で挟めば N は nc/nt に到達する
+        let mut lo = -(phi * d_max + 2.0 * eps_y_max);
+        let mut hi = phi * d_max + 2.0 * eps_y_max;
+        for _ in 0..80 {
+            let mid = 0.5 * (lo + hi);
+            let (n, _) = force(mid);
+            if n < n_target {
+                lo = mid;
+            } else {
+                hi = mid;
+            }
+        }
+        force(0.5 * (lo + hi)).1
+    };
+
+    let n_steps = n_steps.max(2);
+    let mut points = Vec::with_capacity(n_steps + 1);
+    for i in 0..=n_steps {
+        let phi = phi_max * i as f64 / n_steps as f64;
+        points.push([phi, section_m(phi)]);
+    }
+
+    // 初期剛性は最初のステップの割線（φ=0 の点は M が 0 とは限らないため差分をとる）
+    let ei0 = (points[1][1] - points[0][1]) / (points[1][0] - points[0][0]).max(1e-30);
+
+    Some(MPhiCurve { points, ei0 })
+}
+
+/// 塑性化領域長さ Lp を考慮した材端 M-θ 骨格曲線への換算。
+///
+/// 部材（内法スパン `span`、逆対称曲げ・反曲点は部材中央）の端部に長さ Lp の
+/// 塑性化領域を仮定し、材端回転角を
+///
+/// ```text
+/// θ(M) = M·L/(6·EI₀) + Lp·(φ(M) − M/EI₀)
+/// ```
+///
+/// で評価する（第1項: 弾性部材の材端回転、第2項: 塑性化領域の塑性曲率 φp を
+/// Lp で集約した塑性回転 θp = φp·Lp）。材端剛塑性ばねモデルと適合する
+/// ファイバーモデル化（RESP 技術ブログ / 2016年AIJ大会梗概）の考え方に対応する。
+/// 返り値は [θ (rad), M (N·mm)] の点列。
+pub fn m_theta_curve(mphi: &MPhiCurve, span: f64, lp: f64) -> Vec<[f64; 2]> {
+    let ei0 = mphi.ei0.max(1.0);
+    mphi.points
+        .iter()
+        .map(|&[phi, m]| {
+            let theta_el = m * span / (6.0 * ei0);
+            let phi_p = (phi - m / ei0).max(0.0);
+            [theta_el + lp * phi_p, m]
+        })
+        .collect()
+}
+
+// ---------------------------------------------------------------------------
 // 断面形状 → ファイバ/バネ配置
 // ---------------------------------------------------------------------------
 
 /// 矩形領域（中心 `center = [cy, cz]`、幅 w × 高さ h）を目標寸法 `target` 以下の
-/// ファイバに等分割して追加する。`limits = (引張限界応力, 圧縮限界応力)`。
+/// ファイバに等分割して追加する。
 fn mesh_rect(
     fibers: &mut Vec<PlasticFiber>,
     center: [f64; 2],
     w: f64,
     h: f64,
     target: f64,
-    limits: (f64, f64),
+    mat: FiberMat,
 ) {
     let [cy, cz] = center;
-    let (sigma_t, sigma_c) = limits;
+    let FiberMat {
+        sigma_t,
+        sigma_c,
+        young,
+    } = mat;
     let ny = (w / target).ceil().max(1.0) as usize;
     let nz = (h / target).ceil().max(1.0) as usize;
     let dy = w / ny as f64;
@@ -335,6 +470,7 @@ fn mesh_rect(
                 area: dy * dz,
                 sigma_t,
                 sigma_c,
+                young,
             });
         }
     }
@@ -347,9 +483,13 @@ fn mesh_annulus(
     thick: f64,
     n_theta: usize,
     n_r: usize,
-    sigma_t: f64,
-    sigma_c: f64,
+    mat: FiberMat,
 ) {
+    let FiberMat {
+        sigma_t,
+        sigma_c,
+        young,
+    } = mat;
     let ro = outer_dia / 2.0;
     let ri = (ro - thick).max(0.0);
     let dr = (ro - ri) / n_r as f64;
@@ -367,6 +507,7 @@ fn mesh_annulus(
                 area: a,
                 sigma_t,
                 sigma_c,
+                young,
             });
         }
     }
@@ -378,7 +519,14 @@ fn mesh_annulus(
 /// - `main_y`（幅方向主筋）: 側面（y = ±(b/2 − cover)）に各 `count` 本をせい方向の
 ///   内側区間へ等配（隅角部は main_x 側に含める）。
 /// - `layers`: 2段目以降は 2.5×径 ずつ内側へ配置する。
-fn rebar_fibers_rect(fibers: &mut Vec<PlasticFiber>, rebar: &RcRebar, b: f64, d: f64, fy: f64) {
+fn rebar_fibers_rect(
+    fibers: &mut Vec<PlasticFiber>,
+    rebar: &RcRebar,
+    b: f64,
+    d: f64,
+    fy: f64,
+    young: f64,
+) {
     let bar = |set: &BarSet| -> f64 { std::f64::consts::PI * set.dia * set.dia / 4.0 };
 
     // せい方向主筋（上下面）
@@ -401,6 +549,7 @@ fn rebar_fibers_rect(fibers: &mut Vec<PlasticFiber>, rebar: &RcRebar, b: f64, d:
                         area: a,
                         sigma_t: fy,
                         sigma_c: -fy,
+                        young,
                     });
                 }
             }
@@ -424,6 +573,7 @@ fn rebar_fibers_rect(fibers: &mut Vec<PlasticFiber>, rebar: &RcRebar, b: f64, d:
                         area: a,
                         sigma_t: fy,
                         sigma_c: -fy,
+                        young,
                     });
                 }
             }
@@ -432,7 +582,13 @@ fn rebar_fibers_rect(fibers: &mut Vec<PlasticFiber>, rebar: &RcRebar, b: f64, d:
 }
 
 /// RC 円形断面の主筋バネ（main_x + main_y の合計本数を円周上へ等配）。
-fn rebar_fibers_circle(fibers: &mut Vec<PlasticFiber>, rebar: &RcRebar, d: f64, fy: f64) {
+fn rebar_fibers_circle(
+    fibers: &mut Vec<PlasticFiber>,
+    rebar: &RcRebar,
+    d: f64,
+    fy: f64,
+    young: f64,
+) {
     let total = (rebar.main_x.count + rebar.main_y.count) as usize;
     if total == 0 {
         return;
@@ -452,6 +608,7 @@ fn rebar_fibers_circle(fibers: &mut Vec<PlasticFiber>, rebar: &RcRebar, d: f64, 
             area: a,
             sigma_t: fy,
             sigma_c: -fy,
+            young,
         });
     }
 }
@@ -473,6 +630,16 @@ pub fn plastic_fibers(
     let fine = !matches!(kind, YieldModelKind::MultiSpring);
     let fy = strength.steel_fy;
     let fc = strength.concrete_fc;
+    let steel = FiberMat {
+        sigma_t: fy,
+        sigma_c: -fy,
+        young: strength.steel_e,
+    };
+    let conc = FiberMat {
+        sigma_t: 0.0,
+        sigma_c: -fc,
+        young: concrete_young(fc),
+    };
     let mut fibers = Vec::new();
 
     // 最大寸法に対する目標ファイバ寸法
@@ -502,7 +669,7 @@ pub fn plastic_fibers(
                 width,
                 flange_thick,
                 target,
-                (fy, -fy),
+                steel,
             );
             mesh_rect(
                 &mut fibers,
@@ -510,9 +677,9 @@ pub fn plastic_fibers(
                 width,
                 flange_thick,
                 target,
-                (fy, -fy),
+                steel,
             );
-            mesh_rect(&mut fibers, [0.0, 0.0], web_thick, hw, target, (fy, -fy));
+            mesh_rect(&mut fibers, [0.0, 0.0], web_thick, hw, target, steel);
         }
         SectionShape::SteelBox {
             height,
@@ -526,7 +693,7 @@ pub fn plastic_fibers(
                 width,
                 thick,
                 target,
-                (fy, -fy),
+                steel,
             );
             mesh_rect(
                 &mut fibers,
@@ -534,7 +701,7 @@ pub fn plastic_fibers(
                 width,
                 thick,
                 target,
-                (fy, -fy),
+                steel,
             );
             for ysign in [1.0, -1.0] {
                 mesh_rect(
@@ -543,7 +710,7 @@ pub fn plastic_fibers(
                     thick,
                     hw,
                     target,
-                    (fy, -fy),
+                    steel,
                 );
             }
         }
@@ -559,7 +726,7 @@ pub fn plastic_fibers(
                 thick,
                 leg_a,
                 target,
-                (fy, -fy),
+                steel,
             );
             mesh_rect(
                 &mut fibers,
@@ -567,7 +734,7 @@ pub fn plastic_fibers(
                 leg_b - thick,
                 thick,
                 target,
-                (fy, -fy),
+                steel,
             );
         }
         SectionShape::SteelChannel {
@@ -584,7 +751,7 @@ pub fn plastic_fibers(
                 web_thick,
                 hw,
                 target,
-                (fy, -fy),
+                steel,
             );
             for zsign in [1.0, -1.0] {
                 mesh_rect(
@@ -593,7 +760,7 @@ pub fn plastic_fibers(
                     width,
                     flange_thick,
                     target,
-                    (fy, -fy),
+                    steel,
                 );
             }
         }
@@ -610,7 +777,7 @@ pub fn plastic_fibers(
                 width,
                 flange_thick,
                 target,
-                (fy, -fy),
+                steel,
             );
             mesh_rect(
                 &mut fibers,
@@ -621,24 +788,31 @@ pub fn plastic_fibers(
                 web_thick,
                 hw,
                 target,
-                (fy, -fy),
+                steel,
             );
         }
         SectionShape::SteelPipe { outer_dia, thick } => {
             let n_theta = if fine { 48 } else { 8 };
             let n_r = if fine { 4 } else { 1 };
-            mesh_annulus(&mut fibers, outer_dia, thick, n_theta, n_r, fy, -fy);
+            mesh_annulus(&mut fibers, outer_dia, thick, n_theta, n_r, steel);
         }
         SectionShape::RcRect { b, d, ref rebar } => {
-            mesh_rect(&mut fibers, [0.0, 0.0], b, d, target, (0.0, -fc));
-            rebar_fibers_rect(&mut fibers, rebar, b, d, strength.rebar_fy);
+            mesh_rect(&mut fibers, [0.0, 0.0], b, d, target, conc);
+            rebar_fibers_rect(
+                &mut fibers,
+                rebar,
+                b,
+                d,
+                strength.rebar_fy,
+                strength.steel_e,
+            );
         }
         SectionShape::RcCircle { d, ref rebar } => {
             // 中実円 = 厚 d/2 の円環
             let n_theta = if fine { 48 } else { 8 };
             let n_r = if fine { 12 } else { 2 };
-            mesh_annulus(&mut fibers, d, d / 2.0, n_theta, n_r, 0.0, -fc);
-            rebar_fibers_circle(&mut fibers, rebar, d, strength.rebar_fy);
+            mesh_annulus(&mut fibers, d, d / 2.0, n_theta, n_r, conc);
+            rebar_fibers_circle(&mut fibers, rebar, d, strength.rebar_fy, strength.steel_e);
         }
     }
 
@@ -671,7 +845,18 @@ mod tests {
 
     fn steel_rect_fibers(b: f64, d: f64, fy: f64, n: usize) -> Vec<PlasticFiber> {
         let mut fibers = Vec::new();
-        mesh_rect(&mut fibers, [0.0, 0.0], b, d, d / n as f64, (fy, -fy));
+        mesh_rect(
+            &mut fibers,
+            [0.0, 0.0],
+            b,
+            d,
+            d / n as f64,
+            FiberMat {
+                sigma_t: fy,
+                sigma_c: -fy,
+                young: 205000.0,
+            },
+        );
         fibers
     }
 
@@ -884,5 +1069,103 @@ mod tests {
         let a_sum: f64 = fibers.iter().map(|f| f.area).sum();
         let cz: f64 = fibers.iter().map(|f| f.area * f.z).sum::<f64>() / a_sum;
         assert_relative_eq!(cz, 0.0, epsilon = 1e-9);
+    }
+
+    #[test]
+    fn test_m_phi_initial_stiffness_and_plateau() {
+        // 矩形鋼断面: 初期剛性 EI₀ ≈ E·I、終局は全塑性 Mp に漸近
+        let (b, d, fy, e) = (100.0, 200.0, 235.0, 205000.0);
+        let fibers = steel_rect_fibers(b, d, fy, 200);
+        let curve = m_phi_curve(&fibers, 1.0, 0.0, 0.0, 60).unwrap();
+        // 離散断面の I（ファイバ位置ベース）と比較
+        let i_disc: f64 = fibers.iter().map(|f| f.area * f.z * f.z).sum();
+        assert_relative_eq!(curve.ei0, e * i_disc, max_relative = 1e-6);
+        // 最終点は Mp = fy·b·d²/4 の 99% 以上
+        let mp = fy * b * d * d / 4.0;
+        let m_last = curve.points.last().unwrap()[1];
+        assert!(
+            m_last > 0.99 * mp && m_last <= mp * (1.0 + 1e-9),
+            "m_last = {m_last}, mp = {mp}"
+        );
+        // 単調非減少
+        for w in curve.points.windows(2) {
+            assert!(w[1][1] >= w[0][1] - 1e-6);
+        }
+    }
+
+    #[test]
+    fn test_m_phi_with_axial_force_reduces_plateau() {
+        // N = 0.5·Npl では平坦部が Mp·(1-0.25) に漸近（厳密解 M/Mp = 1-(N/Npl)²）
+        let (b, d, fy) = (100.0, 200.0, 235.0);
+        let fibers = steel_rect_fibers(b, d, fy, 200);
+        let npl = b * d * fy;
+        let mp = fy * b * d * d / 4.0;
+        let curve = m_phi_curve(&fibers, 1.0, 0.0, 0.5 * npl, 60).unwrap();
+        let m_last = curve.points.last().unwrap()[1];
+        assert_relative_eq!(m_last, 0.75 * mp, max_relative = 2e-2);
+    }
+
+    #[test]
+    fn test_m_phi_outside_axial_range() {
+        let fibers = steel_rect_fibers(100.0, 200.0, 235.0, 20);
+        let npl = 100.0 * 200.0 * 235.0;
+        assert!(m_phi_curve(&fibers, 1.0, 0.0, npl * 1.01, 20).is_none());
+        assert!(m_phi_curve(&fibers, 1.0, 0.0, -npl * 1.01, 20).is_none());
+    }
+
+    #[test]
+    fn test_m_theta_elastic_slope_and_plastic_rotation() {
+        // 弾性域: θ = M·L/(6EI₀)。塑性域: θp = Lp·(φ - M/EI₀) が加算される。
+        let fibers = steel_rect_fibers(100.0, 200.0, 235.0, 200);
+        let curve = m_phi_curve(&fibers, 1.0, 0.0, 0.0, 60).unwrap();
+        let (span, lp) = (4000.0, 100.0);
+        let mtheta = m_theta_curve(&curve, span, lp);
+        assert_eq!(mtheta.len(), curve.points.len());
+        // 弾性域の点（最初の非零点）: 傾き 6EI₀/L
+        let [th1, m1] = mtheta[1];
+        assert_relative_eq!(m1 / th1, 6.0 * curve.ei0 / span, max_relative = 1e-6);
+        // 最終点（全塑性近傍）: θ = M·L/6EI₀ + Lp·(φ - M/EI₀) を満たす
+        let [phi_l, m_l] = *curve.points.last().unwrap();
+        let [th_l, m_l2] = *mtheta.last().unwrap();
+        assert_relative_eq!(m_l2, m_l, max_relative = 1e-12);
+        let expected = m_l * span / (6.0 * curve.ei0) + lp * (phi_l - m_l / curve.ei0);
+        assert_relative_eq!(th_l, expected, max_relative = 1e-9);
+        // 塑性回転分は正
+        assert!(th_l > m_l * span / (6.0 * curve.ei0));
+    }
+
+    #[test]
+    fn test_m_phi_rc_section() {
+        // RC断面: 引張側コンクリートが効かない弾完全塑性でも有限・単調な M-φ になる
+        let strength = StrengthParams::default();
+        let fibers = plastic_fibers(&sample_rc_shape(), &strength, YieldModelKind::MultiFiber);
+        let (nc, _) = axial_capacity(&fibers);
+        let curve = m_phi_curve(&fibers, 1.0, 0.0, 0.2 * nc, 40).unwrap();
+        assert!(curve.ei0.is_finite() && curve.ei0 > 0.0);
+        for w in curve.points.windows(2) {
+            assert!(w[1][1].is_finite());
+            assert!(w[1][1] >= w[0][1] - 1.0); // 数値誤差の微小許容
+        }
+        // 終局は全塑性耐力（plastic_moment_at_n）に漸近する
+        let mp = plastic_moment_at_n(&fibers, 1.0, 0.0, 0.2 * nc).unwrap()[0];
+        let m_last = curve.points.last().unwrap()[1];
+        assert!(m_last > 0.95 * mp, "m_last = {m_last}, mp = {mp}");
+    }
+
+    #[test]
+    fn test_m_phi_multispring_is_piecewise() {
+        // マルチスプリングの M-φ は少数バネの逐次降伏による折れ線
+        // （= ファイバーより早く初期降伏の折れ点が現れる）。ここでは両者の
+        // 初期剛性がほぼ一致し、終局耐力もほぼ一致することを確認する。
+        let strength = StrengthParams::default();
+        let shape = sample_rc_shape();
+        let ms = plastic_fibers(&shape, &strength, YieldModelKind::MultiSpring);
+        let fib = plastic_fibers(&shape, &strength, YieldModelKind::MultiFiber);
+        let c_ms = m_phi_curve(&ms, 1.0, 0.0, 0.0, 60).unwrap();
+        let c_f = m_phi_curve(&fib, 1.0, 0.0, 0.0, 60).unwrap();
+        assert_relative_eq!(c_ms.ei0, c_f.ei0, max_relative = 5e-2);
+        let m_ms = c_ms.points.last().unwrap()[1];
+        let m_f = c_f.points.last().unwrap()[1];
+        assert_relative_eq!(m_ms, m_f, max_relative = 8e-2);
     }
 }

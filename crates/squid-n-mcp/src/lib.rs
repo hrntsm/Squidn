@@ -428,6 +428,7 @@ pub mod server {
                     end_cond: [EndCondition::Fixed, EndCondition::Fixed],
                     force_regime: ForceRegime::Auto,
                     rigid_zone: Default::default(),
+                    plastic_zone: None,
                 }],
                 sections: vec![Section {
                     id: SectionId(0),
@@ -514,6 +515,7 @@ pub mod server {
                     end_cond: [EndCondition::Fixed, EndCondition::Fixed],
                     force_regime: ForceRegime::Auto,
                     rigid_zone: Default::default(),
+                    plastic_zone: None,
                 }],
                 sections: vec![Section {
                     id: SectionId(0),
@@ -1574,6 +1576,7 @@ mod tests {
                 ],
                 force_regime: squid_n_core::model::ForceRegime::Auto,
                 rigid_zone: Default::default(),
+                plastic_zone: None,
             }],
             ..Default::default()
         }

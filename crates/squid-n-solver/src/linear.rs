@@ -188,6 +188,7 @@ mod tests {
                 end_cond: [EndCondition::Fixed, EndCondition::Fixed],
                 force_regime: ForceRegime::Auto,
                 rigid_zone: Default::default(),
+                plastic_zone: None,
             }],
             sections: vec![Section {
                 id: SectionId(0),
@@ -296,6 +297,7 @@ mod tests {
                 end_cond: [EndCondition::Fixed, EndCondition::Fixed],
                 force_regime: ForceRegime::Auto,
                 rigid_zone: Default::default(),
+                plastic_zone: None,
             }],
             sections: vec![Section {
                 id: SectionId(0),
@@ -435,6 +437,7 @@ mod tests {
                 end_cond: [EndCondition::Fixed, EndCondition::Fixed],
                 force_regime: ForceRegime::Auto,
                 rigid_zone: Default::default(),
+                plastic_zone: None,
             }],
             sections: vec![Section {
                 id: SectionId(0),
@@ -594,6 +597,7 @@ mod tests {
                 end_cond: [EndCondition::Fixed, EndCondition::Fixed],
                 force_regime: ForceRegime::Auto,
                 rigid_zone: Default::default(),
+                plastic_zone: None,
             }],
             sections: vec![Section {
                 id: SectionId(0),
@@ -686,6 +690,7 @@ mod tests {
                 end_cond: [EndCondition::Fixed, EndCondition::Fixed],
                 force_regime: ForceRegime::Auto,
                 rigid_zone: Default::default(),
+                plastic_zone: None,
             }],
             sections: vec![Section {
                 id: SectionId(0),
@@ -862,6 +867,7 @@ mod tests {
                     end_cond: [EndCondition::Fixed, EndCondition::Fixed],
                     force_regime: ForceRegime::Auto,
                     rigid_zone: Default::default(),
+                    plastic_zone: None,
                 },
                 ElementData {
                     id: ElemId(1),
@@ -875,6 +881,7 @@ mod tests {
                     end_cond: [EndCondition::Fixed, EndCondition::Fixed],
                     force_regime: ForceRegime::Auto,
                     rigid_zone: Default::default(),
+                    plastic_zone: None,
                 },
                 ElementData {
                     id: ElemId(2),
@@ -888,6 +895,7 @@ mod tests {
                     end_cond: [EndCondition::Fixed, EndCondition::Fixed],
                     force_regime: ForceRegime::Auto,
                     rigid_zone: Default::default(),
+                    plastic_zone: None,
                 },
                 ElementData {
                     id: ElemId(3),
@@ -901,6 +909,7 @@ mod tests {
                     end_cond: [EndCondition::Fixed, EndCondition::Fixed],
                     force_regime: ForceRegime::Auto,
                     rigid_zone: Default::default(),
+                    plastic_zone: None,
                 },
             ],
             sections: vec![Section {
@@ -990,6 +999,7 @@ mod tests {
                 end_cond: [EndCondition::Fixed, EndCondition::Fixed],
                 force_regime: ForceRegime::Auto,
                 rigid_zone: Default::default(),
+                plastic_zone: None,
             }],
             sections: vec![Section {
                 id: SectionId(0),
@@ -1095,6 +1105,7 @@ mod tests {
                 end_cond: [EndCondition::Fixed, EndCondition::Fixed],
                 force_regime: ForceRegime::Auto,
                 rigid_zone: Default::default(),
+                plastic_zone: None,
             }],
             sections: vec![Section {
                 id: SectionId(0),
@@ -1214,6 +1225,7 @@ mod tests {
                     end_cond: [EndCondition::Fixed, EndCondition::Fixed],
                     force_regime: ForceRegime::Auto,
                     rigid_zone: Default::default(),
+                    plastic_zone: None,
                 });
                 eid += 1;
             }

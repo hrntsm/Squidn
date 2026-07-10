@@ -12,11 +12,24 @@ pub enum SpringModel {
     TwoComponent,
 }
 
+/// 端バネの N-M 相関パラメータ（2バネ連成の線形相関）。
+/// 現在軸力 N に応じて回転バネの降伏モーメントを
+/// M_lim = my0 · (1 − |N|/n_allow) で更新する（下限 0.02·my0）。
+#[derive(Clone, Copy, Debug)]
+pub struct MnInteraction {
+    /// N=0 での降伏モーメント My0 [N·mm]
+    pub my0: f64,
+    /// 軸許容耐力 [N]（正値。引張・圧縮共通）
+    pub n_allow: f64,
+}
+
 pub struct ConcentratedSpringBeam {
     pub elastic: crate::beam::BeamElement,
     pub spring_i: Box<dyn UniaxialMaterial>,
     pub spring_j: Box<dyn UniaxialMaterial>,
     pub model: SpringModel,
+    /// N-M 相関（None = 従来どおり降伏モーメント一定）
+    pub mn: Option<MnInteraction>,
     rot_i: f64,
     rot_j: f64,
     trial_rot_i: f64,
@@ -35,6 +48,7 @@ impl ConcentratedSpringBeam {
             spring_i,
             spring_j,
             model,
+            mn: None,
             rot_i: 0.0,
             rot_j: 0.0,
             trial_rot_i: 0.0,
@@ -48,6 +62,40 @@ impl ConcentratedSpringBeam {
         spring_j: Box<dyn UniaxialMaterial>,
     ) -> Self {
         Self::new(elastic, spring_i, spring_j, SpringModel::OneComponent)
+    }
+
+    /// N-M 相関を有効化する（ビルダー）。
+    pub fn with_mn_interaction(mut self, my0: f64, n_allow: f64) -> Self {
+        self.mn = Some(MnInteraction {
+            my0,
+            n_allow: n_allow.max(1.0),
+        });
+        self
+    }
+
+    /// 現在の軸力 [N]（引張正）。確定変位（＋任意の増分）から
+    /// 弾性部の軸ひずみを取り出して評価する。
+    fn current_axial_force(&self, du_local: Option<&[f64; 12]>) -> f64 {
+        let ul = self
+            .elastic
+            .axis
+            .rotate_to_local(&self.elastic.committed_disp);
+        let mut d = ul[6] - ul[0];
+        if let Some(du) = du_local {
+            d += du[6] - du[0];
+        }
+        self.elastic.e * self.elastic.a / self.elastic.length.max(1.0) * d
+    }
+
+    /// N-M 相関が有効なら、現在軸力に応じて両端バネの降伏モーメントを更新する。
+    fn apply_mn_interaction(&mut self, du_local: Option<&[f64; 12]>) {
+        let Some(mn) = self.mn else {
+            return;
+        };
+        let n = self.current_axial_force(du_local);
+        let m_lim = (mn.my0 * (1.0 - n.abs() / mn.n_allow)).max(0.02 * mn.my0);
+        self.spring_i.set_yield(m_lim);
+        self.spring_j.set_yield(m_lim);
     }
 }
 
@@ -223,6 +271,8 @@ impl ElementBehavior for ConcentratedSpringBeam {
         // elastic.committed_disp 側はグローバル系で蓄積（internal_force と整合）。
         let du_global: [f64; 12] = std::array::from_fn(|i| du.data[i]);
         let du_local = self.elastic.axis.rotate_to_local(&du_global);
+        // N-M 相関: バネの trial より先に現在軸力で降伏モーメントを更新する
+        self.apply_mn_interaction(Some(&du_local));
         if commit {
             self.elastic.update_state(du, true, _ctx);
             self.rot_i += du_local[4];
@@ -386,6 +436,13 @@ mod tests {
         let spring_i = Box::new(Bilinear::new(1.0e12, 1.0e7, 0.01));
         let spring_j = Box::new(Bilinear::new(1.0e12, 1.0e7, 0.01));
         ConcentratedSpringBeam::new_one_component(elastic, spring_i, spring_j)
+    }
+
+    /// Box<dyn UniaxialMaterial> から Bilinear の降伏値を読み出す（テスト用）。
+    fn spring_fy(spring: &dyn UniaxialMaterial) -> f64 {
+        let mut b = Bilinear::new(1.0, 1.0, 0.0);
+        b.deserialize_state(&spring.serialize_state());
+        b.fy
     }
 
     #[test]
@@ -644,5 +701,98 @@ mod tests {
         assert_relative_eq!(before.2, after.2, epsilon = 1e-12);
         assert_relative_eq!(before.3, after.3, epsilon = 1e-12);
         assert_relative_eq!(before.4, after.4, epsilon = 1e-12);
+    }
+    #[test]
+    fn test_mn_interaction_reduces_spring_yield() {
+        // 軸力 |N| = 0.5·n_allow で降伏モーメントが my0 の半分に更新される
+        let my0 = 1.0e7;
+        let elastic = make_test_beam(); // E=205000, A=80000, L=3000 → EA/L=5.4667e6
+        let ea_over_l = 205000.0 * 80000.0 / 3000.0;
+        let n_allow = ea_over_l; // 軸変位 0.5mm で |N|/n_allow = 0.5 になるよう設定
+        let spring_i = Box::new(Bilinear::new(1.0e12, my0, 0.01));
+        let spring_j = Box::new(Bilinear::new(1.0e12, my0, 0.01));
+        let mut elem = ConcentratedSpringBeam::new_one_component(elastic, spring_i, spring_j)
+            .with_mn_interaction(my0, n_allow);
+
+        let ctx = Ctx {
+            model: &squid_n_core::model::Model::default(),
+        };
+        // j端に軸方向（ローカルx=グローバルx）圧縮変位 0.5mm
+        let du = LocalVec {
+            data: smallvec::smallvec![0.0, 0.0, 0.0, 0.0, 0.0, 0.0, -0.5, 0.0, 0.0, 0.0, 0.0, 0.0],
+        };
+        elem.update_state(&du, false, &ctx);
+        assert_relative_eq!(spring_fy(&*elem.spring_i), 0.5 * my0, max_relative = 1e-9);
+        assert_relative_eq!(spring_fy(&*elem.spring_j), 0.5 * my0, max_relative = 1e-9);
+
+        // 引張でも同じ低減（|N| 基準）。trial は非累積（rot と同様に committed 基準）
+        let du_t = LocalVec {
+            data: smallvec::smallvec![0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.5, 0.0, 0.0, 0.0, 0.0, 0.0],
+        };
+        elem.update_state(&du_t, false, &ctx);
+        assert_relative_eq!(spring_fy(&*elem.spring_i), 0.5 * my0, max_relative = 1e-9);
+    }
+
+    #[test]
+    fn test_mn_interaction_disabled_keeps_yield() {
+        // mn 未設定なら軸力がかかっても降伏モーメントは変わらない
+        let my0 = 1.0e7;
+        let elastic = make_test_beam();
+        let spring_i = Box::new(Bilinear::new(1.0e12, my0, 0.01));
+        let spring_j = Box::new(Bilinear::new(1.0e12, my0, 0.01));
+        let mut elem = ConcentratedSpringBeam::new_one_component(elastic, spring_i, spring_j);
+        let ctx = Ctx {
+            model: &squid_n_core::model::Model::default(),
+        };
+        let du = LocalVec {
+            data: smallvec::smallvec![0.0, 0.0, 0.0, 0.0, 0.0, 0.0, -0.5, 0.0, 0.0, 0.0, 0.0, 0.0],
+        };
+        elem.update_state(&du, false, &ctx);
+        assert_relative_eq!(spring_fy(&*elem.spring_i), my0, max_relative = 1e-12);
+    }
+
+    #[test]
+    fn test_mn_interaction_floor_at_high_axial() {
+        // |N| が n_allow を超えても降伏モーメントは 0.02·my0 で下げ止まる
+        let my0 = 1.0e7;
+        let elastic = make_test_beam();
+        let ea_over_l = 205000.0 * 80000.0 / 3000.0;
+        let spring_i = Box::new(Bilinear::new(1.0e12, my0, 0.01));
+        let spring_j = Box::new(Bilinear::new(1.0e12, my0, 0.01));
+        let mut elem = ConcentratedSpringBeam::new_one_component(elastic, spring_i, spring_j)
+            .with_mn_interaction(my0, ea_over_l);
+        let ctx = Ctx {
+            model: &squid_n_core::model::Model::default(),
+        };
+        let du = LocalVec {
+            data: smallvec::smallvec![0.0, 0.0, 0.0, 0.0, 0.0, 0.0, -3.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+        };
+        elem.update_state(&du, false, &ctx);
+        assert_relative_eq!(spring_fy(&*elem.spring_i), 0.02 * my0, max_relative = 1e-9);
+    }
+
+    #[test]
+    fn test_mn_interaction_yield_moment_in_response() {
+        // 降伏後のバネモーメント上限が M_lim に低減されることを応答で確認:
+        // 軸圧縮 0.5mm（M_lim = 0.5·my0）の状態で大回転を与えると、
+        // バネの trial モーメントは ≈ M_lim で頭打ちになる
+        let my0 = 1.0e7;
+        let elastic = make_test_beam();
+        let ea_over_l = 205000.0 * 80000.0 / 3000.0;
+        let spring_i = Box::new(Bilinear::new(1.0e12, my0, 0.0));
+        let spring_j = Box::new(Bilinear::new(1.0e12, my0, 0.0));
+        let mut elem = ConcentratedSpringBeam::new_one_component(elastic, spring_i, spring_j)
+            .with_mn_interaction(my0, ea_over_l);
+        let ctx = Ctx {
+            model: &squid_n_core::model::Model::default(),
+        };
+        // 軸圧縮 + i端大回転を同時に与える
+        let du = LocalVec {
+            data: smallvec::smallvec![0.0, 0.0, 0.0, 0.0, 0.1, 0.0, -0.5, 0.0, 0.0, 0.0, 0.0, 0.0],
+        };
+        elem.update_state(&du, false, &ctx);
+        // バネ i の trial 応力（モーメント）は M_lim = 0.5·my0 で飽和
+        let (m, _) = elem.spring_i.clone_box().trial(0.1);
+        assert_relative_eq!(m, 0.5 * my0, max_relative = 1e-6);
     }
 }

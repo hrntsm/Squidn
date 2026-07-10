@@ -20,6 +20,10 @@ pub trait UniaxialMaterial: Send + Sync + Debug {
     fn serialize_state(&self) -> Vec<u8>;
     /// チェックポイント用: バイト列から材料状態を復元
     fn deserialize_state(&mut self, data: &[u8]);
+    /// 降伏値（応力またはモーメント）を外部から更新するフック。
+    /// N-M 相関により降伏面の大きさを解析中に変える要素（材端集中バネ等）が
+    /// 用いる。対応しない材料は何もしない（既定実装）。
+    fn set_yield(&mut self, _fy: f64) {}
 }
 
 // ──────────────────────────── バイリニア鋼材 ────────────────────────────
@@ -73,6 +77,11 @@ impl Bilinear {
 }
 
 impl UniaxialMaterial for Bilinear {
+    fn set_yield(&mut self, fy: f64) {
+        // kinematic hardening の背応力・塑性ひずみは維持したまま降伏面半径のみ更新
+        self.fy = fy.max(1e-9);
+    }
+
     fn trial(&mut self, strain: f64) -> (f64, f64) {
         let ep = self.committed.plastic_strain;
         let hp = self.hp();

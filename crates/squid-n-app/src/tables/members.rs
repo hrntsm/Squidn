@@ -94,6 +94,7 @@ pub fn members_table(ui: &mut egui::Ui, app: &mut App) {
                     end_cond: [EndCondition::Fixed, EndCondition::Fixed],
                     force_regime: ForceRegime::Auto,
                     rigid_zone: Default::default(),
+                    plastic_zone: None,
                 };
                 app.undo.run(&mut app.model, Box::new(AddMember { elem }));
                 app.staleness.mark_edited();
