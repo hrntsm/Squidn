@@ -1340,10 +1340,18 @@ fn compute_design_check_job(model: &Model, load_case: Option<u32>) -> Result<Job
             mid_moment_z: m_at(0.5),
         };
 
-        let checker: Box<dyn squid_n_design_jp::DesignCheck> = if is_steel(&mat.name) {
-            Box::new(squid_n_design_jp::SteelDesign)
-        } else {
-            Box::new(squid_n_design_jp::RcDesign)
+        // 検定器の選択: 複合断面（SRC/CFT）は形状優先、それ以外は材料名で鋼/RC
+        // （app.rs の run_design_check と同じ規則）。
+        let checker: Box<dyn squid_n_design_jp::DesignCheck> = match sec.shape {
+            Some(squid_n_core::section_shape::SectionShape::SrcRect { .. }) => {
+                Box::new(squid_n_design_jp::SrcDesign)
+            }
+            Some(squid_n_core::section_shape::SectionShape::CftBox { .. })
+            | Some(squid_n_core::section_shape::SectionShape::CftPipe { .. }) => {
+                Box::new(squid_n_design_jp::CftDesign)
+            }
+            _ if is_steel(&mat.name) => Box::new(squid_n_design_jp::SteelDesign),
+            _ => Box::new(squid_n_design_jp::RcDesign),
         };
         for (pos, forces) in &mf.at {
             // [N, Qy, Qz, Mx, My, Mz] -> MemberForcesAt（N は引張正の部材内力）

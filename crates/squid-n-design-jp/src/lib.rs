@@ -7,6 +7,7 @@
 pub mod joint;
 pub mod joint_wiring;
 pub mod rc;
+pub mod src_cft;
 pub mod steel;
 
 // 容量スペクトル法（限界耐力計算）は P12 のスコープ。P7 とは別フェーズなので p12 で分離。
@@ -24,6 +25,7 @@ pub mod panel_shear;
 pub mod rc_capacity;
 
 pub use rc::RcDesign;
+pub use src_cft::{CftDesign, SrcDesign};
 pub use steel::{steel_f_value, steel_f_value_prefix, SteelDesign};
 
 use squid_n_core::model::{Material, Section};

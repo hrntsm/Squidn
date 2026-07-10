@@ -1321,10 +1321,17 @@ impl App {
                 mid_moment_z: m_at(0.5),
             };
 
-            let checker: Box<dyn DesignCheck> = if is_steel(&mat.name) {
-                Box::new(SteelDesign)
-            } else {
-                Box::new(RcDesign)
+            // 検定器の選択: 複合断面（SRC/CFT）は形状優先、それ以外は材料名で鋼/RC。
+            let checker: Box<dyn DesignCheck> = match sec.shape {
+                Some(squid_n_core::section_shape::SectionShape::SrcRect { .. }) => {
+                    Box::new(squid_n_design_jp::SrcDesign)
+                }
+                Some(squid_n_core::section_shape::SectionShape::CftBox { .. })
+                | Some(squid_n_core::section_shape::SectionShape::CftPipe { .. }) => {
+                    Box::new(squid_n_design_jp::CftDesign)
+                }
+                _ if is_steel(&mat.name) => Box::new(SteelDesign),
+                _ => Box::new(RcDesign),
             };
 
             for (pos, forces) in &mf.at {

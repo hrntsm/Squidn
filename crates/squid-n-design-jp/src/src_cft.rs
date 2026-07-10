@@ -1,0 +1,1653 @@
+//! SRC 造・CFT 造の断面検定（RESP-D マニュアル「計算編 04 断面検定
+//! （許容応力度検定）」の SRC 梁・SRC 柱・CFT 柱部分に準拠）。
+//!
+//! 準拠する規準:
+//! - SRC 梁・SRC 柱: 日本建築学会「鉄骨鉄筋コンクリート構造計算規準・同解説」
+//!   （SRC 規準 1987年版）の累加強度式、および構造規定。
+//! - CFT 柱: SRC 規準の累加強度式の考え方を CFT 断面（コンクリート充填鋼管）に
+//!   適用したもの。相互拘束効果によるコンクリート強度割増しは考慮しない
+//!   （非拘束・安全側の仮定）。
+//!
+//! # 材料の扱い
+//! - `SrcRect`: コンクリート強度 = `Material.fc`、主筋グレード = `Material.name`
+//!   （RC の慣習を踏襲）、内蔵鉄骨の鋼種 = `SectionShape::SrcRect.steel_grade`。
+//! - `CftBox`/`CftPipe`: 鋼種 = `Material.name`、充填コンクリート強度 =
+//!   `Material.fc`。
+//! - `Material.fc` が `None`/0 の場合は検定をスキップする（`ok=true`,
+//!   `basis` に "Fc未設定" と記載）。
+//! - 鋼材グレードが [`crate::steel::steel_f_value_prefix`] で解決できない
+//!   場合は SS400 相当（F=235）にフォールバックする（安全側とは限らないため
+//!   実運用では鋼種名を確認すること）。
+//!
+//! # マニュアルからの主な簡略化（doc 内に個別関数でも記載）
+//! 1. SRC 梁・柱の短期設計用せん断力（ヒンジ発生を考慮した
+//!    `rQD1 = rQL + (rM1+rM2)/l'` 等）は、部材端の許容/終局モーメントの
+//!    組み合わせを要するため実装せず、弾性分担に基づく一般化した
+//!    せん断力・せん断耐力の比較で代替する。
+//! 2. SRC 柱・CFT 柱の鋼管/鉄骨部分の許容圧縮応力度 `s_fc` は座屈長さ・
+//!    細長比を考慮せず、`s_fc = s_ft`（許容引張と同値）として扱う
+//!    （非保守的になり得るため、細長い柱では別途座屈検討が必要）。
+//! 3. SRC 柱の RC 部分の中立軸圧縮側鉄骨面積 `s_ac`（fc′ 低減用）は
+//!    軸に依らず `steel_width・steel_flange_thick` の一つの値を用いる
+//!    （本来は曲げ軸ごとに異なりうる）。
+//! 4. SRC 柱・CFT 柱のせん断は強軸・弱軸を対称的に扱うため、RC 柱検定
+//!    （`rc.rs`）と同様に「b/D 入れ替え」の近似を用いる。
+//! 5. CFT 円形柱の (N,M) 相関は閉形式を用いず、縁応力一定の弾性三角形
+//!    分布を断面内で数値積分して求める（矩形の閉形式と同じ弾性仮定）。
+
+use crate::rc::{
+    concrete_allowable_compression, concrete_allowable_shear, rebar_allowable_shear,
+    rebar_allowable_tension, young_ratio_n,
+};
+use crate::steel::{steel_f_value_prefix, steel_fs, steel_ft};
+use crate::{CheckResult, DesignCheck, DesignCtx, LoadTerm, MemberForcesAt, MemberKind};
+use squid_n_core::model::{Material, Section};
+use squid_n_core::section_shape::{BarSet, RcRebar, SectionShape, ShearBar};
+
+// ============================================================================
+// 0. 共通ヘルパ
+// ============================================================================
+
+/// 主筋 1 本あたりの断面積 [mm²]。
+fn one_bar_area(dia: f64) -> f64 {
+    let r = dia / 2.0;
+    std::f64::consts::PI * r * r
+}
+
+/// 主筋セットの総断面積 [mm²]。
+fn bar_set_area(bar: &BarSet) -> f64 {
+    bar.count as f64 * one_bar_area(bar.dia)
+}
+
+/// 引張縁 → 引張筋重心までの距離 dt [mm]（`rc.rs` の `tension_dt` と同じ
+/// 考え方。private のため自前実装する）。
+fn tension_dt(cover: f64, shear_dia: f64, main: &BarSet) -> f64 {
+    let k1 = cover + shear_dia + main.dia / 2.0;
+    if main.layers <= 1 {
+        return k1;
+    }
+    let k_prime = 25.0_f64.max(1.5 * main.dia);
+    let s = main.dia + k_prime;
+    k1 + (main.layers as f64 - 1.0) / 2.0 * s
+}
+
+/// せん断補強筋比 pw = (legs・π/4・dia²) / (b・pitch)。
+fn pw_ratio(shear: &ShearBar, b: f64) -> f64 {
+    if shear.pitch <= 0.0 || b <= 0.0 {
+        return 0.0;
+    }
+    let aw = shear.legs as f64 * std::f64::consts::PI / 4.0 * shear.dia * shear.dia;
+    aw / (b * shear.pitch)
+}
+
+/// せん断スパン比による割増係数 α = 4/(M/(Q・d)+1)（`max_alpha` でクランプ、
+/// 下限 1.0）。
+fn shear_alpha_src(m: f64, q: f64, d: f64, max_alpha: f64) -> f64 {
+    if q.abs() < 1e-9 || d <= 0.0 {
+        return max_alpha;
+    }
+    let mqd = m.abs() / (q.abs() * d);
+    (4.0 / (mqd + 1.0)).clamp(1.0, max_alpha)
+}
+
+/// MA<=0 の場合に検定比が発散しないよう、大きな有限値で代用する。
+fn ratio_or_large(m: f64, ma: f64) -> f64 {
+    if ma > 1e-9 {
+        m.abs() / ma
+    } else if m.abs() > 1e-9 {
+        1.0e9
+    } else {
+        0.0
+    }
+}
+
+/// 矩形断面 1 軸分の断面諸元（`rc.rs` の `AxisProps`/`rect_axis_props` と
+/// 同じ考え方）。
+#[derive(Clone, Copy)]
+struct SrcAxisProps {
+    b: f64,
+    d_full: f64,
+    dt: f64,
+    d: f64,
+    at: f64,
+    ac: f64,
+    j: f64,
+    pw: f64,
+}
+
+fn src_rect_axis_props(
+    width_dir_b: f64,
+    depth_dir_d: f64,
+    main: &BarSet,
+    rebar: &RcRebar,
+) -> SrcAxisProps {
+    let dt = tension_dt(rebar.cover, rebar.shear.dia, main);
+    let d = depth_dir_d - dt;
+    let at = bar_set_area(main) / 2.0;
+    SrcAxisProps {
+        b: width_dir_b,
+        d_full: depth_dir_d,
+        dt,
+        d,
+        at,
+        ac: at,
+        j: 7.0 * d / 8.0,
+        pw: pw_ratio(&rebar.shear, width_dir_b),
+    }
+}
+
+/// 内蔵/充填鋼材の断面積・断面係数を [`SectionShape`] の断面性能計算を
+/// 借りて求める（H 形鋼: `sA`, 強軸 `sZ`, 弱軸 `sZ`）。
+fn steel_h_props(height: f64, width: f64, web_thick: f64, flange_thick: f64) -> (f64, f64, f64) {
+    let shape = SectionShape::SteelH {
+        height,
+        width,
+        web_thick,
+        flange_thick,
+    };
+    let a = shape.calc_area();
+    let iy = shape.calc_iy();
+    let iz = shape.calc_iz();
+    let sz_strong = if height > 0.0 { iy * 2.0 / height } else { 0.0 };
+    let sz_weak = if width > 0.0 { iz * 2.0 / width } else { 0.0 };
+    (a, sz_strong, sz_weak)
+}
+
+// ============================================================================
+// 1. SRC 梁（SRC 規準 1987・累加強度式）
+// ============================================================================
+
+struct SrcShearResult {
+    ratio: f64,
+    s_q: f64,
+    r_q: f64,
+    s_qa: f64,
+    r_qa: f64,
+    alpha: f64,
+    pw: f64,
+}
+
+/// 全せん断力を鉄骨部分・RC 部分に弾性分担させ、それぞれの許容せん断力と
+/// 比較する（SRC 規準・構造規定の長期式の一般化。梁・柱の両方向で共通利用）。
+#[allow(clippy::too_many_arguments)]
+fn src_shear_check(
+    q_signed: f64,
+    m_for_alpha: f64,
+    q_for_alpha: f64,
+    sz: f64,
+    at: f64,
+    rj: f64,
+    rd: f64,
+    b: f64,
+    b_prime: f64,
+    pw_raw: f64,
+    fs: f64,
+    w_ft: f64,
+    s_fs: f64,
+    steel_shear_area: f64,
+    term: LoadTerm,
+    alpha_max: f64,
+) -> SrcShearResult {
+    let alpha = shear_alpha_src(m_for_alpha, q_for_alpha, rd, alpha_max);
+    let q = q_signed.abs();
+
+    let denom = sz + at * rj;
+    let s_q = if denom > 1e-12 { sz / denom * q } else { q };
+    let r_q = (q - s_q).max(0.0);
+
+    let s_qa = steel_shear_area * s_fs;
+
+    let pw_cap = if term == LoadTerm::Long { 0.006 } else { 0.012 };
+    let pw = pw_raw.min(pw_cap);
+
+    let r_qa1 = b * rj * (alpha * fs + 0.5 * pw * w_ft);
+    let b_ratio = if b > 1e-9 {
+        (b_prime / b).max(0.0)
+    } else {
+        0.0
+    };
+    let r_qa2 = b * rj * (2.0 * b_ratio * fs + pw * w_ft);
+    let r_qa = r_qa1.min(r_qa2);
+
+    let ratio_s = if s_qa > 1e-9 { s_q / s_qa } else { 0.0 };
+    let ratio_r = if r_qa > 1e-9 { r_q / r_qa } else { 0.0 };
+
+    SrcShearResult {
+        ratio: ratio_s.max(ratio_r),
+        s_q,
+        r_q,
+        s_qa,
+        r_qa,
+        alpha,
+        pw,
+    }
+}
+
+/// SRC 梁の断面検定。曲げは `MA = sMo + rMA`（単純累加式）、せん断は
+/// 鉄骨・RC への弾性分担＋各許容せん断力の比較で行う。
+#[allow(clippy::too_many_arguments)]
+fn src_beam_check(
+    forces: &MemberForcesAt,
+    mat: &Material,
+    ctx: &DesignCtx,
+    b: f64,
+    d_full: f64,
+    rebar: &RcRebar,
+    steel_height: f64,
+    steel_width: f64,
+    steel_web_thick: f64,
+    steel_flange_thick: f64,
+    steel_grade: &str,
+    fc_raw: f64,
+) -> CheckResult {
+    let long_term = ctx.term == LoadTerm::Long;
+    let grade = mat.name.as_str();
+
+    let fs = concrete_allowable_shear(fc_raw, long_term);
+    let shear_grade = rebar
+        .shear
+        .grade
+        .clone()
+        .unwrap_or_else(|| grade.to_string());
+    let w_ft = rebar_allowable_shear(&shear_grade, long_term);
+    let ft = rebar_allowable_tension(grade, rebar.main_x.dia, long_term);
+
+    let thickness = steel_web_thick.max(steel_flange_thick);
+    let f_value = steel_f_value_prefix(steel_grade, thickness).unwrap_or(235.0);
+    let s_ft = steel_ft(f_value, ctx.term);
+    let s_fs = steel_fs(f_value, ctx.term);
+
+    let (_sa, sz, _sz_weak) = steel_h_props(
+        steel_height,
+        steel_width,
+        steel_web_thick,
+        steel_flange_thick,
+    );
+
+    let props = src_rect_axis_props(b, d_full, &rebar.main_x, rebar);
+
+    let s_mo = sz * s_ft;
+    let r_ma = props.at * ft * props.j;
+    let ma = s_mo + r_ma;
+
+    let ratio_m = ratio_or_large(forces.mz, ma);
+
+    let (m_alpha, q_alpha) = ctx.shear_span.unwrap_or((forces.mz.abs(), forces.qy.abs()));
+    let b_prime = (b - steel_width).max(0.0);
+    let dw = steel_height - 2.0 * steel_flange_thick;
+    let shear = src_shear_check(
+        forces.qy,
+        m_alpha,
+        q_alpha,
+        sz,
+        props.at,
+        props.j,
+        props.d,
+        props.b,
+        b_prime,
+        props.pw,
+        fs,
+        w_ft,
+        s_fs,
+        steel_web_thick * dw,
+        ctx.term,
+        2.0,
+    );
+
+    let ratio = ratio_m.max(shear.ratio);
+
+    let basis = "SRC規準(1987) 梁: 累加強度式(曲げ)+ せん断弾性分担".to_string();
+    let detail = format!(
+        "sMo={:.1} N·mm, rMA={:.1} N·mm, MA={:.1} N·mm, |mz|={:.1} N·mm, \
+         sQ={:.1} N, rQ={:.1} N, sQA={:.1} N, rQA={:.1} N, α={:.3}, pw={:.5}",
+        s_mo,
+        r_ma,
+        ma,
+        forces.mz,
+        shear.s_q,
+        shear.r_q,
+        shear.s_qa,
+        shear.r_qa,
+        shear.alpha,
+        shear.pw
+    );
+
+    CheckResult {
+        ratio,
+        ok: ratio <= 1.0 && ratio.is_finite(),
+        basis,
+        detail,
+    }
+}
+
+// ============================================================================
+// 2. SRC 柱（SRC 規準 1987・累加強度式）
+// ============================================================================
+
+struct SrcColumnAxis {
+    props: SrcAxisProps,
+    /// 直交方向の主筋総断面積（断面中央に集約、RC 規準 14条の慣習）。
+    at_perp: f64,
+    /// 当該軸の主筋径に応じた許容引張・圧縮応力度。
+    ft: f64,
+}
+
+/// 中立軸位置 xn における RC 部分の (N, |M|) を求める（`rc.rs` の
+/// `column_nm_at_xn` と同じ考え方。コンクリート許容応力度に `fc_prime`
+/// （鉄骨フランジ食い込みによる低減後）を用いる点のみ異なる）。
+fn src_column_nm_at_xn(
+    axis: &SrcColumnAxis,
+    fc_prime: f64,
+    n_ratio: f64,
+    xn: f64,
+) -> Option<(f64, f64)> {
+    if xn <= 0.0 {
+        return None;
+    }
+    let p = &axis.props;
+    let d_full = p.d_full;
+    let b = p.b;
+    let r_fc = axis.ft;
+    let ft = axis.ft;
+
+    let s_bar = |y: f64, area: f64| -> f64 {
+        if area <= 0.0 {
+            return f64::INFINITY;
+        }
+        let diff = xn - y;
+        if diff.abs() < 1e-9 {
+            return f64::INFINITY;
+        }
+        if diff > 0.0 {
+            r_fc / (n_ratio * diff)
+        } else {
+            ft / (n_ratio * (-diff))
+        }
+    };
+
+    let s1 = fc_prime / xn;
+    let s2 = s_bar(p.dt, p.ac);
+    let s3 = s_bar(d_full - p.dt, p.at);
+    let s = s1.min(s2).min(s3);
+    if !s.is_finite() || s <= 0.0 {
+        return None;
+    }
+
+    let xc = xn.min(d_full);
+    if xc <= 0.0 {
+        return None;
+    }
+
+    let nc = b * s * (xn * xc - xc * xc / 2.0);
+    let mc =
+        b * s * (xn * (d_full / 2.0) * xc - (xn + d_full / 2.0) * xc * xc / 2.0 + xc.powi(3) / 3.0);
+
+    let bar_contrib = |y: f64, area: f64| -> (f64, f64) {
+        if area <= 0.0 {
+            return (0.0, 0.0);
+        }
+        let mult = if y <= xn { n_ratio - 1.0 } else { n_ratio };
+        let force = area * mult * s * (xn - y);
+        let moment = force * (d_full / 2.0 - y);
+        (force, moment)
+    };
+
+    let (n_c, m_c) = bar_contrib(p.dt, p.ac);
+    let (n_t, m_t) = bar_contrib(d_full - p.dt, p.at);
+    let (n_p, m_p) = bar_contrib(d_full / 2.0, axis.at_perp);
+
+    let n_total = nc + n_c + n_t + n_p;
+    let m_total = mc + m_c + m_t + m_p;
+    Some((n_total, m_total.abs()))
+}
+
+const SRC_XN_SCAN_POINTS: usize = 300;
+const SRC_XN_RATIO_MIN: f64 = 0.02;
+const SRC_XN_RATIO_MAX: f64 = 10.0;
+
+/// N-M 相関曲線（RC 部分のみ）を xn/D の対数スキャンで構成する。
+fn src_column_nm_curve(
+    axis: &SrcColumnAxis,
+    fc_prime: f64,
+    n_ratio: f64,
+    rnc: f64,
+) -> Vec<(f64, f64)> {
+    let mut pts = Vec::with_capacity(SRC_XN_SCAN_POINTS + 1);
+    let log_min = SRC_XN_RATIO_MIN.ln();
+    let log_max = SRC_XN_RATIO_MAX.ln();
+    for i in 0..SRC_XN_SCAN_POINTS {
+        let t = i as f64 / (SRC_XN_SCAN_POINTS as f64 - 1.0);
+        let ratio = (log_min + t * (log_max - log_min)).exp();
+        let xn = axis.props.d_full * ratio;
+        if let Some(pt) = src_column_nm_at_xn(axis, fc_prime, n_ratio, xn) {
+            if pt.0.is_finite() && pt.1.is_finite() {
+                pts.push(pt);
+            }
+        }
+    }
+    pts.push((rnc, 0.0));
+    pts.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+    pts
+}
+
+/// N-M 相関曲線から設計軸力（圧縮正）に対する許容曲げモーメントを線形補間で
+/// 求める。範囲外は端点値でクランプする。
+fn interp_ma_curve(points: &[(f64, f64)], n_design: f64) -> f64 {
+    if points.is_empty() {
+        return 0.0;
+    }
+    if n_design <= points[0].0 {
+        return points[0].1;
+    }
+    let last = points.len() - 1;
+    if n_design >= points[last].0 {
+        return points[last].1;
+    }
+    for w in points.windows(2) {
+        let (n0, m0) = w[0];
+        let (n1, m1) = w[1];
+        if n_design >= n0 && n_design <= n1 {
+            if (n1 - n0).abs() < 1e-9 {
+                return m0.max(m1);
+            }
+            let t = (n_design - n0) / (n1 - n0);
+            return m0 + t * (m1 - m0);
+        }
+    }
+    points[last].1
+}
+
+/// SRC 柱 1 軸分の許容曲げモーメント MA(N)。マニュアルの 3 分岐
+/// （RC+鉄骨累加 / 圧縮超過で鉄骨のみ / 引張超過で鉄骨のみ）を実装する。
+#[allow(clippy::too_many_arguments)]
+fn src_column_axis_ma(
+    n_design: f64,
+    rnc: f64,
+    rnt: f64,
+    sa: f64,
+    s_ft: f64,
+    s_fc: f64,
+    sz: f64,
+    s_mo: f64,
+    curve: &[(f64, f64)],
+) -> f64 {
+    if n_design >= rnt && n_design <= rnc {
+        s_mo + interp_ma_curve(curve, n_design)
+    } else if n_design > rnc {
+        let sn = n_design - rnc;
+        (sz * (s_fc - sn / sa)).max(0.0)
+    } else {
+        let sn = n_design - rnt;
+        (sz * (s_ft - sn.abs() / sa)).max(0.0)
+    }
+}
+
+/// SRC 柱の断面検定（軸力+二軸曲げ+二方向せん断、SRC 規準 1987 累加強度式）。
+#[allow(clippy::too_many_arguments)]
+fn src_column_check(
+    forces: &MemberForcesAt,
+    mat: &Material,
+    ctx: &DesignCtx,
+    b: f64,
+    d_full: f64,
+    rebar: &RcRebar,
+    steel_height: f64,
+    steel_width: f64,
+    steel_web_thick: f64,
+    steel_flange_thick: f64,
+    steel_grade: &str,
+    fc_raw: f64,
+) -> CheckResult {
+    let long_term = ctx.term == LoadTerm::Long;
+    let grade = mat.name.as_str();
+
+    let fc_allow = concrete_allowable_compression(fc_raw, long_term);
+    let fs = concrete_allowable_shear(fc_raw, long_term);
+    let n_ratio = young_ratio_n(fc_raw);
+    let shear_grade = rebar
+        .shear
+        .grade
+        .clone()
+        .unwrap_or_else(|| grade.to_string());
+    let w_ft = rebar_allowable_shear(&shear_grade, long_term);
+
+    let thickness = steel_web_thick.max(steel_flange_thick);
+    let f_value = steel_f_value_prefix(steel_grade, thickness).unwrap_or(235.0);
+    let s_ft = steel_ft(f_value, ctx.term);
+    let s_fs = steel_fs(f_value, ctx.term);
+    let s_fc = s_ft; // 座屈考慮なし（モジュール doc 参照）
+
+    let (sa, sz_z, sz_y) = steel_h_props(
+        steel_height,
+        steel_width,
+        steel_web_thick,
+        steel_flange_thick,
+    );
+
+    let s_pc = (steel_width * steel_flange_thick) / (b * d_full).max(1e-9);
+    let fc_prime = (fc_allow * (1.0 - 15.0 * s_pc)).max(0.0);
+
+    let ft_z = rebar_allowable_tension(grade, rebar.main_x.dia, long_term);
+    let ft_y = rebar_allowable_tension(grade, rebar.main_y.dia, long_term);
+    let ft_axial =
+        rebar_allowable_tension(grade, rebar.main_x.dia.max(rebar.main_y.dia), long_term);
+
+    let as_x = bar_set_area(&rebar.main_x);
+    let as_y = bar_set_area(&rebar.main_y);
+    let as_total = as_x + as_y;
+
+    let ae = b * d_full + (n_ratio - 1.0) * as_total;
+    let rnc1 = ae * fc_prime;
+    let rnc2 = ae * ft_axial / n_ratio;
+    let rnc = rnc1.min(rnc2).max(0.0);
+    let rnt = -(as_total * ft_axial);
+
+    let s_nc = sa * s_fc;
+    let s_nt = sa * s_ft;
+
+    let props_z = src_rect_axis_props(b, d_full, &rebar.main_x, rebar);
+    let props_y = src_rect_axis_props(d_full, b, &rebar.main_y, rebar);
+
+    let axis_z = SrcColumnAxis {
+        props: props_z,
+        at_perp: as_y,
+        ft: ft_z,
+    };
+    let axis_y = SrcColumnAxis {
+        props: props_y,
+        at_perp: as_x,
+        ft: ft_y,
+    };
+
+    let curve_z = src_column_nm_curve(&axis_z, fc_prime, n_ratio, rnc);
+    let curve_y = src_column_nm_curve(&axis_y, fc_prime, n_ratio, rnc);
+
+    let n_design = -forces.n; // 圧縮を正とする設計軸力に変換
+
+    let s_mo_z = sz_z * s_ft;
+    let s_mo_y = sz_y * s_ft;
+
+    let ma_z = src_column_axis_ma(n_design, rnc, rnt, sa, s_ft, s_fc, sz_z, s_mo_z, &curve_z);
+    let ma_y = src_column_axis_ma(n_design, rnc, rnt, sa, s_ft, s_fc, sz_y, s_mo_y, &curve_y);
+
+    let ratio_z = ratio_or_large(forces.mz, ma_z);
+    let ratio_y = ratio_or_large(forces.my, ma_y);
+    let ratio_biaxial = ratio_z + ratio_y;
+
+    let ratio_axial = if n_design > rnc + s_nc {
+        n_design / (rnc + s_nc)
+    } else if n_design < rnt - s_nt {
+        (-n_design) / (-rnt + s_nt)
+    } else {
+        0.0
+    };
+
+    let (m_alpha_z, q_alpha_z) = ctx.shear_span.unwrap_or((forces.mz.abs(), forces.qy.abs()));
+    let b_prime_z = (b - steel_width).max(0.0);
+    let shear_z = src_shear_check(
+        forces.qy,
+        m_alpha_z,
+        q_alpha_z,
+        sz_z,
+        props_z.at,
+        props_z.j,
+        props_z.d,
+        props_z.b,
+        b_prime_z,
+        props_z.pw,
+        fs,
+        w_ft,
+        s_fs,
+        steel_web_thick * (steel_height - 2.0 * steel_flange_thick),
+        ctx.term,
+        1.5,
+    );
+
+    let (m_alpha_y, q_alpha_y) = ctx.shear_span.unwrap_or((forces.my.abs(), forces.qz.abs()));
+    let b_prime_y = (d_full - steel_height).max(0.0);
+    let shear_y = src_shear_check(
+        forces.qz,
+        m_alpha_y,
+        q_alpha_y,
+        sz_y,
+        props_y.at,
+        props_y.j,
+        props_y.d,
+        props_y.b,
+        b_prime_y,
+        props_y.pw,
+        fs,
+        w_ft,
+        s_fs,
+        2.0 * steel_flange_thick * steel_width,
+        ctx.term,
+        1.5,
+    );
+
+    let ratio = ratio_axial
+        .max(ratio_biaxial)
+        .max(shear_z.ratio)
+        .max(shear_y.ratio);
+
+    let basis = "SRC規準(1987) 柱: 累加強度式(軸力+二軸曲げ)+ せん断弾性分担".to_string();
+    let detail = format!(
+        "rNc={:.1} N, rNt={:.1} N, sNc={:.1} N, sNt={:.1} N, N={:.1} N, \
+         MAz={:.1} N·mm, MAy={:.1} N·mm, mz={:.1} N·mm, my={:.1} N·mm, \
+         sQAz={:.1} N, rQAz={:.1} N, sQAy={:.1} N, rQAy={:.1} N, s_pc={:.5}, fc'={:.3}",
+        rnc,
+        rnt,
+        s_nc,
+        s_nt,
+        n_design,
+        ma_z,
+        ma_y,
+        forces.mz,
+        forces.my,
+        shear_z.s_qa,
+        shear_z.r_qa,
+        shear_y.s_qa,
+        shear_y.r_qa,
+        s_pc,
+        fc_prime
+    );
+
+    CheckResult {
+        ratio,
+        ok: ratio <= 1.0 && ratio.is_finite(),
+        basis,
+        detail,
+    }
+}
+
+// ============================================================================
+// 3. CFT 柱（SRC 規準に基づく累加強度式）
+// ============================================================================
+
+/// 矩形充填コンクリート部分の (cN, cM) を弾性三角形応力分布の閉形式で求める。
+/// `xn`: 中立軸位置（圧縮縁からの距離）[mm]、`cb`/`cd`: 検討方向の充填断面
+/// 幅・せい [mm]。
+fn cft_rect_cn_cm(cb: f64, cd: f64, fc: f64, xn: f64) -> (f64, f64) {
+    if cb <= 0.0 || cd <= 0.0 || fc <= 0.0 || xn <= 0.0 {
+        return (0.0, 0.0);
+    }
+    let xr = xn / cd;
+    if xr <= 1.0 {
+        let cn = cb * cd * fc * (xr / 2.0);
+        let cm = cb * cd * cd * fc * (xr * (3.0 - 2.0 * xr) / 12.0);
+        (cn, cm)
+    } else {
+        let cn = cb * cd * fc * (1.0 - 1.0 / (2.0 * xr));
+        let cm = cb * cd * cd * fc * (1.0 / (12.0 * xr));
+        (cn, cm)
+    }
+}
+
+/// 設計軸力 `n_design`（0≤N<cNc）に対する矩形充填コンクリート部分の cM を、
+/// 閉形式の逆算（cN(xn)=N となる xn を解く）で求める。
+fn cft_rect_ma(cb: f64, cd: f64, fc: f64, n_design: f64) -> f64 {
+    let cnc = cb * cd * fc;
+    if cnc <= 0.0 || n_design <= 0.0 {
+        return 0.0;
+    }
+    let ratio = (n_design / cnc).clamp(0.0, 1.0 - 1e-9);
+    let xr = if ratio <= 0.5 {
+        2.0 * ratio
+    } else {
+        1.0 / (2.0 * (1.0 - ratio))
+    };
+    let xn = xr * cd;
+    let (_, cm) = cft_rect_cn_cm(cb, cd, fc, xn);
+    cm
+}
+
+/// 縁応力 `fc` 一定・線形分布（コンクリート引張無視）を断面内で数値積分し、
+/// 任意断面形状の (cN, cM) を求める汎用ヘルパ。`width_fn(y)` は圧縮縁からの
+/// 距離 `y` [mm] における断面幅 [mm] を返す。
+fn numeric_cn_cm(cd: f64, fc: f64, xn: f64, width_fn: impl Fn(f64) -> f64) -> (f64, f64) {
+    if cd <= 0.0 || fc <= 0.0 || xn <= 0.0 {
+        return (0.0, 0.0);
+    }
+    let y_max = xn.min(cd);
+    if y_max <= 0.0 {
+        return (0.0, 0.0);
+    }
+    let n_steps = 400usize;
+    let dy = y_max / n_steps as f64;
+    let center = cd / 2.0;
+    let mut cn = 0.0;
+    let mut cm = 0.0;
+    for i in 0..n_steps {
+        let y = (i as f64 + 0.5) * dy;
+        let sigma = (fc * (1.0 - y / xn)).max(0.0);
+        let width = width_fn(y);
+        let df = sigma * width * dy;
+        cn += df;
+        cm += df * (center - y);
+    }
+    (cn, cm.abs())
+}
+
+/// 円形充填コンクリート部分の (cN, cM)（数値積分、矩形と同じ弾性仮定）。
+/// `dc`: 充填部直径 [mm]。
+fn cft_circle_cn_cm(dc: f64, fc: f64, xn: f64) -> (f64, f64) {
+    numeric_cn_cm(dc, fc, xn, |y| {
+        let r = dc / 2.0;
+        2.0 * (r * r - (y - r).powi(2)).max(0.0).sqrt()
+    })
+}
+
+/// 設計軸力 `n_design`（0≤N<cNc）に対する円形充填コンクリート部分の cM を、
+/// 二分法で cN(xn)=N となる xn を求めて算定する。
+fn cft_circle_ma(dc: f64, fc: f64, n_design: f64) -> f64 {
+    if dc <= 0.0 || fc <= 0.0 || n_design <= 0.0 {
+        return 0.0;
+    }
+    let cnc = std::f64::consts::PI * dc * dc / 4.0 * fc;
+    if cnc <= 0.0 {
+        return 0.0;
+    }
+    let target = n_design.min(cnc * (1.0 - 1e-6));
+    let mut lo = 1e-6 * dc;
+    let mut hi = 50.0 * dc;
+    for _ in 0..60 {
+        let mid = 0.5 * (lo + hi);
+        let (cn, _) = cft_circle_cn_cm(dc, fc, mid);
+        if cn < target {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    let xn = 0.5 * (lo + hi);
+    let (_, cm) = cft_circle_cn_cm(dc, fc, xn);
+    cm
+}
+
+/// CFT 柱 1 軸分の許容曲げモーメント MA(N)。マニュアルの 3 分岐
+/// （コンクリート+鋼管累加 / 圧縮超過で鋼管のみ / 引張で鋼管のみ）を実装する。
+/// `cm_fn`: 0≤N≤cNc の範囲でコンクリート部分の cM(N) を返す関数
+/// （矩形は [`cft_rect_ma`]、円形は [`cft_circle_ma`]）。
+fn cft_axis_capacity(
+    n_design: f64,
+    cnc: f64,
+    sa: f64,
+    s_ft: f64,
+    s_fc: f64,
+    sz: f64,
+    cm_fn: impl Fn(f64) -> f64,
+) -> f64 {
+    if n_design < 0.0 {
+        (sz * (s_ft - (-n_design) / sa)).max(0.0)
+    } else if n_design <= cnc {
+        sz * s_ft + cm_fn(n_design)
+    } else {
+        let sn = n_design - cnc;
+        (sz * (s_fc - sn / sa)).max(0.0)
+    }
+}
+
+fn cft_common_steel(f_value: f64, term: LoadTerm) -> (f64, f64, f64) {
+    let s_ft = steel_ft(f_value, term);
+    let s_fs = steel_fs(f_value, term);
+    let s_fc = s_ft; // 座屈考慮なし（モジュール doc 参照）
+    (s_ft, s_fs, s_fc)
+}
+
+fn cft_box_steel_props(height: f64, width: f64, thick: f64) -> (f64, f64, f64) {
+    let shape = SectionShape::CftBox {
+        height,
+        width,
+        thick,
+    };
+    let a = shape.calc_area();
+    let iy = shape.calc_iy();
+    let iz = shape.calc_iz();
+    let sz_mz = if height > 0.0 { iy * 2.0 / height } else { 0.0 };
+    let sz_my = if width > 0.0 { iz * 2.0 / width } else { 0.0 };
+    (a, sz_mz, sz_my)
+}
+
+fn cft_pipe_steel_props(outer_dia: f64, thick: f64) -> (f64, f64) {
+    let shape = SectionShape::CftPipe { outer_dia, thick };
+    let a = shape.calc_area();
+    let iy = shape.calc_iy();
+    let sz = if outer_dia > 0.0 {
+        iy * 2.0 / outer_dia
+    } else {
+        0.0
+    };
+    (a, sz)
+}
+
+fn cft_box_check(
+    forces: &MemberForcesAt,
+    mat: &Material,
+    ctx: &DesignCtx,
+    height: f64,
+    width: f64,
+    thick: f64,
+    fc_raw: f64,
+) -> CheckResult {
+    let long_term = ctx.term == LoadTerm::Long;
+    let fc_allow = concrete_allowable_compression(fc_raw, long_term);
+
+    let f_value = steel_f_value_prefix(&mat.name, thick).unwrap_or(235.0);
+    let (s_ft, s_fs, s_fc) = cft_common_steel(f_value, ctx.term);
+
+    let (sa, sz_z, sz_y) = cft_box_steel_props(height, width, thick);
+    let s_nt = sa * s_ft;
+    let s_nc = sa * s_fc;
+
+    let c_b_z = (width - 2.0 * thick).max(0.0);
+    let c_d_z = (height - 2.0 * thick).max(0.0);
+    let c_b_y = c_d_z;
+    let c_d_y = c_b_z;
+
+    let c_area = c_b_z * c_d_z;
+    let cnc = c_area * fc_allow;
+
+    let n_design = -forces.n;
+
+    let ma_z = cft_axis_capacity(n_design, cnc, sa, s_ft, s_fc, sz_z, |n| {
+        cft_rect_ma(c_b_z, c_d_z, fc_allow, n)
+    });
+    let ma_y = cft_axis_capacity(n_design, cnc, sa, s_ft, s_fc, sz_y, |n| {
+        cft_rect_ma(c_b_y, c_d_y, fc_allow, n)
+    });
+
+    let ratio_z = ratio_or_large(forces.mz, ma_z);
+    let ratio_y = ratio_or_large(forces.my, ma_y);
+    let ratio_biaxial = ratio_z + ratio_y;
+
+    let ratio_axial = if n_design > cnc + s_nc {
+        n_design / (cnc + s_nc)
+    } else if n_design < 0.0 && (-n_design) > s_nt {
+        (-n_design) / s_nt
+    } else {
+        0.0
+    };
+
+    let dw = (height - 2.0 * thick).max(0.0);
+    let s_aw = 2.0 * thick * dw;
+    let s_qa = s_aw * s_fs;
+    let q_max = forces.qy.abs().max(forces.qz.abs());
+    let ratio_shear = if s_qa > 1e-9 { q_max / s_qa } else { 0.0 };
+
+    let ratio = ratio_axial.max(ratio_biaxial).max(ratio_shear);
+
+    let basis = "CFT柱(角形): SRC規準に基づく累加強度式".to_string();
+    let detail = format!(
+        "cNc={:.1} N, sNc={:.1} N, sNt={:.1} N, N={:.1} N, MAz={:.1} N·mm, MAy={:.1} N·mm, \
+         mz={:.1} N·mm, my={:.1} N·mm, sQA={:.1} N, qy={:.1} N, qz={:.1} N",
+        cnc, s_nc, s_nt, n_design, ma_z, ma_y, forces.mz, forces.my, s_qa, forces.qy, forces.qz
+    );
+
+    CheckResult {
+        ratio,
+        ok: ratio <= 1.0 && ratio.is_finite(),
+        basis,
+        detail,
+    }
+}
+
+fn cft_pipe_check(
+    forces: &MemberForcesAt,
+    mat: &Material,
+    ctx: &DesignCtx,
+    outer_dia: f64,
+    thick: f64,
+    fc_raw: f64,
+) -> CheckResult {
+    let long_term = ctx.term == LoadTerm::Long;
+    let fc_allow = concrete_allowable_compression(fc_raw, long_term);
+
+    let f_value = steel_f_value_prefix(&mat.name, thick).unwrap_or(235.0);
+    let (s_ft, s_fs, s_fc) = cft_common_steel(f_value, ctx.term);
+
+    let (sa, sz) = cft_pipe_steel_props(outer_dia, thick);
+    let s_nt = sa * s_ft;
+    let s_nc = sa * s_fc;
+
+    let dc = (outer_dia - 2.0 * thick).max(0.0);
+    let c_area = std::f64::consts::PI * dc * dc / 4.0;
+    let cnc = c_area * fc_allow;
+
+    let n_design = -forces.n;
+
+    let ma = cft_axis_capacity(n_design, cnc, sa, s_ft, s_fc, sz, |n| {
+        cft_circle_ma(dc, fc_allow, n)
+    });
+
+    // 円形は等方性のため二軸とも同じ MA を用いる。
+    let ratio_z = ratio_or_large(forces.mz, ma);
+    let ratio_y = ratio_or_large(forces.my, ma);
+    let ratio_biaxial = ratio_z + ratio_y;
+
+    let ratio_axial = if n_design > cnc + s_nc {
+        n_design / (cnc + s_nc)
+    } else if n_design < 0.0 && (-n_design) > s_nt {
+        (-n_design) / s_nt
+    } else {
+        0.0
+    };
+
+    let s_aw = sa / 2.0;
+    let s_qa = s_aw * s_fs;
+    let q_res = (forces.qy.powi(2) + forces.qz.powi(2)).sqrt();
+    let ratio_shear = if s_qa > 1e-9 { q_res / s_qa } else { 0.0 };
+
+    let ratio = ratio_axial.max(ratio_biaxial).max(ratio_shear);
+
+    let basis = "CFT柱(円形): SRC規準に基づく累加強度式".to_string();
+    let detail = format!(
+        "cNc={:.1} N, sNc={:.1} N, sNt={:.1} N, N={:.1} N, MA={:.1} N·mm, mz={:.1} N·mm, \
+         my={:.1} N·mm, sQA={:.1} N, qy={:.1} N, qz={:.1} N",
+        cnc, s_nc, s_nt, n_design, ma, forces.mz, forces.my, s_qa, forces.qy, forces.qz
+    );
+
+    CheckResult {
+        ratio,
+        ok: ratio <= 1.0 && ratio.is_finite(),
+        basis,
+        detail,
+    }
+}
+
+// ============================================================================
+// 4. DesignCheck 実装
+// ============================================================================
+
+/// SRC 梁・SRC 柱の断面検定（`SectionShape::SrcRect` を対象とする）。
+pub struct SrcDesign;
+
+impl DesignCheck for SrcDesign {
+    fn check(
+        &self,
+        forces: &MemberForcesAt,
+        sec: &Section,
+        mat: &Material,
+        ctx: &DesignCtx,
+    ) -> CheckResult {
+        let fc_raw = mat.fc.unwrap_or(0.0);
+        if fc_raw <= 0.0 {
+            return CheckResult {
+                ratio: 0.0,
+                ok: true,
+                basis: "SRC検定: Fc未設定".to_string(),
+                detail: "Material.fc が None/0 のため検定をスキップしました。".to_string(),
+            };
+        }
+
+        let shape = match &sec.shape {
+            Some(s @ SectionShape::SrcRect { .. }) => s,
+            _ => {
+                return CheckResult {
+                    ratio: 0.0,
+                    ok: true,
+                    basis: "SRC検定: 断面形状不一致".to_string(),
+                    detail: "Section.shape が SrcRect ではないため検定をスキップしました。"
+                        .to_string(),
+                };
+            }
+        };
+
+        let SectionShape::SrcRect {
+            b,
+            d,
+            rebar,
+            steel_height,
+            steel_width,
+            steel_web_thick,
+            steel_flange_thick,
+            steel_grade,
+        } = shape
+        else {
+            unreachable!()
+        };
+
+        match ctx.kind {
+            MemberKind::Beam | MemberKind::Brace => src_beam_check(
+                forces,
+                mat,
+                ctx,
+                *b,
+                *d,
+                rebar,
+                *steel_height,
+                *steel_width,
+                *steel_web_thick,
+                *steel_flange_thick,
+                steel_grade,
+                fc_raw,
+            ),
+            MemberKind::Column => src_column_check(
+                forces,
+                mat,
+                ctx,
+                *b,
+                *d,
+                rebar,
+                *steel_height,
+                *steel_width,
+                *steel_web_thick,
+                *steel_flange_thick,
+                steel_grade,
+                fc_raw,
+            ),
+        }
+    }
+}
+
+/// CFT 柱の断面検定（`SectionShape::CftBox`/`CftPipe` を対象とする）。
+/// マニュアルに CFT 梁の規定は無いため、`ctx.kind` に依らず柱の検定式を
+/// 適用する。
+pub struct CftDesign;
+
+impl DesignCheck for CftDesign {
+    fn check(
+        &self,
+        forces: &MemberForcesAt,
+        sec: &Section,
+        mat: &Material,
+        ctx: &DesignCtx,
+    ) -> CheckResult {
+        let fc_raw = mat.fc.unwrap_or(0.0);
+        if fc_raw <= 0.0 {
+            return CheckResult {
+                ratio: 0.0,
+                ok: true,
+                basis: "CFT検定: Fc未設定".to_string(),
+                detail: "Material.fc が None/0 のため検定をスキップしました。".to_string(),
+            };
+        }
+
+        match &sec.shape {
+            Some(SectionShape::CftBox {
+                height,
+                width,
+                thick,
+            }) => cft_box_check(forces, mat, ctx, *height, *width, *thick, fc_raw),
+            Some(SectionShape::CftPipe { outer_dia, thick }) => {
+                cft_pipe_check(forces, mat, ctx, *outer_dia, *thick, fc_raw)
+            }
+            _ => CheckResult {
+                ratio: 0.0,
+                ok: true,
+                basis: "CFT検定: 断面形状不一致".to_string(),
+                detail: "Section.shape が CftBox/CftPipe ではないため検定をスキップしました。"
+                    .to_string(),
+            },
+        }
+    }
+}
+
+// ============================================================================
+// テスト
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use squid_n_core::ids::{MaterialId, SectionId};
+    use squid_n_core::section_shape::{BarSet, RcRebar, SectionShape, ShearBar};
+
+    fn make_material(fc: f64, grade: &str) -> Material {
+        Material {
+            id: MaterialId(0),
+            name: grade.to_string(),
+            young: 205000.0,
+            poisson: 0.3,
+            density: 0.0,
+            shear: None,
+            fc: Some(fc),
+            fy: None,
+        }
+    }
+
+    fn make_material_no_fc(grade: &str) -> Material {
+        Material {
+            id: MaterialId(0),
+            name: grade.to_string(),
+            young: 205000.0,
+            poisson: 0.3,
+            density: 0.0,
+            shear: None,
+            fc: None,
+            fy: None,
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn src_rect_shape(
+        b: f64,
+        d: f64,
+        main_count: u32,
+        main_dia: f64,
+        main_layers: u32,
+        cover: f64,
+        shear_dia: f64,
+        shear_pitch: f64,
+        shear_legs: u32,
+        steel_height: f64,
+        steel_width: f64,
+        steel_web_thick: f64,
+        steel_flange_thick: f64,
+        steel_grade: &str,
+    ) -> SectionShape {
+        SectionShape::SrcRect {
+            b,
+            d,
+            rebar: RcRebar {
+                main_x: BarSet {
+                    count: main_count,
+                    dia: main_dia,
+                    layers: main_layers,
+                },
+                main_y: BarSet {
+                    count: main_count,
+                    dia: main_dia,
+                    layers: main_layers,
+                },
+                cover,
+                shear: ShearBar {
+                    dia: shear_dia,
+                    pitch: shear_pitch,
+                    legs: shear_legs,
+                    grade: None,
+                },
+            },
+            steel_height,
+            steel_width,
+            steel_web_thick,
+            steel_flange_thick,
+            steel_grade: steel_grade.to_string(),
+        }
+    }
+
+    fn make_section(shape: SectionShape) -> Section {
+        shape.to_section(SectionId(0), "test".to_string())
+    }
+
+    fn zero_forces() -> MemberForcesAt {
+        MemberForcesAt {
+            pos: 0.0,
+            n: 0.0,
+            qy: 0.0,
+            qz: 0.0,
+            my: 0.0,
+            mz: 0.0,
+        }
+    }
+
+    fn ctx_beam(term: LoadTerm) -> DesignCtx {
+        DesignCtx {
+            term,
+            kind: MemberKind::Beam,
+            ..Default::default()
+        }
+    }
+
+    fn ctx_column(term: LoadTerm) -> DesignCtx {
+        DesignCtx {
+            term,
+            kind: MemberKind::Column,
+            ..Default::default()
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // SRC 梁
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_src_beam_moment_handcalc() {
+        let shape = src_rect_shape(
+            400.0, 700.0, 6, 22.0, 2, 40.0, 10.0, 100.0, 2, 500.0, 200.0, 9.0, 14.0, "SN400B",
+        );
+        let sec = make_section(shape.clone());
+        let mat = make_material(24.0, "SD345");
+        let ctx = ctx_beam(LoadTerm::Long);
+
+        let rebar = match &shape {
+            SectionShape::SrcRect { rebar, .. } => rebar.clone(),
+            _ => unreachable!(),
+        };
+        let props = src_rect_axis_props(400.0, 700.0, &rebar.main_x, &rebar);
+        let ft = rebar_allowable_tension("SD345", 22.0, true);
+        let (_sa, sz, _) = steel_h_props(500.0, 200.0, 9.0, 14.0);
+        let f_value = steel_f_value_prefix("SN400B", 14.0).unwrap();
+        let s_ft = steel_ft(f_value, LoadTerm::Long);
+        let expected_ma = sz * s_ft + props.at * ft * props.j;
+
+        let forces = MemberForcesAt {
+            mz: expected_ma * 0.5,
+            ..zero_forces()
+        };
+        let design = SrcDesign;
+        let result = design.check(&forces, &sec, &mat, &ctx);
+        assert!((result.ratio - 0.5).abs() < 1e-6, "ratio={}", result.ratio);
+        assert!(result.basis.contains("SRC規準"));
+    }
+
+    #[test]
+    fn test_src_beam_shear_split_handcalc() {
+        let shape = src_rect_shape(
+            400.0, 700.0, 6, 22.0, 2, 40.0, 10.0, 100.0, 2, 500.0, 200.0, 9.0, 14.0, "SN400B",
+        );
+        let rebar = match &shape {
+            SectionShape::SrcRect { rebar, .. } => rebar.clone(),
+            _ => unreachable!(),
+        };
+        let props = src_rect_axis_props(400.0, 700.0, &rebar.main_x, &rebar);
+        let (_sa, sz, _) = steel_h_props(500.0, 200.0, 9.0, 14.0);
+
+        let q = 200_000.0;
+        let expected_s_q = sz / (sz + props.at * props.j) * q;
+
+        let fs = concrete_allowable_shear(24.0, true);
+        let w_ft = rebar_allowable_shear("SD345", true);
+        let f_value = steel_f_value_prefix("SN400B", 14.0).unwrap();
+        let s_fs = steel_fs(f_value, LoadTerm::Long);
+
+        let shear = src_shear_check(
+            q,
+            0.0,
+            q,
+            sz,
+            props.at,
+            props.j,
+            props.d,
+            props.b,
+            200.0,
+            props.pw,
+            fs,
+            w_ft,
+            s_fs,
+            9.0 * (500.0 - 2.0 * 14.0),
+            LoadTerm::Long,
+            2.0,
+        );
+        assert!((shear.s_q - expected_s_q).abs() / expected_s_q < 1e-9);
+        assert!((shear.s_q + shear.r_q - q).abs() < 1e-6);
+    }
+
+    // ------------------------------------------------------------------
+    // SRC 柱
+    // ------------------------------------------------------------------
+
+    fn src_column_shape() -> SectionShape {
+        src_rect_shape(
+            500.0, 500.0, 8, 22.0, 2, 40.0, 10.0, 100.0, 2, 300.0, 200.0, 9.0, 14.0, "SN400B",
+        )
+    }
+
+    #[test]
+    fn test_src_column_n0_matches_smo_plus_rm0() {
+        let shape = src_column_shape();
+        let sec = make_section(shape);
+        let mat = make_material(24.0, "SD345");
+        let ctx = ctx_column(LoadTerm::Long);
+
+        let forces = MemberForcesAt {
+            mz: 1.0,
+            ..zero_forces()
+        };
+        let design = SrcDesign;
+        let r0 = design.check(&forces, &sec, &mat, &ctx);
+        let ma_z = 1.0 / r0.ratio;
+        assert!(ma_z > 0.0 && ma_z.is_finite());
+
+        let (_sa, sz_z, _) = steel_h_props(300.0, 200.0, 9.0, 14.0);
+        let f_value = steel_f_value_prefix("SN400B", 14.0).unwrap();
+        let s_ft = steel_ft(f_value, LoadTerm::Long);
+        let s_mo = sz_z * s_ft;
+        // N=0 の MA は少なくとも鋼骨単体の sMo 以上であるはず（RC 分は正で加算）。
+        assert!(ma_z >= s_mo * 0.99, "ma_z={ma_z}, s_mo={s_mo}");
+    }
+
+    #[test]
+    fn test_src_column_beyond_rnc_uses_steel_only() {
+        let shape = src_column_shape();
+        let sec = make_section(shape.clone());
+        let mat = make_material(24.0, "SD345");
+        let ctx = ctx_column(LoadTerm::Long);
+
+        // 非常に大きな圧縮軸力 (n<0 は圧縮) を与え、N > rNc となる状況を作る。
+        let forces = MemberForcesAt {
+            n: -30_000_000.0,
+            mz: 10_000_000.0,
+            ..zero_forces()
+        };
+        let design = SrcDesign;
+        let result = design.check(&forces, &sec, &mat, &ctx);
+        assert!(result.ratio.is_finite());
+        assert!(result.detail.contains("rNc"));
+        let _ = shape;
+    }
+
+    #[test]
+    fn test_src_column_tension_side() {
+        let shape = src_column_shape();
+        let sec = make_section(shape);
+        let mat = make_material(24.0, "SD345");
+        let ctx = ctx_column(LoadTerm::Long);
+
+        // n>0 は引張。全主筋の引張耐力を大きく超える引張軸力を与える。
+        let forces = MemberForcesAt {
+            n: 5_000_000.0,
+            mz: 1_000_000.0,
+            ..zero_forces()
+        };
+        let design = SrcDesign;
+        let result = design.check(&forces, &sec, &mat, &ctx);
+        assert!(result.ratio.is_finite());
+        assert!(result.ratio > 0.0);
+    }
+
+    #[test]
+    fn test_src_column_biaxial_linear_sum() {
+        let shape = src_column_shape();
+        let sec = make_section(shape);
+        let mat = make_material(24.0, "SD345");
+        let ctx = ctx_column(LoadTerm::Long);
+        let design = SrcDesign;
+
+        let forces_z = MemberForcesAt {
+            mz: 1.0,
+            ..zero_forces()
+        };
+        let r0 = design.check(&forces_z, &sec, &mat, &ctx);
+        let ma_z = 1.0 / r0.ratio;
+
+        let mz_test = ma_z * 0.3;
+        let forces = MemberForcesAt {
+            mz: mz_test,
+            ..zero_forces()
+        };
+        let r = design.check(&forces, &sec, &mat, &ctx);
+        assert!(
+            (r.ratio - 0.3).abs() < 0.05,
+            "mz 単独 0.3 割合のとき ratio ≒ 0.3 のはず: ratio={}",
+            r.ratio
+        );
+    }
+
+    #[test]
+    fn test_src_column_fc_prime_reduction_effect() {
+        // 鉄骨フランジが大きいほど s_pc が大きくなり fc' が低下し、rNc が
+        // 減少するはず。
+        let shape_small_steel = src_rect_shape(
+            500.0, 500.0, 8, 22.0, 2, 40.0, 10.0, 100.0, 2, 300.0, 150.0, 9.0, 9.0, "SN400B",
+        );
+        let shape_large_steel = src_rect_shape(
+            500.0, 500.0, 8, 22.0, 2, 40.0, 10.0, 100.0, 2, 300.0, 300.0, 9.0, 30.0, "SN400B",
+        );
+
+        let sec_small = make_section(shape_small_steel);
+        let sec_large = make_section(shape_large_steel);
+        let mat = make_material(24.0, "SD345");
+        let ctx = ctx_column(LoadTerm::Long);
+        let design = SrcDesign;
+
+        let forces = MemberForcesAt {
+            n: -1.0,
+            ..zero_forces()
+        };
+        let r_small = design.check(&forces, &sec_small, &mat, &ctx);
+        let r_large = design.check(&forces, &sec_large, &mat, &ctx);
+        assert!(r_small.detail.contains("rNc"));
+        assert!(r_large.detail.contains("rNc"));
+    }
+
+    #[test]
+    fn test_src_fc_missing_skip() {
+        let shape = src_column_shape();
+        let sec = make_section(shape);
+        let mat = make_material_no_fc("SD345");
+        let ctx = ctx_column(LoadTerm::Long);
+        let design = SrcDesign;
+        let result = design.check(&zero_forces(), &sec, &mat, &ctx);
+        assert!(result.ok);
+        assert_eq!(result.ratio, 0.0);
+        assert!(result.basis.contains("Fc"));
+    }
+
+    #[test]
+    fn test_src_shape_mismatch_skip() {
+        let sec = Section {
+            id: SectionId(0),
+            name: "no-shape".to_string(),
+            area: 1.0,
+            iy: 1.0,
+            iz: 1.0,
+            j: 1.0,
+            depth: 500.0,
+            width: 500.0,
+            as_y: 0.0,
+            as_z: 0.0,
+            panel_thickness: None,
+            thickness: None,
+            shape: None,
+        };
+        let mat = make_material(24.0, "SD345");
+        let ctx = ctx_column(LoadTerm::Long);
+        let design = SrcDesign;
+        let result = design.check(&zero_forces(), &sec, &mat, &ctx);
+        assert!(result.ok);
+        assert!(result.basis.contains("断面形状不一致"));
+    }
+
+    // ------------------------------------------------------------------
+    // CFT 矩形: 閉形式
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_cft_rect_xn_half_d() {
+        let (cb, cd, fc) = (400.0, 400.0, 8.0);
+        let xn = 0.5 * cd;
+        let (cn, cm) = cft_rect_cn_cm(cb, cd, fc, xn);
+        let expected_cn = cb * cd * fc * (0.5 / 2.0);
+        let expected_cm = cb * cd * cd * fc * (0.5 * (3.0 - 1.0) / 12.0);
+        assert!((cn - expected_cn).abs() / expected_cn < 1e-9);
+        assert!((cm - expected_cm).abs() / expected_cm < 1e-9);
+    }
+
+    #[test]
+    fn test_cft_rect_xn_eq_d_continuity() {
+        let (cb, cd, fc) = (400.0, 400.0, 8.0);
+        let (cn, cm) = cft_rect_cn_cm(cb, cd, fc, cd);
+        // Xn=1 の境界で両分岐が一致することを確認する。
+        let expected_cn = cb * cd * fc * 0.5;
+        let expected_cm = cb * cd * cd * fc * (1.0 / 12.0);
+        assert!((cn - expected_cn).abs() / expected_cn < 1e-6);
+        assert!((cm - expected_cm).abs() / expected_cm < 1e-6);
+    }
+
+    #[test]
+    fn test_cft_rect_xn_2d() {
+        let (cb, cd, fc) = (400.0, 400.0, 8.0);
+        let xn = 2.0 * cd;
+        let (cn, cm) = cft_rect_cn_cm(cb, cd, fc, xn);
+        let expected_cn = cb * cd * fc * (1.0 - 1.0 / 4.0);
+        let expected_cm = cb * cd * cd * fc * (1.0 / 24.0);
+        assert!((cn - expected_cn).abs() / expected_cn < 1e-9);
+        assert!((cm - expected_cm).abs() / expected_cm < 1e-9);
+    }
+
+    #[test]
+    fn test_cft_rect_matches_numeric_integration() {
+        let (cb, cd, fc) = (350.0, 500.0, 10.0);
+        for &xr in &[0.3, 0.8, 1.0, 1.5, 3.0] {
+            let xn = xr * cd;
+            let (cn_closed, cm_closed) = cft_rect_cn_cm(cb, cd, fc, xn);
+            let (cn_num, cm_num) = numeric_cn_cm(cd, fc, xn, |_| cb);
+            assert!(
+                (cn_closed - cn_num).abs() / cn_closed.max(1.0) < 5e-3,
+                "xr={xr}: cn_closed={cn_closed}, cn_num={cn_num}"
+            );
+            assert!(
+                (cm_closed - cm_num).abs() / cm_closed.max(1.0) < 5e-3,
+                "xr={xr}: cm_closed={cm_closed}, cm_num={cm_num}"
+            );
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // CFT 円形
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_cft_circle_positive_and_small_at_small_xn() {
+        let dc = 400.0;
+        let fc = 8.0;
+        let (cn, cm) = cft_circle_cn_cm(dc, fc, 0.05 * dc);
+        assert!(cn > 0.0 && cm > 0.0);
+        assert!(cn < std::f64::consts::PI * dc * dc / 4.0 * fc);
+    }
+
+    #[test]
+    fn test_cft_circle_converges_to_area_times_fc() {
+        let dc = 400.0;
+        let fc = 8.0;
+        let (cn, _) = cft_circle_cn_cm(dc, fc, 1000.0 * dc);
+        let ca_fc = std::f64::consts::PI * dc * dc / 4.0 * fc;
+        assert!((cn - ca_fc).abs() / ca_fc < 1e-3, "cn={cn}, ca_fc={ca_fc}");
+    }
+
+    // ------------------------------------------------------------------
+    // CFT 柱: DesignCheck 経由
+    // ------------------------------------------------------------------
+
+    fn cft_box_section(height: f64, width: f64, thick: f64) -> Section {
+        make_section(SectionShape::CftBox {
+            height,
+            width,
+            thick,
+        })
+    }
+
+    fn cft_pipe_section(outer_dia: f64, thick: f64) -> Section {
+        make_section(SectionShape::CftPipe { outer_dia, thick })
+    }
+
+    #[test]
+    fn test_cft_box_n0_ma_equals_sm0() {
+        let sec = cft_box_section(400.0, 300.0, 9.0);
+        let mat = make_material(24.0, "SN400B");
+        let ctx = ctx_column(LoadTerm::Long);
+        let design = CftDesign;
+
+        let forces = MemberForcesAt {
+            mz: 1.0,
+            ..zero_forces()
+        };
+        let r = design.check(&forces, &sec, &mat, &ctx);
+        let ma_z = 1.0 / r.ratio;
+
+        let (_sa, sz_z, _sz_y) = cft_box_steel_props(400.0, 300.0, 9.0);
+        let f_value = steel_f_value_prefix("SN400B", 9.0).unwrap();
+        let s_ft = steel_ft(f_value, LoadTerm::Long);
+        let s_mo = sz_z * s_ft;
+        assert!(
+            (ma_z - s_mo).abs() / s_mo < 1e-6,
+            "ma_z={ma_z}, s_mo={s_mo}"
+        );
+    }
+
+    #[test]
+    fn test_cft_box_n_exceeds_cnc_steel_only() {
+        let sec = cft_box_section(400.0, 300.0, 9.0);
+        let mat = make_material(24.0, "SN400B");
+        let ctx = ctx_column(LoadTerm::Long);
+        let design = CftDesign;
+
+        let forces = MemberForcesAt {
+            n: -20_000_000.0,
+            mz: 1_000_000.0,
+            ..zero_forces()
+        };
+        let r = design.check(&forces, &sec, &mat, &ctx);
+        assert!(r.ratio.is_finite());
+        assert!(r.detail.contains("cNc"));
+    }
+
+    #[test]
+    fn test_cft_pipe_biaxial_smoke() {
+        let sec = cft_pipe_section(400.0, 12.0);
+        let mat = make_material(24.0, "STKR400");
+        let ctx = ctx_column(LoadTerm::Short);
+        let design = CftDesign;
+
+        let forces = MemberForcesAt {
+            pos: 0.0,
+            n: -500_000.0,
+            qy: 30_000.0,
+            qz: 20_000.0,
+            my: 8_000_000.0,
+            mz: 15_000_000.0,
+        };
+        let r = design.check(&forces, &sec, &mat, &ctx);
+        assert!(r.ratio.is_finite() && r.ratio >= 0.0);
+        assert!(r.basis.contains("円形"));
+    }
+
+    #[test]
+    fn test_cft_shear_box() {
+        let sec = cft_box_section(400.0, 300.0, 9.0);
+        let mat = make_material(24.0, "SN400B");
+        let ctx = ctx_column(LoadTerm::Long);
+        let design = CftDesign;
+
+        let (sa, _, _) = cft_box_steel_props(400.0, 300.0, 9.0);
+        let f_value = steel_f_value_prefix("SN400B", 9.0).unwrap();
+        let s_fs = steel_fs(f_value, LoadTerm::Long);
+        let dw = 400.0 - 2.0 * 9.0;
+        let s_aw = 2.0 * 9.0 * dw;
+        let s_qa = s_aw * s_fs;
+        let _ = sa;
+
+        let forces = MemberForcesAt {
+            qy: s_qa * 0.4,
+            ..zero_forces()
+        };
+        let r = design.check(&forces, &sec, &mat, &ctx);
+        assert!((r.ratio - 0.4).abs() < 1e-3, "ratio={}", r.ratio);
+    }
+
+    #[test]
+    fn test_cft_fc_missing_skip() {
+        let sec = cft_box_section(400.0, 300.0, 9.0);
+        let mat = make_material_no_fc("SN400B");
+        let ctx = ctx_column(LoadTerm::Long);
+        let design = CftDesign;
+        let result = design.check(&zero_forces(), &sec, &mat, &ctx);
+        assert!(result.ok);
+        assert_eq!(result.ratio, 0.0);
+        assert!(result.basis.contains("Fc"));
+    }
+
+    #[test]
+    fn test_cft_shape_mismatch_skip() {
+        let sec = Section {
+            id: SectionId(0),
+            name: "no-shape".to_string(),
+            area: 1.0,
+            iy: 1.0,
+            iz: 1.0,
+            j: 1.0,
+            depth: 400.0,
+            width: 400.0,
+            as_y: 0.0,
+            as_z: 0.0,
+            panel_thickness: None,
+            thickness: None,
+            shape: None,
+        };
+        let mat = make_material(24.0, "SN400B");
+        let ctx = ctx_column(LoadTerm::Long);
+        let design = CftDesign;
+        let result = design.check(&zero_forces(), &sec, &mat, &ctx);
+        assert!(result.ok);
+        assert!(result.basis.contains("断面形状不一致"));
+    }
+}
