@@ -528,7 +528,11 @@ impl SectionShape {
                 2.0 * thick * (width - 2.0 * thick).max(0.0),
                 2.0 * thick * (height - 2.0 * thick).max(0.0),
             ),
-            SectionShape::SteelAngle { leg_a, leg_b, thick } => (
+            SectionShape::SteelAngle {
+                leg_a,
+                leg_b,
+                thick,
+            } => (
                 leg_a.max(leg_b),
                 leg_a.min(leg_b),
                 leg_b * thick,
@@ -556,8 +560,7 @@ impl SectionShape {
                 width * flange_thick,
                 h_web_shear_area(height, web_thick),
             ),
-            SectionShape::SteelPipe { outer_dia, .. }
-            | SectionShape::CftPipe { outer_dia, .. } => {
+            SectionShape::SteelPipe { outer_dia, .. } | SectionShape::CftPipe { outer_dia, .. } => {
                 (outer_dia, outer_dia, area / 2.0, area / 2.0)
             }
             SectionShape::RcRect { b, d, .. } => (d, b, b * d / KAPPA_RC, b * d / KAPPA_RC),
@@ -934,8 +937,7 @@ mod tests {
             rebar: rebar.clone(),
         };
         let b: f64 = 500.0;
-        let expected =
-            b.powi(3) * b / 16.0 * (16.0 / 3.0 - 3.36 * (1.0 - 1.0 / 12.0));
+        let expected = b.powi(3) * b / 16.0 * (16.0 / 3.0 - 3.36 * (1.0 - 1.0 / 12.0));
         assert!((sq.calc_j() - expected).abs() / expected < 1e-12);
         // 細長断面 100×2000（旧実装は r≥10 で β=1/3 に切替え約+6.7%乖離していた）
         let slender = SectionShape::RcRect {

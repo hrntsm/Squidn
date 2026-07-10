@@ -3118,34 +3118,53 @@ mod tests {
             });
         }
 
-        let col_shape = SectionShape::SteelH {
-            height: 300.0,
-            width: 300.0,
-            web_thick: 10.0,
-            flange_thick: 15.0,
+        // RC 造ラーメン（S 造は RESP-D 計算編 02 に従い剛域長 0 となるため、
+        // 剛域自動算定の配管検証には RC 断面を用いる）。
+        let rebar = squid_n_core::section_shape::RcRebar {
+            main_x: squid_n_core::section_shape::BarSet {
+                count: 4,
+                dia: 22.0,
+                layers: 1,
+            },
+            main_y: squid_n_core::section_shape::BarSet {
+                count: 4,
+                dia: 22.0,
+                layers: 1,
+            },
+            cover: 40.0,
+            shear: squid_n_core::section_shape::ShearBar {
+                dia: 10.0,
+                pitch: 100.0,
+                legs: 2,
+                grade: None,
+            },
         };
-        let beam_shape = SectionShape::SteelH {
-            height: 400.0,
-            width: 200.0,
-            web_thick: 8.0,
-            flange_thick: 13.0,
+        let col_shape = SectionShape::RcRect {
+            b: 300.0,
+            d: 300.0,
+            rebar: rebar.clone(),
+        };
+        let beam_shape = SectionShape::RcRect {
+            b: 200.0,
+            d: 400.0,
+            rebar,
         };
         model
             .sections
-            .push(col_shape.to_section(SectionId(0), "柱 H-300x300x10x15".into()));
+            .push(col_shape.to_section(SectionId(0), "柱 RC-300x300".into()));
         model
             .sections
-            .push(beam_shape.to_section(SectionId(1), "梁 H-400x200x8x13".into()));
+            .push(beam_shape.to_section(SectionId(1), "梁 RC-200x400".into()));
 
         model.materials.push(Material {
             id: squid_n_core::ids::MaterialId(0),
-            name: "SN400B".into(),
-            young: 205000.0,
-            poisson: 0.3,
-            density: 7.85e-9,
+            name: "FC24".into(),
+            young: 23000.0,
+            poisson: 0.2,
+            density: 2.4e-9,
             shear: None,
-            fc: None,
-            fy: Some(235.0),
+            fc: Some(24.0),
+            fy: None,
         });
 
         let members = [
