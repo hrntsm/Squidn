@@ -1270,6 +1270,9 @@ mod tests {
                 joists: vec![],
                 loads: vec![],
                 method: DistributionMethod::TriTrapezoid,
+                kind: Default::default(),
+                one_way: None,
+                edge_supported: None,
             }],
             slab_thickness: 150.0,
             ..Default::default()
