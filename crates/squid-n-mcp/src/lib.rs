@@ -875,6 +875,13 @@ pub fn query_model(model: &Model, kind: &str, filter: Option<&str>) -> Vec<serde
 /// `spawn_blocking` 内でこの関数を呼ぶことで、CPU バウンドな解析中も `ServerState` の
 /// ミューテックスを他ツール呼び出しのためにブロックしない。
 pub fn analyze_model(model: &Model) -> Result<String, String> {
+    // 解析前に剛域を自動算定してモデルへ反映する（設計書 §6.2.1「剛域」は標準実装）。
+    let mut model = model.clone();
+    squid_n_element::beam::apply_auto_rigid_zones(
+        &mut model,
+        &squid_n_element::beam::RigidZoneRule::default(),
+    );
+    let model = &model;
     let analysis = squid_n_solver::analysis::Analysis::prepare(model)
         .map_err(|e| format!("prepare failed: {e}"))?;
     if let Some(lc) = model.load_cases.first() {
@@ -1028,6 +1035,13 @@ fn resolve_load_case(
 
 /// LinearStatic ジョブの純粋計算部分。
 fn compute_linear_static_job(model: &Model, load_case: Option<u32>) -> Result<JobOutcome, String> {
+    // 解析前に剛域を自動算定してモデルへ反映する（設計書 §6.2.1、標準実装）。
+    let mut model = model.clone();
+    squid_n_element::beam::apply_auto_rigid_zones(
+        &mut model,
+        &squid_n_element::beam::RigidZoneRule::default(),
+    );
+    let model = &model;
     let analysis = squid_n_solver::analysis::Analysis::prepare(model)
         .map_err(|e| format!("prepare failed: {e}"))?;
     let lc = resolve_load_case(model, load_case)?;
@@ -1067,6 +1081,13 @@ fn compute_linear_static_job(model: &Model, load_case: Option<u32>) -> Result<Jo
 
 /// Eigen ジョブの純粋計算部分。
 fn compute_eigen_job(model: &Model, n_modes: usize) -> Result<JobOutcome, String> {
+    // 解析前に剛域を自動算定してモデルへ反映する（設計書 §6.2.1、標準実装）。
+    let mut model = model.clone();
+    squid_n_element::beam::apply_auto_rigid_zones(
+        &mut model,
+        &squid_n_element::beam::RigidZoneRule::default(),
+    );
+    let model = &model;
     let analysis = squid_n_solver::analysis::Analysis::prepare(model)
         .map_err(|e| format!("prepare failed: {e}"))?;
     let modal = analysis
@@ -1097,9 +1118,14 @@ fn compute_pushover_job(
     steps: usize,
     max_disp: f64,
 ) -> Result<JobOutcome, String> {
-    squid_n_solver::analysis::Analysis::prepare(&model)
-        .map_err(|e| format!("解析準備エラー: {e}"))?;
     let mut work = model;
+    // 解析前に剛域を自動算定してモデルへ反映する（設計書 §6.2.1、標準実装）。
+    squid_n_element::beam::apply_auto_rigid_zones(
+        &mut work,
+        &squid_n_element::beam::RigidZoneRule::default(),
+    );
+    squid_n_solver::analysis::Analysis::prepare(&work)
+        .map_err(|e| format!("解析準備エラー: {e}"))?;
     let dofmap = squid_n_core::dof::DofMap::build(&work);
     let reducer = squid_n_solver::constraint::Reducer::build(&work, &dofmap);
     let seismic_dir = match dir {
@@ -1150,6 +1176,13 @@ fn compute_time_history_job(
     period: f64,
     amp: f64,
 ) -> Result<JobOutcome, String> {
+    // 解析前に剛域を自動算定してモデルへ反映する（設計書 §6.2.1、標準実装）。
+    let mut model = model.clone();
+    squid_n_element::beam::apply_auto_rigid_zones(
+        &mut model,
+        &squid_n_element::beam::RigidZoneRule::default(),
+    );
+    let model = &model;
     let analysis = squid_n_solver::analysis::Analysis::prepare(model)
         .map_err(|e| format!("解析準備エラー: {e}"))?;
 
@@ -1220,6 +1253,47 @@ fn is_steel(name: &str) -> bool {
         || upper.starts_with("ST")
 }
 
+/// 部材両端節点間の幾何長 \[mm\]（内法補正なしの簡易値。剛域等は考慮しない）。
+/// squid-n-app の `elem_geometric_length`（app.rs）と同じロジック
+/// （squid-n-mcp は squid-n-app に依存しないため複製している）。
+fn elem_geometric_length(elem: &squid_n_core::model::ElementData, model: &Model) -> f64 {
+    let coords: Vec<[f64; 3]> = elem
+        .nodes
+        .iter()
+        .filter_map(|nid| model.nodes.get(nid.index()))
+        .map(|n| n.coord)
+        .take(2)
+        .collect();
+    let (Some(p0), Some(p1)) = (coords.first(), coords.get(1)) else {
+        return 0.0;
+    };
+    let dx = p1[0] - p0[0];
+    let dy = p1[1] - p0[1];
+    let dz = p1[2] - p0[2];
+    (dx * dx + dy * dy + dz * dz).sqrt()
+}
+
+/// 危険断面位置（§6.2.3、既定は柱フェイスと中央）を正規化座標 \[0,1\] で算定する。
+/// `squid_n_element::beam::BeamElement::new` の `eval_sections` 算定と同じ規則
+/// （xi_i は \[0.0, 0.5) へ、xi_j は (0.5, 1.0\] へクランプ）で face_i/face_j から
+/// 求める。face=0（直交材が無い端）では節点芯（0.0/1.0）と一致する。
+/// squid-n-app の `design_positions`（app.rs）と同じロジック
+/// （squid-n-mcp は squid-n-app に依存しないため複製している）。
+fn design_positions(elem: &squid_n_core::model::ElementData, geom_len: f64) -> [f64; 3] {
+    if geom_len > 1e-12 {
+        let xi_i = (elem.rigid_zone.face_i / geom_len).clamp(0.0, 0.5 - 1e-9);
+        let xi_j = (1.0 - elem.rigid_zone.face_j / geom_len).clamp(0.5 + 1e-9, 1.0);
+        [xi_i, 0.5, xi_j]
+    } else {
+        [0.0, 0.5, 1.0]
+    }
+}
+
+/// `pos` が `positions` のいずれかと 1e-6 以内で一致するか判定する。
+fn is_near_design_position(pos: f64, positions: &[f64; 3]) -> bool {
+    positions.iter().any(|p| (p - pos).abs() < 1e-6)
+}
+
 /// DesignCheck ジョブの純粋計算部分。
 /// 指定/先頭の荷重ケースで線形静的解析を行い、断面力に対して
 /// squid-n-app の `App::run_design_check`（app.rs）と同じ判定
@@ -1227,6 +1301,14 @@ fn is_steel(name: &str) -> bool {
 /// （squid-n-mcp は squid-n-app に依存しないため複製している）。
 /// 検定条件（長期/短期）は既定で長期（`LoadTerm::Long`）とする。
 fn compute_design_check_job(model: &Model, load_case: Option<u32>) -> Result<JobOutcome, String> {
+    // 解析前に剛域を自動算定してモデルへ反映する（設計書 §6.2.1、標準実装）。
+    // face_i/face_j は危険断面位置（§6.2.3）の算定にも使う。
+    let mut model = model.clone();
+    squid_n_element::beam::apply_auto_rigid_zones(
+        &mut model,
+        &squid_n_element::beam::RigidZoneRule::default(),
+    );
+    let model = &model;
     let analysis = squid_n_solver::analysis::Analysis::prepare(model)
         .map_err(|e| format!("prepare failed: {e}"))?;
     let lc = resolve_load_case(model, load_case)?;
@@ -1266,7 +1348,14 @@ fn compute_design_check_job(model: &Model, load_case: Option<u32>) -> Result<Job
         } else {
             Box::new(squid_n_design_jp::RcDesign)
         };
+        // 危険断面位置（§6.2.3、既定は柱フェイスと中央）の内力のみ検定する。
+        // 節点芯は剛域が有る場合は検定対象外（app.rs の run_design_check と同じ規則）。
+        let geom_len = elem_geometric_length(elem, model);
+        let positions = design_positions(elem, geom_len);
         for (pos, forces) in &mf.at {
+            if !is_near_design_position(*pos, &positions) {
+                continue;
+            }
             // [N, Qy, Qz, Mx, My, Mz] -> MemberForcesAt（暫定: 強軸まわりとして
             // Mz[5] と Qy[1] を使用。app.rs の run_design_check と同じ簡略化）。
             let mfa = squid_n_design_jp::MemberForcesAt {

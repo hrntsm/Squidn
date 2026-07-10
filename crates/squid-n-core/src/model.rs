@@ -49,6 +49,12 @@ pub enum ZoneSource {
 
 /// 部材端の剛域（接合部の有限寸法）。可とう長 L' = L − length_i − length_j。
 /// 力学計算は sc-element 側。ここではモデルに保持・永続化するデータ。
+///
+/// **剛域長（length_i/j）とフェイス距離（face_i/j）は別概念**（設計書 §6.2.1）。
+/// - `length_i/j`: 剛性計算に使う剛域長 `λ = D_orth/2 − D_self/4`（低減率 `reduction` を含む）。
+/// - `face_i/j`: 断面算定・危険断面位置（§6.2.3）に使う柱フェース距離 `D_orth/2`。
+///   剛域長のような低減率調整は行わない幾何量であり、節点から接合する直交部材せいの
+///   半分までの距離をそのまま保持する。
 #[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct RigidZone {
     pub length_i: f64,
@@ -56,6 +62,13 @@ pub struct RigidZone {
     pub source_i: ZoneSource,
     pub source_j: ZoneSource,
     pub reduction: f64,
+    /// 柱フェース距離 [mm]（節点→フェース、= 接合する直交部材せい/2）。
+    /// 直交材が無い端は 0。断面算定の既定危険断面位置に用いる（§6.2.3）。
+    #[serde(default)]
+    pub face_i: f64,
+    /// 柱フェース距離 [mm]（j端）。意味は `face_i` と同様。
+    #[serde(default)]
+    pub face_j: f64,
 }
 
 impl Default for RigidZone {
@@ -66,6 +79,8 @@ impl Default for RigidZone {
             source_i: ZoneSource::Auto,
             source_j: ZoneSource::Auto,
             reduction: 1.0,
+            face_i: 0.0,
+            face_j: 0.0,
         }
     }
 }

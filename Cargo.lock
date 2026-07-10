@@ -5448,6 +5448,7 @@ dependencies = [
  "squid-n-core",
  "squid-n-design-jp",
  "squid-n-edit",
+ "squid-n-element",
  "squid-n-io",
  "squid-n-solver",
  "tokio",

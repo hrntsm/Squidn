@@ -222,7 +222,16 @@ fn build_rotational_springs(
         + (n1.coord[1] - n0.coord[1]).powi(2)
         + (n1.coord[2] - n0.coord[2]).powi(2))
     .sqrt();
-    let k_rot = if l > 0.0 { 6.0 * e * iz / l } else { 1.0e12 };
+    // 集中ばねの初期剛性は可とう長 L'（= L − 剛域長。§6.2.1）基準で評価する。
+    // 剛域があるのに節点間長 L で評価すると初期剛性を過小評価するため、
+    // L' ≤ 0（剛域が全長を占める異常値）の場合のみ L にフォールバックする。
+    let l_flex = l - data.rigid_zone.length_i - data.rigid_zone.length_j;
+    let l_eff = if l_flex > 0.0 { l_flex } else { l };
+    let k_rot = if l_eff > 0.0 {
+        6.0 * e * iz / l_eff
+    } else {
+        1.0e12
+    };
 
     let spring_i = Box::new(Bilinear::new(k_rot, my, 0.01));
     let spring_j = Box::new(Bilinear::new(k_rot, my, 0.01));

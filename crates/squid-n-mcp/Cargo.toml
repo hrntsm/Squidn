@@ -10,6 +10,7 @@ mcp = ["dep:rmcp", "dep:tokio"]
 
 [dependencies]
 squid-n-core = { path = "../squid-n-core" }
+squid-n-element = { path = "../squid-n-element" }
 squid-n-solver = { path = "../squid-n-solver" }
 squid-n-io = { path = "../squid-n-io" }
 squid-n-edit = { path = "../squid-n-edit" }

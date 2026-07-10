@@ -570,10 +570,22 @@ impl App {
         }
     }
 
+    /// 解析前に剛域を自動算定してモデルへ反映する（設計書 §6.2.1「剛域」は
+    /// 標準実装。解析前に1回適用する）。`squid_n_element::beam::apply_auto_rigid_zones`
+    /// は `ZoneSource::Auto` の端のみ更新し `Manual` 端を保護するため、
+    /// 各解析エントリの先頭で毎回呼んでも冪等で安全。
+    fn apply_rigid_zones_for_analysis(&mut self) {
+        squid_n_element::beam::apply_auto_rigid_zones(
+            &mut self.model,
+            &squid_n_element::beam::RigidZoneRule::default(),
+        );
+    }
+
     /// T3: 線形静的解析を実行し、結果を `self.results` に格納する。
     /// 指定した荷重ケースが存在しない場合はエラーメッセージをセット。
     pub fn run_linear_static(&mut self, lc: LoadCaseId) {
         self.last_error = None;
+        self.apply_rigid_zones_for_analysis();
         match Analysis::prepare(&self.model) {
             Ok(analysis) => match analysis.linear_static(lc) {
                 Ok(res) => {
@@ -602,6 +614,7 @@ impl App {
             self.last_error = Some(format!("荷重組合せ #{} が存在しません", index));
             return;
         };
+        self.apply_rigid_zones_for_analysis();
         match Analysis::prepare(&self.model) {
             Ok(analysis) => match analysis.linear_combination(&combo) {
                 Ok(res) => {
@@ -662,7 +675,7 @@ impl App {
     /// へフォールバック。false の場合は全層 `design_rank`）。
     #[allow(clippy::type_complexity)]
     pub fn compute_holding_capacity(
-        &self,
+        &mut self,
     ) -> Result<
         (
             squid_n_design_jp::holding_capacity::HoldingCapacityResult,
@@ -679,6 +692,10 @@ impl App {
         };
         use squid_n_design_jp::rc_capacity::{rc_qmu_simple, rc_qsu_simple};
         use squid_n_design_jp::steel_f_value_prefix;
+
+        // rigid_zone（剛域長・face_i/j）を読むため、算定前に自動剛域を反映する
+        // （設計書 §6.2.1、冪等なので他の解析エントリと重複して呼んでも安全）。
+        self.apply_rigid_zones_for_analysis();
 
         if self.model.stories.is_empty() {
             return Err(
@@ -782,12 +799,14 @@ impl App {
                         let Some(SectionShape::RcRect { b, d, rebar }) = sec.shape.as_ref() else {
                             continue;
                         };
-                        // 内法スパン = 幾何長 - 両端剛域長。剛域長の合計が幾何長以上になる
+                        // 内法スパン = 幾何長 − 両端フェイス距離(直交材せい/2)。
+                        // 剛域長(D_orth/2 − D_self/4)を引いた可撓長さとは別物
+                        // （設計書 §6.2.1）。フェイス距離の合計が幾何長以上になる
                         // (不整合な入力)場合は下限0を割り込むため、幾何長のままとする。
                         let geom_len = elem_geometric_length(elem, &self.model);
-                        let rz_len = elem.rigid_zone.length_i + elem.rigid_zone.length_j;
-                        let clear_span = if geom_len - rz_len > 0.0 {
-                            geom_len - rz_len
+                        let face_sum = elem.rigid_zone.face_i + elem.rigid_zone.face_j;
+                        let clear_span = if geom_len - face_sum > 0.0 {
+                            geom_len - face_sum
                         } else {
                             geom_len
                         };
@@ -864,6 +883,7 @@ impl App {
     /// T3: 固有値解析を実行し、結果を `self.results` に格納する。
     pub fn run_eigen(&mut self, n_modes: usize) {
         self.last_error = None;
+        self.apply_rigid_zones_for_analysis();
         match Analysis::prepare(&self.model) {
             Ok(analysis) => match analysis.eigen(n_modes) {
                 Ok(modal) => {
@@ -915,6 +935,7 @@ impl App {
             soil: self.analysis_cfg.soil,
             c0: self.analysis_cfg.c0,
         };
+        self.apply_rigid_zones_for_analysis();
         match Analysis::prepare(&self.model) {
             Ok(analysis) => match analysis.seismic_static_with(cfg) {
                 Ok(res) => {
@@ -943,8 +964,13 @@ impl App {
         model: squid_n_core::model::Model,
         cfg: AnalysisSettings,
     ) -> Result<squid_n_solver::pushover::PushoverResult, String> {
-        Analysis::prepare(&model).map_err(|e| format!("解析準備エラー: {}", e))?;
         let mut work = model;
+        // 解析前に剛域を自動算定（設計書 §6.2.1、標準実装）。
+        squid_n_element::beam::apply_auto_rigid_zones(
+            &mut work,
+            &squid_n_element::beam::RigidZoneRule::default(),
+        );
+        Analysis::prepare(&work).map_err(|e| format!("解析準備エラー: {}", e))?;
         let dofmap = squid_n_core::dof::DofMap::build(&work);
         let reducer = squid_n_solver::constraint::Reducer::build(&work, &dofmap);
         squid_n_solver::pushover::pushover_analysis(
@@ -1027,6 +1053,12 @@ impl App {
         cfg: AnalysisSettings,
         wave: squid_n_solver::timehistory::GroundMotion,
     ) -> Result<squid_n_solver::timehistory::ResponseResult, String> {
+        let mut model = model;
+        // 解析前に剛域を自動算定（設計書 §6.2.1、標準実装）。
+        squid_n_element::beam::apply_auto_rigid_zones(
+            &mut model,
+            &squid_n_element::beam::RigidZoneRule::default(),
+        );
         let analysis = Analysis::prepare(&model).map_err(|e| format!("解析準備エラー: {}", e))?;
         let damping = match cfg.th_damping_model {
             ThDampingModel::StiffnessProportional => {
@@ -1245,9 +1277,13 @@ impl App {
     }
 
     /// T7: 解析結果の member_forces から検定結果を生成する。
-    /// 危険断面位置（eval_sections）の内力に対し、材種に応じて
-    /// SteelDesign / RcDesign を適用する。
+    /// 危険断面位置（§6.2.3、既定は柱フェイスと中央）の内力で検定する。
+    /// 節点芯は剛域が有る場合は検定対象外（節点芯の応力をそのまま使わない、
+    /// 設計書 §6.2.3）。材種に応じて SteelDesign / RcDesign を適用する。
     pub fn run_design_check(&mut self) {
+        // rigid_zone（face_i/j）から危険断面位置を決めるため、算定前に自動剛域を
+        // 反映する（設計書 §6.2.1、冪等なので他の解析エントリと重複して呼んでも安全）。
+        self.apply_rigid_zones_for_analysis();
         let Some(results) = &self.results else {
             return;
         };
@@ -1278,7 +1314,13 @@ impl App {
                 Box::new(RcDesign)
             };
 
+            let geom_len = elem_geometric_length(elem, &self.model);
+            let positions = design_positions(elem, geom_len);
+
             for (pos, forces) in &mf.at {
+                if !is_near_design_position(*pos, &positions) {
+                    continue;
+                }
                 // [N, Qy, Qz, Mx, My, Mz] -> MemberForcesAt
                 // 暫定: 強軸まわりとして Mz[5] と Qy[1] を使用
                 let mfa = MemberForcesAt {
@@ -1523,6 +1565,25 @@ fn elem_geometric_length(
     let dy = p1[1] - p0[1];
     let dz = p1[2] - p0[2];
     (dx * dx + dy * dy + dz * dz).sqrt()
+}
+
+/// 危険断面位置（§6.2.3、既定は柱フェイスと中央）を正規化座標 \[0,1\] で算定する。
+/// `squid_n_element::beam::BeamElement::new` の `eval_sections` 算定と同じ規則
+/// （xi_i は \[0.0, 0.5) へ、xi_j は (0.5, 1.0\] へクランプ）で face_i/face_j から
+/// 求める。face=0（直交材が無い端）では節点芯（0.0/1.0）と一致する。
+fn design_positions(elem: &squid_n_core::model::ElementData, geom_len: f64) -> [f64; 3] {
+    if geom_len > 1e-12 {
+        let xi_i = (elem.rigid_zone.face_i / geom_len).clamp(0.0, 0.5 - 1e-9);
+        let xi_j = (1.0 - elem.rigid_zone.face_j / geom_len).clamp(0.5 + 1e-9, 1.0);
+        [xi_i, 0.5, xi_j]
+    } else {
+        [0.0, 0.5, 1.0]
+    }
+}
+
+/// `pos` が `positions` のいずれかと 1e-6 以内で一致するか判定する。
+fn is_near_design_position(pos: f64, positions: &[f64; 3]) -> bool {
+    positions.iter().any(|p| (p - pos).abs() < 1e-6)
 }
 
 #[cfg(feature = "gui")]
@@ -2872,6 +2933,214 @@ mod tests {
         let mut app = App::default();
         app.run_design_check();
         assert!(app.results.is_none() || app.results.as_ref().unwrap().checks.is_empty());
+    }
+
+    /// 剛域自動算定・危険断面フィルタのテスト用モデル。
+    /// `sample::portal_frame`（対角材を含む変則的な接続）と異なり、
+    /// 柱(node0-node1)・梁(node1-node2)・柱(node2-node3)が各節点で厳密に直交する
+    /// 素直なポータルフレーム（柱 H-300x300x10x15・梁 H-400x200x8x13、SN400B）。
+    /// - node0(柱1脚部)・node3(柱2脚部): 他要素と接続しない → face=0（節点芯のまま）
+    /// - node1(柱1頭部/梁始端)・node2(梁終端/柱2頭部): 柱・梁が直交 → face>0
+    fn aligned_portal_frame() -> squid_n_core::model::Model {
+        use squid_n_core::model::{
+            ElementData, ElementKind, EndCondition, ForceRegime, LoadCase, LocalAxis, Material,
+            MemberLoad, MemberLoadKind, Model, Node,
+        };
+        use squid_n_section::shape::SectionShape;
+
+        let mut model = Model::default();
+
+        let coords = [
+            [0.0, 0.0, 0.0],
+            [0.0, 0.0, 3000.0],
+            [4000.0, 0.0, 3000.0],
+            [4000.0, 0.0, 0.0],
+        ];
+        for (i, c) in coords.iter().enumerate() {
+            model.nodes.push(Node {
+                id: NodeId(i as u32),
+                coord: *c,
+                restraint: if i == 0 || i == 3 {
+                    squid_n_core::dof::Dof6Mask::FIXED
+                } else {
+                    squid_n_core::dof::Dof6Mask::FREE
+                },
+                mass: None,
+                story: None,
+            });
+        }
+
+        let col_shape = SectionShape::SteelH {
+            height: 300.0,
+            width: 300.0,
+            web_thick: 10.0,
+            flange_thick: 15.0,
+        };
+        let beam_shape = SectionShape::SteelH {
+            height: 400.0,
+            width: 200.0,
+            web_thick: 8.0,
+            flange_thick: 13.0,
+        };
+        model
+            .sections
+            .push(col_shape.to_section(SectionId(0), "柱 H-300x300x10x15".into()));
+        model
+            .sections
+            .push(beam_shape.to_section(SectionId(1), "梁 H-400x200x8x13".into()));
+
+        model.materials.push(Material {
+            id: squid_n_core::ids::MaterialId(0),
+            name: "SN400B".into(),
+            young: 205000.0,
+            poisson: 0.3,
+            density: 7.85e-9,
+            shear: None,
+            fc: None,
+            fy: Some(235.0),
+        });
+
+        let members = [
+            (0u32, 0u32, 1u32, 0u32, [1.0, 0.0, 0.0]),
+            (1, 1, 2, 1, [0.0, 0.0, 1.0]),
+            (2, 2, 3, 0, [1.0, 0.0, 0.0]),
+        ];
+        for (id, i, j, sec, ref_vector) in members {
+            model.elements.push(ElementData {
+                id: ElemId(id),
+                kind: ElementKind::Beam,
+                nodes: [NodeId(i), NodeId(j)].into_iter().collect(),
+                section: Some(SectionId(sec)),
+                material: Some(squid_n_core::ids::MaterialId(0)),
+                local_axis: LocalAxis { ref_vector },
+                end_cond: [EndCondition::Fixed, EndCondition::Fixed],
+                force_regime: ForceRegime::Auto,
+                rigid_zone: Default::default(),
+                plastic_zone: None,
+            });
+        }
+
+        model.load_cases.push(LoadCase {
+            id: LoadCaseId(0),
+            name: "長期".into(),
+            nodal: Vec::new(),
+            member: vec![MemberLoad {
+                elem: ElemId(1),
+                dir: [0.0, 0.0, -1.0],
+                kind: MemberLoadKind::Distributed {
+                    a: 0.0,
+                    b: 4000.0,
+                    w1: 10.0,
+                    w2: 10.0,
+                },
+            }],
+        });
+
+        model
+    }
+
+    /// 剛域自動算定が解析パイプラインへ接続されていること（設計書 §6.2.1、標準実装）。
+    /// 解析エントリ(`run_linear_static`)を通す前は既定の 0（未適用）のままだが、
+    /// 通した後は `apply_rigid_zones_for_analysis` により `elem.rigid_zone` が
+    /// 自動算定値へ更新される。
+    #[test]
+    fn test_run_linear_static_applies_auto_rigid_zones() {
+        let mut app = App::default();
+        app.load_model(aligned_portal_frame());
+
+        // 適用前は既定の 0（apply_auto_rigid_zones 未実行）。
+        assert_eq!(app.model.elements[1].rigid_zone.length_i, 0.0);
+        assert_eq!(app.model.elements[1].rigid_zone.face_i, 0.0);
+
+        app.run_linear_static(LoadCaseId(0));
+        assert!(app.last_error.is_none(), "{:?}", app.last_error);
+
+        // 梁(id=1)の i端(node1, 柱と直交)。
+        // λ_i = D_orth/2 − D_self/4 = 柱せい/2 − 梁せい/4 = 150 − 100 = 50
+        // face_i = D_orth/2 = 柱せい/2 = 150
+        let beam = &app.model.elements[1];
+        assert!(
+            (beam.rigid_zone.length_i - 50.0).abs() < 1e-9,
+            "length_i={}",
+            beam.rigid_zone.length_i
+        );
+        assert!(
+            (beam.rigid_zone.face_i - 150.0).abs() < 1e-9,
+            "face_i={}",
+            beam.rigid_zone.face_i
+        );
+
+        // 柱(id=0)の j端(node1, 梁と直交)。
+        // λ_j = D_orth/2 − D_self/4 = 梁せい/2 − 柱せい/4 = 200 − 75 = 125
+        // face_j = D_orth/2 = 梁せい/2 = 200
+        let col = &app.model.elements[0];
+        assert!(
+            (col.rigid_zone.length_j - 125.0).abs() < 1e-9,
+            "length_j={}",
+            col.rigid_zone.length_j
+        );
+        assert!(
+            (col.rigid_zone.face_j - 200.0).abs() < 1e-9,
+            "face_j={}",
+            col.rigid_zone.face_j
+        );
+        // 柱脚(node0)は他要素と接続しないため face_i は 0 のまま。
+        assert_eq!(col.rigid_zone.face_i, 0.0);
+    }
+
+    /// `run_design_check` が危険断面位置（§6.2.3、既定は柱フェイスと中央）のみを
+    /// 検定し、剛域が有る端の節点芯は検定対象外になることを確認する。
+    /// 剛域が無い端（face=0）では従来どおり節点芯が検定対象に残る。
+    #[test]
+    fn test_run_design_check_filters_to_design_positions() {
+        let mut app = App::default();
+        app.load_model(aligned_portal_frame());
+        app.run_linear_static(LoadCaseId(0));
+        assert!(app.last_error.is_none(), "{:?}", app.last_error);
+
+        let checks = &app.results.as_ref().unwrap().checks;
+        assert!(!checks.is_empty());
+
+        // 梁(id=1): 両端とも柱と直交(face>0)のため、節点芯 0.0/1.0 は検定対象外。
+        let beam_positions: Vec<f64> = checks
+            .iter()
+            .filter(|(id, _, _)| *id == ElemId(1))
+            .map(|(_, pos, _)| *pos)
+            .collect();
+        assert!(
+            !beam_positions.iter().any(|p| *p < 1e-6),
+            "梁の節点芯(i端)が検定対象に残っている: {:?}",
+            beam_positions
+        );
+        assert!(
+            !beam_positions.iter().any(|p| (*p - 1.0).abs() < 1e-6),
+            "梁の節点芯(j端)が検定対象に残っている: {:?}",
+            beam_positions
+        );
+        assert!(
+            beam_positions.iter().any(|p| (*p - 0.5).abs() < 1e-6),
+            "梁の中央が検定対象から抜けている: {:?}",
+            beam_positions
+        );
+
+        // 柱(id=0): 脚部(node0)は他要素と接続しない(face_i=0)ため節点芯 0.0 のままが
+        // 危険断面位置に一致し、検定対象に残る(従来挙動と一致)。
+        // 頭部(node1)は梁と直交(face_j>0)のため節点芯 1.0 は検定対象外になる。
+        let col_positions: Vec<f64> = checks
+            .iter()
+            .filter(|(id, _, _)| *id == ElemId(0))
+            .map(|(_, pos, _)| *pos)
+            .collect();
+        assert!(
+            col_positions.iter().any(|p| *p < 1e-6),
+            "剛域の無い柱脚(節点芯)が検定対象から抜けている: {:?}",
+            col_positions
+        );
+        assert!(
+            !col_positions.iter().any(|p| (*p - 1.0).abs() < 1e-6),
+            "柱頭の節点芯が検定対象に残っている: {:?}",
+            col_positions
+        );
     }
 
     #[test]

@@ -123,6 +123,20 @@ impl BeamElement {
         let mat = get_material(model, data.material);
         let g = mat.shear_modulus();
 
+        // 危険断面位置（§6.2.3、既定は柱フェース＝節点から face_i/j）を正規化座標へ変換し、
+        // 節点芯 [0.0, 1.0] と部材中央 0.5 に加えて評価断面リストへ含める。
+        // face=0（直交材が無い端）では従来どおり [0.0, 0.5, 1.0] と完全一致する。
+        let eval_sections = if len > 1e-12 {
+            let xi_i = (data.rigid_zone.face_i / len).clamp(0.0, 0.5 - 1e-9);
+            let xi_j = (1.0 - data.rigid_zone.face_j / len).clamp(0.5 + 1e-9, 1.0);
+            let mut xs = vec![0.0, xi_i, 0.5, xi_j, 1.0];
+            xs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            xs.dedup_by(|a, b| (*a - *b).abs() < 1e-9);
+            xs
+        } else {
+            vec![0.0, 0.5, 1.0]
+        };
+
         let as_y = if sec.as_y != 0.0 {
             sec.as_y
         } else {
@@ -150,7 +164,7 @@ impl BeamElement {
             axis,
             rigid: data.rigid_zone,
             end_cond: data.end_cond,
-            eval_sections: vec![0.0, 0.5, 1.0],
+            eval_sections,
             section: data.section,
             material: data.material,
             committed_disp: [0.0; 12],
@@ -592,6 +606,10 @@ pub fn auto_rigid_zones(
             v
         }
     };
+    // フェイス距離 = D_orth/2 は剛性用剛域の低減率（慣用調整）と無関係な幾何量なので
+    // reduction を掛けない（設計書 §6.2.1「設計位置との区別」）。
+    // λ が負→0 にクランプされる場合でも face はそのまま D_orth/2 を保持する。
+    let face = |d_orth: f64| -> f64 { d_orth / 2.0 };
 
     RigidZone {
         length_i: lambda(d_orth_i),
@@ -599,6 +617,8 @@ pub fn auto_rigid_zones(
         source_i: ZoneSource::Auto,
         source_j: ZoneSource::Auto,
         reduction: rule.reduction,
+        face_i: face(d_orth_i),
+        face_j: face(d_orth_j),
     }
 }
 
@@ -609,6 +629,12 @@ pub fn recompute_auto_zones(zone: &mut RigidZone, recomputed: &RigidZone) {
     if matches!(zone.source_j, ZoneSource::Auto) {
         zone.length_j = recomputed.length_j;
     }
+    // フェイス距離は剛域長の Manual/Auto フラグとは独立な幾何量（接続関係から
+    // 一意に決まる §6.2.1）。手動で剛域長を保護しているときも、モデルの接続情報
+    // が変われば危険断面位置は追従すべきなので、Manual 保護の対象外として常に
+    // 再算定値で更新する。
+    zone.face_i = recomputed.face_i;
+    zone.face_j = recomputed.face_j;
 }
 
 /// モデル全要素の剛域を自動算定し、`ElementData::rigid_zone` を更新する前処理。
@@ -1034,6 +1060,8 @@ mod tests {
 
         let zone = auto_rigid_zones(&model, ElemId(1), &RigidZoneRule::default());
         assert!((zone.length_i - 125.0).abs() < 1e-9);
+        // フェイス距離 face_i = D_orth/2 = 柱せい/2 = 300（低減率は掛けない）。
+        assert!((zone.face_i - 300.0).abs() < 1e-9, "face_i={}", zone.face_i);
     }
 
     /// apply_auto_rigid_zones が ElementData::rigid_zone に反映され、
@@ -1115,10 +1143,108 @@ mod tests {
         // 手動端は再適用で保護される。
         model.elements[1].rigid_zone.source_i = ZoneSource::Manual;
         model.elements[1].rigid_zone.length_i = 999.0;
+        model.elements[1].rigid_zone.face_i = 0.0;
         apply_auto_rigid_zones(&mut model, &RigidZoneRule::default());
         assert_eq!(
             model.elements[1].rigid_zone.length_i, 999.0,
             "Manual 端が上書きされた"
         );
+        // face_i は剛域長の Manual/Auto フラグとは無関係な幾何量なので、
+        // Manual 端でも常に再算定される（設計書 §6.2.1）。
+        assert!(
+            (model.elements[1].rigid_zone.face_i - 300.0).abs() < 1e-9,
+            "Manual 端でも face_i は再算定されるべき: face_i={}",
+            model.elements[1].rigid_zone.face_i
+        );
+    }
+
+    /// 危険断面位置（§6.2.3）: face_i/face_j から評価断面リストを算定する。
+    /// face=0（直交材なし）の端では従来どおり [0.0, 0.5, 1.0] と完全一致する。
+    #[test]
+    fn test_eval_sections_from_face_distance() {
+        use squid_n_core::ids::{ElemId, MaterialId, NodeId, SectionId};
+        use squid_n_core::model::{ElementKind, RigidZone};
+
+        let sec = Section {
+            id: SectionId(0),
+            name: String::new(),
+            area: 100.0,
+            iy: 1.0e6,
+            iz: 1.0e6,
+            j: 1.0e6,
+            depth: 300.0,
+            width: 300.0,
+            as_y: 0.0,
+            as_z: 0.0,
+            panel_thickness: None,
+            thickness: None,
+            shape: None,
+        };
+        let mat = Material {
+            id: MaterialId(0),
+            name: String::new(),
+            young: 205000.0,
+            poisson: 0.3,
+            density: 0.0,
+            shear: None,
+            fc: None,
+            fy: None,
+        };
+        let model = Model {
+            nodes: vec![
+                Node {
+                    id: NodeId(0),
+                    coord: [0.0, 0.0, 0.0],
+                    restraint: Default::default(),
+                    mass: None,
+                    story: None,
+                },
+                Node {
+                    id: NodeId(1),
+                    coord: [4000.0, 0.0, 0.0],
+                    restraint: Default::default(),
+                    mass: None,
+                    story: None,
+                },
+            ],
+            elements: vec![ElementData {
+                id: ElemId(0),
+                kind: ElementKind::Beam,
+                nodes: smallvec::smallvec![NodeId(0), NodeId(1)],
+                section: Some(SectionId(0)),
+                material: Some(MaterialId(0)),
+                local_axis: LocalAxis {
+                    ref_vector: [0.0, 0.0, 1.0],
+                },
+                end_cond: [EndCondition::Fixed, EndCondition::Fixed],
+                force_regime: squid_n_core::model::ForceRegime::Auto,
+                rigid_zone: RigidZone {
+                    face_i: 300.0,
+                    face_j: 250.0,
+                    ..Default::default()
+                },
+                plastic_zone: None,
+            }],
+            sections: vec![sec],
+            materials: vec![mat],
+            ..Default::default()
+        };
+
+        let beam = BeamElement::new(&model.elements[0], &model);
+        let expected = [0.0, 0.075, 0.5, 0.9375, 1.0];
+        assert_eq!(beam.eval_sections.len(), expected.len());
+        for (a, b) in beam.eval_sections.iter().zip(expected.iter()) {
+            assert!(
+                (a - b).abs() < 1e-9,
+                "eval_sections={:?}",
+                beam.eval_sections
+            );
+        }
+
+        // face=0 の端では従来どおり [0.0, 0.5, 1.0] と完全一致。
+        let mut model_zero = model.clone();
+        model_zero.elements[0].rigid_zone = RigidZone::default();
+        let beam_zero = BeamElement::new(&model_zero.elements[0], &model_zero);
+        assert_eq!(beam_zero.eval_sections, vec![0.0, 0.5, 1.0]);
     }
 }
