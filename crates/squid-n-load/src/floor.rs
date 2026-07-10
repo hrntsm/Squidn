@@ -291,6 +291,8 @@ mod tests {
             ..Default::default()
         };
         let slab = Slab {
+            kind: Default::default(),
+            one_way: None,
             id: SlabId(0),
             boundary: vec![NodeId(0), NodeId(1), NodeId(2), NodeId(3)],
             joists: vec![],

@@ -253,8 +253,11 @@ pub fn generate_stories(
                 master,
                 slaves,
                 rigid: true,
+                weight: Some(weight),
             }],
             seismic_weight: Some(weight),
+            structure: Default::default(),
+            level_kind: Default::default(),
         });
     }
 
@@ -362,6 +365,7 @@ mod tests {
             });
         }
         model.load_cases.push(LoadCase {
+            kind: Default::default(),
             id: LoadCaseId(0),
             name: "DL".into(),
             nodal: vec![NodalLoad {
@@ -467,6 +471,7 @@ mod tests {
             });
         }
         model.load_cases.push(LoadCase {
+            kind: Default::default(),
             id: LoadCaseId(0),
             name: "DL".into(),
             nodal: vec![

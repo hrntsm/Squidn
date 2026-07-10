@@ -3021,6 +3021,7 @@ mod tests {
         }
 
         model.load_cases.push(LoadCase {
+            kind: Default::default(),
             id: LoadCaseId(0),
             name: "長期".into(),
             nodal: Vec::new(),
@@ -3993,6 +3994,7 @@ mod tests {
             });
         }
         model.load_cases.push(LoadCase {
+            kind: Default::default(),
             id: LoadCaseId(0),
             name: "長期".into(),
             nodal: Vec::new(),
@@ -4008,6 +4010,7 @@ mod tests {
             }],
         });
         model.load_cases.push(LoadCase {
+            kind: Default::default(),
             id: LoadCaseId(1),
             name: "地震X".into(),
             nodal: vec![
@@ -4188,6 +4191,7 @@ mod tests {
                 plastic_zone: None,
             }],
             load_cases: vec![LoadCase {
+                kind: Default::default(),
                 id: LoadCaseId(0),
                 name: "圧縮".into(),
                 nodal: vec![NodalLoad {
@@ -4325,6 +4329,7 @@ mod tests {
             }],
             load_cases: vec![
                 LoadCase {
+                    kind: Default::default(),
                     id: LoadCaseId(0),
                     name: "長期".into(),
                     nodal: vec![NodalLoad {
@@ -4334,6 +4339,7 @@ mod tests {
                     member: Vec::new(),
                 },
                 LoadCase {
+                    kind: Default::default(),
                     id: LoadCaseId(1),
                     name: "地震".into(),
                     nodal: vec![NodalLoad {
@@ -4432,6 +4438,8 @@ mod tests {
             mk_beam(3, 3, 0),
         ];
         let slab = Slab {
+            kind: Default::default(),
+            one_way: None,
             id: SlabId(0),
             boundary: vec![NodeId(0), NodeId(1), NodeId(2), NodeId(3)],
             joists: vec![],

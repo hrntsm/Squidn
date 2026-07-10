@@ -320,6 +320,7 @@ impl<'m> Analysis<'m> {
 
         // Attach Pi forces to master nodes of each story's diaphragms
         let mut lc = squid_n_core::model::LoadCase {
+            kind: Default::default(),
             id: lc_id,
             name: format!("seismic_{:?}_{:?}", dir, mode),
             nodal: Vec::new(),
@@ -548,6 +549,7 @@ mod tests {
             }],
             load_cases: vec![
                 LoadCase {
+                    kind: Default::default(),
                     id: LoadCaseId(1),
                     name: "axial".into(),
                     nodal: vec![NodalLoad {
@@ -557,6 +559,7 @@ mod tests {
                     member: Vec::new(),
                 },
                 LoadCase {
+                    kind: Default::default(),
                     id: LoadCaseId(2),
                     name: "shear".into(),
                     nodal: vec![NodalLoad {

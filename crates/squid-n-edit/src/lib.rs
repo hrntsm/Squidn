@@ -1176,6 +1176,7 @@ impl EditCommand for AddLoadCase {
     fn apply(&self, model: &mut Model) -> Box<dyn EditCommand> {
         let new_id = LoadCaseId(model.load_cases.len() as u32);
         model.load_cases.push(squid_n_core::model::LoadCase {
+            kind: Default::default(),
             id: new_id,
             name: self.name.clone(),
             nodal: Vec::new(),
@@ -1434,6 +1435,8 @@ impl EditCommand for AddSlab {
     fn apply(&self, model: &mut Model) -> Box<dyn EditCommand> {
         let new_id = SlabId(model.slabs.len() as u32);
         model.slabs.push(squid_n_core::model::Slab {
+            kind: Default::default(),
+            one_way: None,
             id: new_id,
             boundary: self.boundary.clone(),
             joists: self.joists.clone(),
@@ -1781,6 +1784,7 @@ mod tests {
         use squid_n_core::model::{LoadCase, MemberLoad, MemberLoadKind};
         let mut model = empty_model();
         model.load_cases.push(LoadCase {
+            kind: Default::default(),
             id: LoadCaseId(0),
             name: "lc".into(),
             nodal: vec![],
@@ -2095,6 +2099,7 @@ mod tests {
         let mut model = two_member_model();
         // 両方の部材に部材荷重を付ける
         model.load_cases.push(LoadCase {
+            kind: Default::default(),
             id: LoadCaseId(0),
             name: "lc".into(),
             nodal: vec![],
@@ -2477,6 +2482,8 @@ mod tests {
 
     fn make_story(id: u32, weight: Option<f64>) -> squid_n_core::model::Story {
         squid_n_core::model::Story {
+            level_kind: Default::default(),
+            structure: Default::default(),
             id: StoryId(id),
             name: format!("{}F", id + 1),
             elevation: id as f64 * 3000.0,
@@ -2561,11 +2568,14 @@ mod tests {
         };
         let cmd = ApplyStories {
             stories: vec![Story {
+                level_kind: Default::default(),
+                structure: Default::default(),
                 id: StoryId(0),
                 name: "1F".into(),
                 elevation: 3000.0,
                 node_ids: vec![NodeId(0), NodeId(1)],
                 diaphragms: vec![DiaphragmDef {
+                    weight: None,
                     master: NodeId(2),
                     slaves: vec![NodeId(0), NodeId(1)],
                     rigid: true,

@@ -110,6 +110,33 @@ pub struct DiaphragmDef {
     pub master: NodeId,
     pub slaves: Vec<NodeId>,
     pub rigid: bool,
+    /// この剛床が負担する地震用重量 [N]。多剛床の階では層の水平力 Pi を
+    /// 剛床ごとの重量比で分配するために用いる（RESP-D マニュアル
+    /// 「多剛床の設計用せん断力」）。None は未算定（階に単一剛床なら層重量全量）。
+    #[serde(default)]
+    pub weight: Option<f64>,
+}
+
+/// 階の主要構造種別。設計用一次固有周期の略算式 T=h(0.02+0.01α) の
+/// α（柱梁の大部分が鉄骨造である階の高さ比）の算定に用いる（令88条・告示1793号）。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum StoryStructure {
+    #[default]
+    Rc,
+    S,
+    Src,
+}
+
+/// 階の種別。地震層せん断力の算定方法を切り替える
+/// （一般階=Ai分布、PH階=震度 k、地下階=水平震度 K）。
+#[derive(Clone, Copy, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+pub enum StoryLevelKind {
+    #[default]
+    Normal,
+    /// 塔屋（PH）階。層せん断力 Qi = k·ΣWj（k は 0.5〜1.0 の指定震度）。
+    Penthouse { k: f64 },
+    /// 地下階。Qi = Q(i+1) + K·Wi、K = 0.1·(1 − H/40)·Z（H は地盤面からの深さ[m]、20m 超は 20m）。
+    Basement { depth_m: f64 },
 }
 
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -120,6 +147,12 @@ pub struct Story {
     pub node_ids: Vec<NodeId>,
     pub diaphragms: Vec<DiaphragmDef>,
     pub seismic_weight: Option<f64>,
+    /// 主要構造種別（略算周期の鉄骨造比 α 算定用）。旧スキーマは RC 扱い。
+    #[serde(default)]
+    pub structure: StoryStructure,
+    /// 階の種別（一般/PH/地下）。旧スキーマは一般階扱い。
+    #[serde(default)]
+    pub level_kind: StoryLevelKind,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -142,6 +175,23 @@ pub struct AreaLoad {
     pub value: f64,
 }
 
+/// スラブの種別。片持ちスラブは境界の辺 0（`boundary[0]`→`boundary[1]`）を
+/// 取付き辺（大梁側）とし、荷重は取付き辺へ伝達する（RESP-D マニュアル「片持ちスラブ」）。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum SlabKind {
+    #[default]
+    Interior,
+    Cantilever,
+}
+
+/// 一方向スラブの荷重伝達方向（床ごとに指定。RESP-D マニュアル「スラブ荷重」の〔X〕〔Y〕）。
+/// `X` は全体座標 X 方向へ伝達（＝X 方向両側の辺が負担）、`Y` は Y 方向へ伝達。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum OneWayDir {
+    X,
+    Y,
+}
+
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Slab {
     pub id: SlabId,
@@ -149,6 +199,13 @@ pub struct Slab {
     pub joists: Vec<JoistLine>,
     pub loads: Vec<AreaLoad>,
     pub method: DistributionMethod,
+    /// スラブ種別（一般/片持ち）。旧スキーマは一般スラブ扱い。
+    #[serde(default)]
+    pub kind: SlabKind,
+    /// 一方向スラブの伝達方向。`None` は従来互換
+    /// （境界辺 0・2 が負担＝辺 1 方向スパン）の暗黙規則。
+    #[serde(default)]
+    pub one_way: Option<OneWayDir>,
 }
 
 use crate::dof::Dof;
@@ -253,6 +310,28 @@ pub struct MemberLoad {
     pub kind: MemberLoadKind,
 }
 
+/// 荷重ケースの種別。地震用重量の集計（固定＋地震用積載）や
+/// 荷重組合せの自動生成（長期・短期・多雪区域の係数）に用いる。
+/// 旧スキーマ・種別未指定は `Other`（従来の「先頭ケースを重力とみなす」
+/// フォールバック規則の対象）。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum LoadCaseKind {
+    /// 固定荷重（自重・仕上げ）
+    Dead,
+    /// 積載荷重（架構用・長期）
+    Live,
+    /// 積載荷重（地震用）。地震用重量の集計にはこちらを用いる（令85条）。
+    LiveSeismic,
+    /// 積雪荷重
+    Snow,
+    /// 風荷重
+    Wind,
+    /// 地震荷重（自動生成された水平力など）
+    Seismic,
+    #[default]
+    Other,
+}
+
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct LoadCase {
     pub id: LoadCaseId,
@@ -261,12 +340,46 @@ pub struct LoadCase {
     /// 部材（梁）荷重。既存データとの後方互換のため `#[serde(default)]`。
     #[serde(default)]
     pub member: Vec<MemberLoad>,
+    /// 荷重種別。旧スキーマは `Other`。
+    #[serde(default)]
+    pub kind: LoadCaseKind,
 }
 
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct LoadCombination {
     pub name: String,
     pub terms: Vec<(LoadCaseId, f64)>,
+}
+
+/// 自重算定の付加設定（RESP-D マニュアル「柱梁自重」の鉄骨重量割増率・
+/// 仕上げ荷重・耐火被覆に対応する簡易版）。
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct LoadCfg {
+    /// 鉄骨重量割増率 α（デフォルト 1.0）。コンクリート材（`fc` あり）には適用しない。
+    /// 0 以下が入力された場合は 1.0 として扱う（RESP-D と同じ規則）。
+    pub steel_weight_factor: f64,
+    /// 部材ごとの付加線重量 [N/mm]（仕上げ w_f·φ・耐火被覆 γc·Ac 等の合算値）。
+    pub extra_line_weight: Vec<(ElemId, f64)>,
+}
+
+impl Default for LoadCfg {
+    fn default() -> Self {
+        Self {
+            steel_weight_factor: 1.0,
+            extra_line_weight: Vec::new(),
+        }
+    }
+}
+
+impl LoadCfg {
+    /// 有効な鉄骨重量割増率（0 以下の入力は 1.0 とみなす）。
+    pub fn effective_steel_factor(&self) -> f64 {
+        if self.steel_weight_factor > 0.0 {
+            self.steel_weight_factor
+        } else {
+            1.0
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
@@ -284,6 +397,9 @@ pub struct Model {
     /// 構造節点と区別するために保持し、再生成時に再利用する。
     #[serde(default)]
     pub generated_masters: Vec<NodeId>,
+    /// 自重算定の付加設定（鉄骨重量割増率・部材付加線重量）。`None` は既定値。
+    #[serde(default)]
+    pub load_cfg: Option<LoadCfg>,
     #[serde(skip)]
     pub dof_map: crate::dof::DofMap,
 }
@@ -456,6 +572,7 @@ impl Model {
             && self.load_cases == other.load_cases
             && self.combinations == other.combinations
             && self.generated_masters == other.generated_masters
+            && self.load_cfg == other.load_cfg
     }
 }
 

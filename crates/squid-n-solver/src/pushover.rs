@@ -886,11 +886,14 @@ mod tests {
                 fy: Some(fy),
             }],
             stories: vec![Story {
+                level_kind: Default::default(),
+                structure: Default::default(),
                 id: StoryId(0),
                 name: "1F".to_string(),
                 elevation: 3000.0,
                 node_ids: vec![NodeId(1)],
                 diaphragms: vec![DiaphragmDef {
+                    weight: None,
                     master: NodeId(1),
                     slaves: vec![],
                     rigid: true,
@@ -1089,6 +1092,8 @@ mod tests {
             materials: vec![mat],
             stories: vec![
                 Story {
+                    level_kind: Default::default(),
+                    structure: Default::default(),
                     id: StoryId(0),
                     name: "1F".to_string(),
                     elevation: 3000.0,
@@ -1097,6 +1102,8 @@ mod tests {
                     seismic_weight: None,
                 },
                 Story {
+                    level_kind: Default::default(),
+                    structure: Default::default(),
                     id: StoryId(1),
                     name: "2F".to_string(),
                     elevation: 6000.0,
@@ -1261,6 +1268,8 @@ mod tests {
                 fy: Some(235.0),
             }],
             stories: vec![Story {
+                level_kind: Default::default(),
+                structure: Default::default(),
                 id: StoryId(0),
                 name: "1F".to_string(),
                 elevation: 3000.0,
@@ -1446,11 +1455,14 @@ mod tests {
                 fy: Some(fy),
             }],
             stories: vec![Story {
+                level_kind: Default::default(),
+                structure: Default::default(),
                 id: StoryId(0),
                 name: "1F".to_string(),
                 elevation: 3000.0,
                 node_ids: vec![NodeId(1), NodeId(2)],
                 diaphragms: vec![DiaphragmDef {
+                    weight: None,
                     master: NodeId(1),
                     slaves: vec![NodeId(2)],
                     rigid: true,
