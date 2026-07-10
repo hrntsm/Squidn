@@ -120,8 +120,17 @@ fn plate_thickness(sec: &Section) -> f64 {
             } => return web_thick.max(flange_thick),
             SectionShape::SteelBox { thick, .. }
             | SectionShape::SteelAngle { thick, .. }
-            | SectionShape::SteelPipe { thick, .. } => return thick,
-            SectionShape::RcRect { .. } | SectionShape::RcCircle { .. } => {}
+            | SectionShape::SteelPipe { thick, .. }
+            | SectionShape::CftBox { thick, .. }
+            | SectionShape::CftPipe { thick, .. } => return thick,
+            SectionShape::SrcRect {
+                steel_web_thick,
+                steel_flange_thick,
+                ..
+            } => return steel_web_thick.max(steel_flange_thick),
+            SectionShape::RcRect { .. }
+            | SectionShape::RcCircle { .. }
+            | SectionShape::RcWall { .. } => {}
         }
     }
     sec.thickness.unwrap_or(40.0)
@@ -282,9 +291,13 @@ fn shape_of(sec: &Section) -> (ShapeCategory, f64, f64) {
                 ..
             } => return (ShapeCategory::Other, flange_thick, web_thick),
             SectionShape::SteelAngle { thick, .. } => return (ShapeCategory::Other, thick, thick),
-            SectionShape::RcRect { .. } | SectionShape::RcCircle { .. } => {
-                return (ShapeCategory::Other, 0.0, 0.0)
-            }
+            // CFT の鋼管部分は角形/円形鋼管として扱う（検定本体は cft 側で行う）。
+            SectionShape::CftBox { thick, .. } => return (ShapeCategory::Box, thick, thick),
+            SectionShape::CftPipe { thick, .. } => return (ShapeCategory::Pipe, thick, thick),
+            SectionShape::RcRect { .. }
+            | SectionShape::RcCircle { .. }
+            | SectionShape::SrcRect { .. }
+            | SectionShape::RcWall { .. } => return (ShapeCategory::Other, 0.0, 0.0),
         }
     }
     let t = sec.thickness.unwrap_or(0.0);

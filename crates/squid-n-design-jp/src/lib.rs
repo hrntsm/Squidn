@@ -88,6 +88,14 @@ pub struct DesignCtx {
     /// RC 短期許容せん断力で「損傷制御のための検討」式（2/3·α）を使うか。
     /// false の場合は「安全確保のための検討」式。
     pub rc_damage_control: bool,
+    /// 部材両端の強軸まわり曲げモーメント `(M_i端, M_j端)` [N·mm]（符号付き）。
+    /// 鋼の横座屈修正係数 C（複曲率正/単曲率負）とたわみ検定に用いる。
+    /// None の場合は C=1.0（安全側）となり、たわみ検定は省略される。
+    pub end_moments_z: Option<(f64, f64)>,
+    /// 部材中央（pos=0.5）の強軸まわり曲げモーメント [N·mm]（符号付き）。
+    /// たわみ検定の単純梁中央モーメント M0 の復元と、横座屈 C 係数の
+    /// 「中央部の曲げモーメントが端部より大きい場合 C=1.0」判定に用いる。
+    pub mid_moment_z: Option<f64>,
 }
 
 impl Default for DesignCtx {
@@ -100,6 +108,8 @@ impl Default for DesignCtx {
             lk: None,
             shear_span: None,
             rc_damage_control: true,
+            end_moments_z: None,
+            mid_moment_z: None,
         }
     }
 }

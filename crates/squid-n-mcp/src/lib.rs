@@ -1317,6 +1317,17 @@ fn compute_design_check_job(model: &Model, load_case: Option<u32>) -> Result<Job
             .iter()
             .map(|(_, f)| (f[5].abs(), f[1].abs()))
             .max_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+        // 端部・中央の強軸曲げ（横座屈 C 係数・たわみ検定用）。
+        let m_at = |target: f64| {
+            mf.at
+                .iter()
+                .find(|(p, _)| (p - target).abs() < 1e-9)
+                .map(|(_, f)| f[5])
+        };
+        let end_moments_z = match (m_at(0.0), m_at(1.0)) {
+            (Some(a), Some(b)) => Some((a, b)),
+            _ => None,
+        };
         let ctx = squid_n_design_jp::DesignCtx {
             term: squid_n_design_jp::LoadTerm::Long,
             kind,
@@ -1325,6 +1336,8 @@ fn compute_design_check_job(model: &Model, load_case: Option<u32>) -> Result<Job
             lk: None,
             shear_span,
             rc_damage_control: true,
+            end_moments_z,
+            mid_moment_z: m_at(0.5),
         };
 
         let checker: Box<dyn squid_n_design_jp::DesignCheck> = if is_steel(&mat.name) {

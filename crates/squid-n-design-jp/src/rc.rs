@@ -943,6 +943,7 @@ mod tests {
                     dia: shear_dia,
                     pitch: shear_pitch,
                     legs: shear_legs,
+                    grade: None,
                 },
             },
         }
@@ -1524,6 +1525,7 @@ mod tests {
                     dia: 10.0,
                     pitch: 100.0,
                     legs: 1,
+                    grade: None,
                 },
             },
         };

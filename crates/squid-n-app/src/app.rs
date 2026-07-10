@@ -1291,6 +1291,17 @@ impl App {
                 .iter()
                 .map(|(_, f)| (f[5].abs(), f[1].abs()))
                 .max_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+            // 端部・中央の強軸曲げ（横座屈 C 係数・たわみ検定用）。
+            let m_at = |target: f64| {
+                mf.at
+                    .iter()
+                    .find(|(p, _)| (p - target).abs() < 1e-9)
+                    .map(|(_, f)| f[5])
+            };
+            let end_moments_z = match (m_at(0.0), m_at(1.0)) {
+                (Some(a), Some(b)) => Some((a, b)),
+                _ => None,
+            };
             let ctx = DesignCtx {
                 term: self.design_term,
                 kind,
@@ -1299,6 +1310,8 @@ impl App {
                 lk: None,
                 shear_span,
                 rc_damage_control: true,
+                end_moments_z,
+                mid_moment_z: m_at(0.5),
             };
 
             let checker: Box<dyn DesignCheck> = if is_steel(&mat.name) {
@@ -1598,8 +1611,17 @@ fn steel_max_thickness(shape: &squid_n_core::section_shape::SectionShape) -> f64
         } => web_thick.max(flange_thick),
         SectionShape::SteelBox { thick, .. }
         | SectionShape::SteelAngle { thick, .. }
-        | SectionShape::SteelPipe { thick, .. } => thick,
-        SectionShape::RcRect { .. } | SectionShape::RcCircle { .. } => 0.0,
+        | SectionShape::SteelPipe { thick, .. }
+        | SectionShape::CftBox { thick, .. }
+        | SectionShape::CftPipe { thick, .. } => thick,
+        SectionShape::SrcRect {
+            steel_web_thick,
+            steel_flange_thick,
+            ..
+        } => steel_web_thick.max(steel_flange_thick),
+        SectionShape::RcRect { .. }
+        | SectionShape::RcCircle { .. }
+        | SectionShape::RcWall { .. } => 0.0,
     }
 }
 
@@ -3652,6 +3674,7 @@ mod tests {
                 dia: 10.0,
                 pitch: 150.0,
                 legs: 2,
+                grade: None,
             },
         };
         // 材料名は "FC24"（is_steel が false になる、かつ fc 設定あり）を想定。
@@ -3751,6 +3774,7 @@ mod tests {
                 dia: 10.0,
                 pitch: 150.0,
                 legs: 2,
+                grade: None,
             },
         };
         let rc_shape = SectionShape::RcRect {
@@ -3966,6 +3990,7 @@ mod tests {
                 dia: 10.0,
                 pitch: 150.0,
                 legs: 2,
+                grade: None,
             },
         };
         let rc_shape = SectionShape::RcRect {
@@ -4106,6 +4131,7 @@ mod tests {
                 dia: 10.0,
                 pitch: 150.0,
                 legs: 2,
+                grade: None,
             },
         };
         let rc_shape = SectionShape::RcRect {
