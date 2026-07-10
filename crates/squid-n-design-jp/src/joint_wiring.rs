@@ -15,6 +15,16 @@
 //! - 耐震壁は `SectionShape::RcWall` を割り当てた Wall 要素のみ検定する。
 //!   開口情報が無いため無開口（r=1）とし、設計用せん断力は等価梁化された
 //!   壁要素の内力の最大水平せん断成分を用いる（暫定）。
+//!
+//!   ここで固定している `r=1` は [`crate::joint::rc_wall_shear_check`]
+//!   （RC規準18条・耐震壁せん断耐力検定）が内部に持つ開口低減係数
+//!   `r=min(γ1,γ2,γ3)` 用のものであり、[`crate::wall_opening`]
+//!   （RESP-D マニュアル 02 剛性計算の `r=1−1.25・r0` や耐震壁判定・
+//!   複数開口の等価開口置換）とは準拠する規定も数式も異なる別物である。
+//!   壁要素の開口寸法を保持するデータモデルが無いため、いずれの経路も
+//!   実データを供給できない状態は同じだが、モデルに開口情報が追加された
+//!   際は本来別々に配線すべきで、一方の r をもう一方の計算に流用しては
+//!   ならない（数式が異なるため結果が変わる）。
 
 use crate::joint::{
     box_zp, cold_formed_column_ratio_check, panel_mpp, rc_joint_shear_check, rc_wall_shear_check,
@@ -240,6 +250,9 @@ pub fn collect_joint_checks(
             ps,
             w_ft: crate::rc::rebar_allowable_shear(&mat.name, term == LoadTerm::Long),
             side_columns,
+            // 開口寸法データモデルが未整備のため無開口として扱う（r=1・冒頭 doc 参照）。
+            // 本 r は RC規準18条のせん断耐力検定専用であり、`crate::wall_opening`
+            // （RESP-D 02 剛性計算の開口低減）とは別式のため流用しない。
             opening: None,
             q_design,
             long_term: term == LoadTerm::Long,

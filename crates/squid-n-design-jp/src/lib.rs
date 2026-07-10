@@ -9,6 +9,7 @@ pub mod joint_wiring;
 pub mod rc;
 pub mod src_cft;
 pub mod steel;
+pub mod wall_opening;
 
 // 容量スペクトル法（限界耐力計算）は P12 のスコープ。P7 とは別フェーズなので p12 で分離。
 #[cfg(feature = "p12")]
