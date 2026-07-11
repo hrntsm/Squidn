@@ -1444,6 +1444,7 @@ mod tests {
             height: 200.0,
             weight_per_area: 1.0e-3,
             transfer: MiscWallTransfer::Beam,
+            thickness: None,
         });
         let gen = generate_stories(&model, None).unwrap();
         // 領域中心の z は 2900+200/2=3000 で node1 に一致し、x も node1(x=0)に
@@ -1518,6 +1519,7 @@ mod tests {
             height: 200.0,
             weight_per_area: 1.0e-3,
             transfer: MiscWallTransfer::Column,
+            thickness: None,
         });
         let gen = generate_stories(&model, None).unwrap();
         let total = 1.0e-3 * 200.0 * 200.0;

@@ -178,6 +178,7 @@ pub fn misc_walls_table(ui: &mut egui::Ui, app: &mut App) {
                     height,
                     weight_per_area,
                     transfer: app.misc_wall_draft.transfer,
+                    thickness: None,
                 };
                 match app.misc_wall_draft.editing {
                     Some(index) if index < app.model.misc_walls.len() => {

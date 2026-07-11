@@ -99,10 +99,12 @@
 
 - **マニュアル:** 剛性率・偏心率算定時の雑壁剛性 `Kw' = n·Aw'·ΣKc/ΣAc`
   （ΣAc=0 の場合は Kw'=0。n は入力値）。
-- **実装:** `eccentricity::misc_wall_stiffness()` と `sum_column_area()`。
-  フレーム外雑壁（`MiscWall`）は現状、断面積 Aw' の算定に必要な壁厚を属性に
-  持たないため、剛心・ねじり剛性への自動配線は壁厚属性の追加とあわせて行う
-  （式・ガードはテスト済み）。
+- **実装:** `eccentricity::misc_wall_stiffness()`・`sum_column_area()`・
+  `append_misc_wall_stiffnesses()`。`MiscWall` に壁厚属性（`thickness`、
+  `None` は剛性評価の対象外）、`StressAnalysisCfg` に n 係数（`misc_wall_n`、
+  `None` は雑壁剛性を考慮しない）を追加し、当該層に帰属する雑壁
+  （中間高さ z が層帯域内）を方向別の等価剛性要素として剛心・ねじり剛性へ
+  自動配線した（`story_eccentricity` / `story_eccentricity_from_analysis` 両ルート）。
 
 ## 3. 応力解析モデル（変形自由度）の照合
 
@@ -122,5 +124,7 @@
 - 壁要素の限定自由度モデル（TVLEM）。P5.5 スコープ。
 - せん断ヒンジ（せん断降伏）の独立判定と、段階的耐力喪失のせん断降伏条件の厳密化。
 - 制振間柱要素と、その長期軸力非負担への追随。
-- `MiscWall` への壁厚属性の追加と、雑壁剛性の剛心・ねじり剛性への自動配線。
+- 雑壁の壁厚・n 係数の入力 UI（データモデル・計算は対応済み）。
 - 層間変形角の緩和値（1/120）の計算条件化（現状は 1/200 固定で判定表示）。
+- SRC/CFT 複合断面柱への長期軸力非負担の適用（現状は素の断面のみ。
+  `apply_long_axial_cut` の doc コメントに明記）。

@@ -3286,6 +3286,7 @@ mod tests {
             height: 3000.0,
             weight_per_area: weight,
             transfer: Default::default(),
+            thickness: None,
         }
     }
 

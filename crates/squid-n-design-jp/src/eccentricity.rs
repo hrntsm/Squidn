@@ -343,7 +343,8 @@ pub fn story_centers(model: &Model, story: StoryId) -> StoryCenters {
 
 /// 当該層の偏心率を算定して返す。
 pub fn story_eccentricity(model: &Model, story: StoryId) -> Eccentricity {
-    let cols = column_stiffnesses(model, story);
+    let mut cols = column_stiffnesses(model, story);
+    append_misc_wall_stiffnesses(model, story, &mut cols);
     let cor = center_of_rigidity(&cols);
     let com = center_of_mass(model, story);
     eccentricity(&cols, com, cor)
@@ -513,7 +514,8 @@ pub fn story_eccentricity_from_analysis(
     res_y: &StaticOnce,
     long_term: Option<&StaticOnce>,
 ) -> Eccentricity {
-    let cols = column_stiffnesses_from_analysis(model, story, res_x, res_y);
+    let mut cols = column_stiffnesses_from_analysis(model, story, res_x, res_y);
+    append_misc_wall_stiffnesses(model, story, &mut cols);
     let cor = center_of_rigidity(&cols);
     let com = long_term
         .and_then(|lt| center_of_gravity_from_axial(model, story, lt))
@@ -545,6 +547,70 @@ pub fn sum_column_area(model: &Model, story: StoryId) -> f64 {
         }
     });
     sum
+}
+
+/// 当該層に帰属するフレーム外雑壁を n 倍法で等価剛性要素へ換算し、`cols` に
+/// 追加する（剛心・ねじり剛性への寄与。マニュアル「(7) 雑壁の剛性評価」）。
+///
+/// - n 係数は `Model::stress_cfg.misc_wall_n`（`None` なら雑壁剛性を考慮しない）
+/// - 帰属層: 壁の中間高さ z が（直下層 elevation, 当該層 elevation] に入る壁
+/// - `Aw' = 壁の平面長さ × 壁厚`（`MiscWall::thickness` 未設定の壁は対象外）
+/// - 方向別に `Kw'x = n·Aw'·ΣKc,x/ΣAc`, `Kw'y = n·Aw'·ΣKc,y/ΣAc` を求め、
+///   壁面内方向の方向余弦 (cx, cy) で `dx = Kw'x·cx²`, `dy = Kw'y·cy²` として
+///   壁の平面中点に置く。ΣAc = 0 の場合は Kw' = 0（マニュアル但し書き）。
+pub fn append_misc_wall_stiffnesses(
+    model: &Model,
+    story: StoryId,
+    cols: &mut Vec<ColumnStiffness>,
+) {
+    let Some(n) = model.stress_cfg.misc_wall_n else {
+        return;
+    };
+    if model.misc_walls.is_empty() {
+        return;
+    }
+    let sum_ac = sum_column_area(model, story);
+    if sum_ac <= 0.0 {
+        return; // ΣAc = 0 → ΣKw' = 0
+    }
+    let sum_kx: f64 = cols.iter().map(|c| c.dx).sum();
+    let sum_ky: f64 = cols.iter().map(|c| c.dy).sum();
+
+    let idx = story.index();
+    let Some(elev) = model.stories.get(idx).map(|s| s.elevation) else {
+        return;
+    };
+    let below = if idx == 0 {
+        f64::NEG_INFINITY
+    } else {
+        model.stories[idx - 1].elevation
+    };
+
+    for w in &model.misc_walls {
+        let Some(t) = w.thickness else {
+            continue;
+        };
+        let z_mid = w.start[2] + w.height * 0.5;
+        if !(z_mid > below + 1e-9 && z_mid <= elev + 1e-9) {
+            continue;
+        }
+        let dxw = w.end[0] - w.start[0];
+        let dyw = w.end[1] - w.start[1];
+        let len = (dxw * dxw + dyw * dyw).sqrt();
+        if len <= 0.0 || t <= 0.0 {
+            continue;
+        }
+        let aw = len * t;
+        let (cx, cy) = (dxw / len, dyw / len);
+        cols.push(ColumnStiffness {
+            pos: [
+                (w.start[0] + w.end[0]) * 0.5,
+                (w.start[1] + w.end[1]) * 0.5,
+            ],
+            dx: misc_wall_stiffness(n, aw, sum_kx, sum_ac) * cx * cx,
+            dy: misc_wall_stiffness(n, aw, sum_ky, sum_ac) * cy * cy,
+        });
+    }
 }
 
 #[cfg(test)]
@@ -985,9 +1051,9 @@ mod tests {
         col_local_forces: [[f64; 3]; 4],
     ) -> StaticOnce {
         let mut disp = vec![[0.0; 6]; 8];
-        for i in 4..8 {
-            disp[i][0] = top_disp[0];
-            disp[i][1] = top_disp[1];
+        for d in disp.iter_mut().skip(4) {
+            d[0] = top_disp[0];
+            d[1] = top_disp[1];
         }
         let member_forces = col_local_forces
             .iter()
@@ -1107,5 +1173,80 @@ mod tests {
         let (model, s0) = build_symmetric_frame(None);
         // 柱 4 本 × area 100
         assert!((sum_column_area(&model, s0) - 400.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn test_append_misc_wall_stiffnesses() {
+        use squid_n_core::model::{MiscWall, MiscWallTransfer};
+        let (mut model, s0) = build_symmetric_frame(None);
+        model.stress_cfg.misc_wall_n = Some(2.0);
+        // Y 方向の壁 @ x=6000（長さ 6000 × 厚 100 → Aw' = 6e5）、z_mid=1500 → S0 帰属。
+        model.misc_walls.push(MiscWall {
+            start: [6000.0, 0.0, 0.0],
+            end: [6000.0, 6000.0, 0.0],
+            height: 3000.0,
+            weight_per_area: 1.0e-3,
+            transfer: MiscWallTransfer::SelfStanding,
+            thickness: Some(100.0),
+        });
+        // 帯域外の壁（z_mid = 4500 > elevation 3000）→ 無視される。
+        model.misc_walls.push(MiscWall {
+            start: [0.0, 0.0, 3000.0],
+            end: [0.0, 6000.0, 3000.0],
+            height: 3000.0,
+            weight_per_area: 1.0e-3,
+            transfer: MiscWallTransfer::SelfStanding,
+            thickness: Some(100.0),
+        });
+        // 厚さ未設定の壁 → 無視される。
+        model.misc_walls.push(MiscWall {
+            start: [0.0, 0.0, 0.0],
+            end: [0.0, 6000.0, 0.0],
+            height: 3000.0,
+            weight_per_area: 1.0e-3,
+            transfer: MiscWallTransfer::SelfStanding,
+            thickness: None,
+        });
+
+        let mut cols = vec![
+            ColumnStiffness {
+                pos: [0.0, 0.0],
+                dx: 100.0,
+                dy: 100.0,
+            },
+            ColumnStiffness {
+                pos: [6000.0, 0.0],
+                dx: 100.0,
+                dy: 100.0,
+            },
+            ColumnStiffness {
+                pos: [0.0, 6000.0],
+                dx: 100.0,
+                dy: 100.0,
+            },
+            ColumnStiffness {
+                pos: [6000.0, 6000.0],
+                dx: 100.0,
+                dy: 100.0,
+            },
+        ];
+        append_misc_wall_stiffnesses(&model, s0, &mut cols);
+        assert_eq!(cols.len(), 5, "帯域内かつ厚さ有りの壁 1 枚のみ追加");
+        let wall = cols[4];
+        // Kw'y = n·Aw'·ΣKy/ΣAc = 2·6e5·400/400 = 1.2e6（cy=1 なので dy へ全量）
+        assert!((wall.dy - 1.2e6).abs() < 1e-6, "Kw'y={}", wall.dy);
+        assert!(wall.dx.abs() < 1e-12, "cx=0 なので dx は 0");
+        assert_eq!(wall.pos, [6000.0, 3000.0]);
+
+        // 剛心が壁側（x=6000）へ寄ることの確認。
+        let cor = center_of_rigidity(&cols);
+        assert!(cor[0] > 3000.0, "Xs={} は壁側へ寄る", cor[0]);
+
+        // n 未指定なら追加されない。
+        let mut model2 = model.clone();
+        model2.stress_cfg.misc_wall_n = None;
+        let mut cols2 = cols[..4].to_vec();
+        append_misc_wall_stiffnesses(&model2, s0, &mut cols2);
+        assert_eq!(cols2.len(), 4);
     }
 }
