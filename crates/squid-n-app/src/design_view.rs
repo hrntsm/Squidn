@@ -236,10 +236,12 @@ pub fn design_table(ui: &mut egui::Ui, app: &mut App) {
         );
     } else if let Some(st) = app.current_static() {
         // 表示対象はナビゲータの結果ケース選択（→最後に実行した結果）に追従する。
-        let metrics = crate::summary::compute_story_metrics(
+        let ctx = crate::summary::metrics_ctx_from_results(app.results.as_ref());
+        let metrics = crate::summary::compute_story_metrics_with(
             &app.model,
             &st.disp,
             app.analysis_cfg.seismic_dir,
+            &ctx,
         );
 
         TableBuilder::new(ui)
@@ -252,17 +254,23 @@ pub fn design_table(ui: &mut egui::Ui, app: &mut App) {
             .column(Column::initial(80.0))
             .column(Column::initial(60.0))
             .header(20.0, |mut h| {
-                for t in &[
+                // 変形角の制限値は計算条件（令82条の2: 原則 1/200、緩和時 1/120）に追従する。
+                let denom = metrics
+                    .first()
+                    .map(|m| m.drift_limit_denom)
+                    .unwrap_or(app.model.stress_cfg.drift_limit_denom);
+                let drift_label = format!("変形角(1/{:.0})", denom);
+                for t in [
                     "階",
                     "階高[mm]",
                     "層間変位[mm]",
-                    "変形角(1/200)",
+                    drift_label.as_str(),
                     "剛性率Rs(≥0.6)",
                     "偏心率Re(≤0.15)",
                     "Fes",
                 ] {
                     h.col(|ui| {
-                        ui.strong(*t);
+                        ui.strong(t);
                     });
                 }
             })

@@ -95,6 +95,7 @@ pub fn portal_frame() -> Model {
             force_regime: ForceRegime::Auto,
             rigid_zone: Default::default(),
             plastic_zone: None,
+            spring: None,
         });
     }
 

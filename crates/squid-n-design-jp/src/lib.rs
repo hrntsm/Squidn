@@ -23,7 +23,11 @@ pub mod holding_capacity;
 #[cfg(feature = "p7")]
 pub mod panel_shear;
 #[cfg(feature = "p7")]
+pub mod principal_axis;
+#[cfg(feature = "p7")]
 pub mod rc_capacity;
+#[cfg(feature = "p7")]
+pub mod story_metrics;
 
 pub use rc::RcDesign;
 pub use src_cft::{CftDesign, SrcDesign};

@@ -1,9 +1,11 @@
 //! 層指標（二次設計チェック）とレポート文字列の生成。GUI 非依存。
 
 use squid_n_core::model::Model;
-use squid_n_design_jp::eccentricity::story_eccentricity;
+use squid_n_design_jp::eccentricity::{story_eccentricity, story_eccentricity_from_analysis};
 use squid_n_design_jp::holding_capacity::{eccentricity_ratio, fes, stiffness_ratios};
+use squid_n_design_jp::story_metrics::{cog_story_drifts, max_column_drift};
 use squid_n_solver::analysis::SeismicDir;
+use squid_n_solver::linear::StaticOnce;
 
 use crate::app::{App, ResultsBundle, StaticCaseKey};
 
@@ -17,7 +19,10 @@ pub struct StoryMetric {
     pub drift: f64,
     /// 層間変形角 [rad]
     pub drift_angle: f64,
-    /// 1/200 以下か（令82条の2）
+    /// 層間変形角の制限値の分母（令82条の2。原則 200、緩和時 120。
+    /// `Model::stress_cfg.drift_limit_denom`）
+    pub drift_limit_denom: f64,
+    /// 1/drift_limit_denom 以下か（令82条の2）
     pub drift_ok: bool,
     /// 剛性率 Rs
     pub rs: f64,
@@ -31,12 +36,67 @@ pub struct StoryMetric {
     pub fes: f64,
 }
 
-/// 静的解析の変位から層指標を計算する。
+/// 層指標算定の追加入力（偏心率の精算・重心の長期軸力算定用）。
+/// 無い項目は `None` のままでよく、その場合は略算（D値法・質量重心）へ
+/// フォールバックする。
+#[derive(Default, Clone, Copy)]
+pub struct StoryMetricsCtx<'a> {
+    /// X 方向加力の弾性応力解析結果（剛心の精算 ki=Qi/δi 用）
+    pub seismic_x: Option<&'a StaticOnce>,
+    /// Y 方向加力の弾性応力解析結果（同上）
+    pub seismic_y: Option<&'a StaticOnce>,
+    /// 長期応力解析結果（重心の長期軸力算定用）
+    pub long_term: Option<&'a StaticOnce>,
+}
+
+/// 解析結果一式から `StoryMetricsCtx` を組み立てる。
+/// 長期は「短期でない荷重組合せ」を優先し、無ければ None。
+pub fn metrics_ctx_from_results(results: Option<&ResultsBundle>) -> StoryMetricsCtx<'_> {
+    let Some(r) = results else {
+        return StoryMetricsCtx::default();
+    };
+    let find_seismic = |dir: SeismicDir| {
+        r.statics
+            .iter()
+            .find(|(k, _)| *k == StaticCaseKey::Seismic(dir))
+            .map(|(_, s)| s)
+    };
+    let long_term = r
+        .combos
+        .iter()
+        .find(|(name, _)| !squid_n_load::combo::is_short_term_combo(name))
+        .map(|(_, s)| s);
+    StoryMetricsCtx {
+        seismic_x: find_seismic(SeismicDir::X),
+        seismic_y: find_seismic(SeismicDir::Y),
+        long_term,
+    }
+}
+
+/// 静的解析の変位から層指標を計算する（略算フォールバック版）。
 /// `disp` は節点変位（`model.nodes` と同順）。階が未定義なら空を返す。
 pub fn compute_story_metrics(
     model: &Model,
     disp: &[[f64; 6]],
     dir: SeismicDir,
+) -> Vec<StoryMetric> {
+    compute_story_metrics_with(model, disp, dir, &StoryMetricsCtx::default())
+}
+
+/// 静的解析の変位から層指標を計算する（RESP-D 計算編 03「応力解析」準拠）。
+///
+/// - **層間変形角**: その階の柱の層間変形角の**最大値**（斜め柱除外。
+///   `story_metrics::max_column_drift`）。柱が拾えない層は従来の
+///   階平均変位差にフォールバックする。
+/// - **剛性率 Rs**: 重心位置の層間変位 δg（質量重み付き平均変位の差。
+///   `story_metrics::cog_story_drifts`）から `Rs = rs/r̄s`。
+/// - **偏心率 Re**: `ctx` に X/Y 加力の解析結果があれば精算
+///   （剛心 ki=Qi/δi・重心=長期軸力）、無ければ D値法（略算）。
+pub fn compute_story_metrics_with(
+    model: &Model,
+    disp: &[[f64; 6]],
+    dir: SeismicDir,
+    ctx: &StoryMetricsCtx<'_>,
 ) -> Vec<StoryMetric> {
     if model.stories.is_empty() {
         return Vec::new();
@@ -53,7 +113,7 @@ pub fn compute_story_metrics(
         .map(|n| n.coord[2])
         .fold(f64::INFINITY, f64::min);
 
-    // 各階の平均水平変位
+    // 各階の平均水平変位（柱が拾えない層の層間変位フォールバック用）
     let avg_disp: Vec<f64> = model
         .stories
         .iter()
@@ -79,19 +139,42 @@ pub fn compute_story_metrics(
         } else {
             model.stories[i - 1].elevation
         };
-        let below_disp = if i == 0 { 0.0 } else { avg_disp[i - 1] };
         heights.push((s.elevation - below_elev).max(1e-9));
-        drifts.push((avg_disp[i] - below_disp).abs());
+        // 層間変形角の確認用変位: 柱ごとの最大値（マニュアル 1/irs = max(δ)/iH）
+        let drift = match max_column_drift(model, disp, d, s.id) {
+            Some(cd) => cd.drift,
+            None => {
+                let below_disp = if i == 0 { 0.0 } else { avg_disp[i - 1] };
+                (avg_disp[i] - below_disp).abs()
+            }
+        };
+        drifts.push(drift);
     }
 
-    let rs_all = stiffness_ratios(&heights, &drifts);
+    // 剛性率は重心位置の層間変位 δg で算定（マニュアル 1/irs = iδg/iH）
+    let cog_drifts = cog_story_drifts(model, disp, d);
+    let rs_all = stiffness_ratios(&heights, &cog_drifts);
+
+    // 層間変形角の制限値（令82条の2。原則 1/200、緩和時 1/120）。
+    let denom = if model.stress_cfg.drift_limit_denom > 0.0 {
+        model.stress_cfg.drift_limit_denom
+    } else {
+        200.0
+    };
 
     model
         .stories
         .iter()
         .enumerate()
         .map(|(i, s)| {
-            let ecc = story_eccentricity(model, s.id);
+            let ecc = match (ctx.seismic_x, ctx.seismic_y) {
+                // 精算: 剛心 = 地震時応力解析結果の ki=Qi/δi、重心 = 長期軸力
+                (Some(rx), Some(ry)) => {
+                    story_eccentricity_from_analysis(model, s.id, rx, ry, ctx.long_term)
+                }
+                // 略算: D値法
+                _ => story_eccentricity(model, s.id),
+            };
             let (e_dist, radius) = match dir {
                 SeismicDir::X => (ecc.ey, ecc.rex),
                 SeismicDir::Y => (ecc.ex, ecc.rey),
@@ -104,7 +187,8 @@ pub fn compute_story_metrics(
                 height: heights[i],
                 drift: drifts[i],
                 drift_angle: angle,
-                drift_ok: angle <= 1.0 / 200.0,
+                drift_limit_denom: denom,
+                drift_ok: angle <= 1.0 / denom,
                 rs,
                 rs_ok: rs >= 0.6,
                 re,
@@ -185,11 +269,18 @@ pub fn build_report_csv(app: &App) -> String {
 
     // 層指標（最後に実行した静的結果に基づく）
     if let Some((_, st)) = results.statics.last() {
-        let metrics = compute_story_metrics(model, &st.disp, app.analysis_cfg.seismic_dir);
+        let ctx = metrics_ctx_from_results(app.results.as_ref());
+        let metrics =
+            compute_story_metrics_with(model, &st.disp, app.analysis_cfg.seismic_dir, &ctx);
         if !metrics.is_empty() {
-            out.push_str(
-                "\n[層指標(二次設計)]\n階,階高[mm],層間変位[mm],層間変形角,1/200判定,剛性率Rs,Rs判定,偏心率Re,Re判定,Fes\n",
-            );
+            let denom = metrics
+                .first()
+                .map(|m| m.drift_limit_denom)
+                .unwrap_or(200.0);
+            out.push_str(&format!(
+                "\n[層指標(二次設計)]\n階,階高[mm],層間変位[mm],層間変形角,1/{:.0}判定,剛性率Rs,Rs判定,偏心率Re,Re判定,Fes\n",
+                denom
+            ));
             for m in &metrics {
                 out.push_str(&format!(
                     "{},{:.0},{:.3},1/{:.0},{},{:.3},{},{:.3},{},{:.3}\n",
@@ -208,6 +299,33 @@ pub fn build_report_csv(app: &App) -> String {
                     if m.re_ok { "OK" } else { "NG" },
                     m.fes
                 ));
+            }
+        }
+    }
+
+    // 主軸の計算（RESP-D 計算編03「応力解析 §主軸の計算」）。
+    // X・Y 加力の弾性解析結果が揃っている場合のみ、水平力のなす仕事が極値をとる
+    // 角度 Θ（tan2Θ = −Pᵗ(uy+vx)/Pᵗ(vy−ux)）を出力する。
+    {
+        let ctx = metrics_ctx_from_results(app.results.as_ref());
+        if let (Some(rx), Some(ry)) = (ctx.seismic_x, ctx.seismic_y) {
+            let cfg = squid_n_solver::analysis::SeismicCfg {
+                dir: SeismicDir::X,
+                mode: app.analysis_cfg.ai_mode,
+                z: app.analysis_cfg.z,
+                soil: app.analysis_cfg.soil,
+                c0: app.analysis_cfg.c0,
+            };
+            if let Ok(analysis) = squid_n_solver::analysis::Analysis::prepare(model) {
+                if let Ok(p) = analysis.seismic_nodal_force_magnitudes(cfg) {
+                    let theta = squid_n_design_jp::principal_axis::principal_axis_from_results(
+                        model, &p, rx, ry,
+                    );
+                    out.push_str(&format!(
+                        "\n[主軸の計算]\n主軸角Θ[deg],{:.3}\n",
+                        theta.to_degrees()
+                    ));
+                }
             }
         }
     }
@@ -296,6 +414,24 @@ mod tests {
         assert!(csv.contains("[モデル概要]"));
         assert!(csv.contains("[層指標(二次設計)]"));
         assert!(csv.contains("[部材検定]"));
+    }
+
+    #[test]
+    fn test_drift_limit_denom_relaxation() {
+        // 令82条の2 の緩和（1/120）を計算条件で指定すると判定と表示分母が追従する。
+        let mut app = App::default();
+        app.load_model(crate::sample::portal_frame());
+        app.generate_stories_action();
+        app.model.stress_cfg.drift_limit_denom = 120.0;
+        app.run_seismic(SeismicDir::X);
+        assert!(app.last_error.is_none(), "{:?}", app.last_error);
+
+        let st = &app.results.as_ref().unwrap().statics.last().unwrap().1;
+        let metrics = compute_story_metrics(&app.model, &st.disp, SeismicDir::X);
+        assert_eq!(metrics[0].drift_limit_denom, 120.0);
+        assert_eq!(metrics[0].drift_ok, metrics[0].drift_angle <= 1.0 / 120.0);
+        let csv = build_report_csv(&app);
+        assert!(csv.contains("1/120判定"), "CSV ヘッダが緩和値に追従する");
     }
 
     #[test]

@@ -556,6 +556,7 @@ mod tests {
                 force_regime: ForceRegime::Auto,
                 rigid_zone: Default::default(),
                 plastic_zone: None,
+                spring: None,
             }],
             ..Default::default()
         }
@@ -575,6 +576,7 @@ mod tests {
             force_regime: ForceRegime::Auto,
             rigid_zone: Default::default(),
             plastic_zone: None,
+            spring: None,
         }
     }
 

@@ -2,6 +2,7 @@ pub mod dof;
 pub mod error;
 pub mod ids;
 pub mod model;
+pub mod rc_capacity;
 pub mod section_shape;
 pub mod units;
 

@@ -344,6 +344,7 @@ mod tests {
                 story_drift,
             }],
             hinges: vec![],
+            shear_yields: vec![],
             mechanism: MechanismType::Overall,
             qu: 0.0,
         }

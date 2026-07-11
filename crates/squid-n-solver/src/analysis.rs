@@ -547,6 +547,23 @@ impl<'m> Analysis<'m> {
 
     /// 地震静的解析（設定指定版）。Z・地盤種別・C0 を UI から与える。
     pub fn seismic_static_with(&self, cfg: SeismicCfg) -> Result<StaticOnce, SolveError> {
+        let lc = self.build_seismic_load_case(cfg)?;
+
+        if self.n_indep == 0 {
+            return Ok(self.zero_result());
+        }
+
+        let f_free = self.assemble_f_free_from_nodal(&lc.nodal);
+        self.solve_and_recover(&f_free)
+    }
+
+    /// 地震静的解析の水平力（Ai 分布）を荷重ケースとして構築して返す。
+    /// `seismic_static_with` の載荷部分を切り出したもので、主軸の計算
+    /// （RESP-D 計算編03「応力解析 §主軸の計算」の P ベクトル）にも用いる。
+    pub fn build_seismic_load_case(
+        &self,
+        cfg: SeismicCfg,
+    ) -> Result<squid_n_core::model::LoadCase, SolveError> {
         let SeismicCfg {
             dir,
             mode,
@@ -640,12 +657,22 @@ impl<'m> Analysis<'m> {
             ));
         }
 
-        if self.n_indep == 0 {
-            return Ok(self.zero_result());
-        }
+        Ok(lc)
+    }
 
-        let f_free = self.assemble_f_free_from_nodal(&lc.nodal);
-        self.solve_and_recover(&f_free)
+    /// 各節点の地震静的水平力の大きさ P [N]（`model.nodes` と同順）。
+    /// 主軸の計算 `tan2Θ = −Pᵗ(uy+vx)/Pᵗ(vy−ux)` の P ベクトル用
+    /// （Ai 分布は加力方向によらないため、X・Y 加力とも同じ分布）。
+    pub fn seismic_nodal_force_magnitudes(&self, cfg: SeismicCfg) -> Result<Vec<f64>, SolveError> {
+        let lc = self.build_seismic_load_case(cfg)?;
+        let mut p = vec![0.0_f64; self.model.nodes.len()];
+        for nl in &lc.nodal {
+            let i = nl.node.index();
+            if i < p.len() {
+                p[i] += (nl.values[0].powi(2) + nl.values[1].powi(2)).sqrt();
+            }
+        }
+        Ok(p)
     }
 
     /// 風荷重の静的解析（RESP-D マニュアル「風荷重の計算」節）。
@@ -904,6 +931,7 @@ mod tests {
                 force_regime: ForceRegime::Auto,
                 rigid_zone: Default::default(),
                 plastic_zone: None,
+                spring: None,
             }],
             sections: vec![Section {
                 id: SectionId(0),
@@ -1320,6 +1348,7 @@ mod tests {
                 force_regime: ForceRegime::Auto,
                 rigid_zone: Default::default(),
                 plastic_zone: None,
+                spring: None,
             });
         }
         model.load_cases.push(LoadCase {
@@ -1686,6 +1715,7 @@ mod tests {
                 force_regime: ForceRegime::Auto,
                 rigid_zone: Default::default(),
                 plastic_zone: None,
+                spring: None,
             });
         }
         // 2階柱脚(4,5)を1階床(2,3)へ接続する水平つなぎ梁。
@@ -1702,6 +1732,7 @@ mod tests {
             force_regime: ForceRegime::Auto,
             rigid_zone: Default::default(),
             plastic_zone: None,
+            spring: None,
         });
         model.elements.push(ElementData {
             id: ElemId(7),
@@ -1716,6 +1747,7 @@ mod tests {
             force_regime: ForceRegime::Auto,
             rigid_zone: Default::default(),
             plastic_zone: None,
+            spring: None,
         });
 
         let gen = squid_n_load::story_gen::generate_stories(&model, None).unwrap();

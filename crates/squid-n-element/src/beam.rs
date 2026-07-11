@@ -1379,6 +1379,7 @@ mod tests {
             force_regime: ForceRegime::Auto,
             rigid_zone: Default::default(),
             plastic_zone: None,
+            spring: None,
         };
 
         // SRC + コンクリート材料: ns=Es/Ec による等価断面性能
@@ -1492,6 +1493,7 @@ mod tests {
             force_regime: ForceRegime::Auto,
             rigid_zone: Default::default(),
             plastic_zone: None,
+            spring: None,
         };
 
         // 期待値: a=2500 < l/2=3000 → ba=(0.5−0.6·2500/6000)·2500=625(片側のみ)
@@ -1708,6 +1710,7 @@ mod tests {
                     force_regime: squid_n_core::model::ForceRegime::Auto,
                     rigid_zone: Default::default(),
                     plastic_zone: None,
+                    spring: None,
                 },
                 ElementData {
                     id: ElemId(1),
@@ -1722,6 +1725,7 @@ mod tests {
                     force_regime: squid_n_core::model::ForceRegime::Auto,
                     rigid_zone: Default::default(),
                     plastic_zone: None,
+                    spring: None,
                 },
             ],
             sections: vec![col_sec, beam_sec],
@@ -1777,6 +1781,7 @@ mod tests {
             force_regime: squid_n_core::model::ForceRegime::Auto,
             rigid_zone: Default::default(),
             plastic_zone: None,
+            spring: None,
         };
 
         let mut model = Model {
@@ -1895,6 +1900,7 @@ mod tests {
                     ..Default::default()
                 },
                 plastic_zone: None,
+                spring: None,
             }],
             sections: vec![sec],
             materials: vec![mat],
@@ -2014,6 +2020,7 @@ mod tests {
                     force_regime: squid_n_core::model::ForceRegime::Auto,
                     rigid_zone: Default::default(),
                     plastic_zone: None,
+                    spring: None,
                 },
                 ElementData {
                     id: ElemId(1),
@@ -2028,6 +2035,7 @@ mod tests {
                     force_regime: squid_n_core::model::ForceRegime::Auto,
                     rigid_zone: Default::default(),
                     plastic_zone: None,
+                    spring: None,
                 },
             ],
             sections: vec![col_sec, beam_sec],
@@ -2123,6 +2131,7 @@ mod tests {
                     force_regime: squid_n_core::model::ForceRegime::Auto,
                     rigid_zone: Default::default(),
                     plastic_zone: None,
+                    spring: None,
                 },
                 ElementData {
                     id: ElemId(1),
@@ -2137,6 +2146,7 @@ mod tests {
                     force_regime: squid_n_core::model::ForceRegime::Auto,
                     rigid_zone: Default::default(),
                     plastic_zone: None,
+                    spring: None,
                 },
             ],
             sections: vec![col_sec, beam_sec],
@@ -2232,6 +2242,7 @@ mod tests {
                     force_regime: squid_n_core::model::ForceRegime::Auto,
                     rigid_zone: Default::default(),
                     plastic_zone: None,
+                    spring: None,
                 },
                 ElementData {
                     id: ElemId(1),
@@ -2246,6 +2257,7 @@ mod tests {
                     force_regime: squid_n_core::model::ForceRegime::Auto,
                     rigid_zone: Default::default(),
                     plastic_zone: None,
+                    spring: None,
                 },
             ],
             sections: vec![col_sec, beam_sec],
@@ -2369,6 +2381,7 @@ mod tests {
                     force_regime: squid_n_core::model::ForceRegime::Auto,
                     rigid_zone: Default::default(),
                     plastic_zone: None,
+                    spring: None,
                 },
                 ElementData {
                     id: ElemId(1),
@@ -2383,6 +2396,7 @@ mod tests {
                     force_regime: squid_n_core::model::ForceRegime::Auto,
                     rigid_zone: Default::default(),
                     plastic_zone: None,
+                    spring: None,
                 },
                 // 節点1に接続する壁要素（節点1-3）。梁と直交するがWall kindなので無視される。
                 ElementData {
@@ -2398,6 +2412,7 @@ mod tests {
                     force_regime: squid_n_core::model::ForceRegime::Auto,
                     rigid_zone: Default::default(),
                     plastic_zone: None,
+                    spring: None,
                 },
             ],
             sections: vec![col_sec, beam_sec, wall_sec],
@@ -2476,6 +2491,7 @@ mod tests {
             force_regime: ForceRegime::Auto,
             rigid_zone: Default::default(),
             plastic_zone: None,
+            spring: None,
         };
 
         // 壁なしモデル（基準）
@@ -2502,6 +2518,7 @@ mod tests {
             force_regime: ForceRegime::Auto,
             rigid_zone: Default::default(),
             plastic_zone: None,
+            spring: None,
         };
         let model_with_wall = Model {
             nodes,
@@ -2590,6 +2607,7 @@ mod tests {
             force_regime: ForceRegime::Auto,
             rigid_zone: Default::default(),
             plastic_zone: None,
+            spring: None,
         };
         let wall_elem = ElementData {
             id: ElemId(1),
@@ -2604,6 +2622,7 @@ mod tests {
             force_regime: ForceRegime::Auto,
             rigid_zone: Default::default(),
             plastic_zone: None,
+            spring: None,
         };
         let model = Model {
             nodes,
@@ -2678,6 +2697,7 @@ mod tests {
             force_regime: ForceRegime::Auto,
             rigid_zone: Default::default(),
             plastic_zone: None,
+            spring: None,
         };
         let wall_elem = ElementData {
             id: ElemId(1),
@@ -2692,6 +2712,7 @@ mod tests {
             force_regime: ForceRegime::Auto,
             rigid_zone: Default::default(),
             plastic_zone: None,
+            spring: None,
         };
         let model = Model {
             nodes,
@@ -2775,6 +2796,7 @@ mod tests {
             force_regime: ForceRegime::Auto,
             rigid_zone: Default::default(),
             plastic_zone: None,
+            spring: None,
         };
         let wall_elem = ElementData {
             id: ElemId(1),
@@ -2789,6 +2811,7 @@ mod tests {
             force_regime: ForceRegime::Auto,
             rigid_zone: Default::default(),
             plastic_zone: None,
+            spring: None,
         };
         let mut model = Model {
             nodes,
@@ -2916,6 +2939,7 @@ mod tests {
             force_regime: ForceRegime::Auto,
             rigid_zone: Default::default(),
             plastic_zone: None,
+            spring: None,
         };
         let wall_elem = ElementData {
             id: ElemId(1),
@@ -2930,6 +2954,7 @@ mod tests {
             force_regime: ForceRegime::Auto,
             rigid_zone: Default::default(),
             plastic_zone: None,
+            spring: None,
         };
         let mut model = Model {
             nodes,
@@ -3078,6 +3103,7 @@ mod tests {
             force_regime: ForceRegime::Auto,
             rigid_zone: Default::default(),
             plastic_zone: None,
+            spring: None,
         };
         let beam_elem = ElementData {
             id: ElemId(1),
@@ -3092,6 +3118,7 @@ mod tests {
             force_regime: ForceRegime::Auto,
             rigid_zone: Default::default(),
             plastic_zone: None,
+            spring: None,
         };
         let wall_elem = ElementData {
             id: ElemId(2),
@@ -3106,6 +3133,7 @@ mod tests {
             force_regime: ForceRegime::Auto,
             rigid_zone: Default::default(),
             plastic_zone: None,
+            spring: None,
         };
         // 開口なし（wall_attrs 未設定）・t=150 → 耐震壁成立
         let model = Model {

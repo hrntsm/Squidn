@@ -5,9 +5,12 @@ use crate::transaction::{StateSnapshot, StatefulModel};
 use smallvec::SmallVec;
 use squid_n_core::dof::DofMap;
 use squid_n_core::ids::{ElemId, StoryId};
-use squid_n_core::model::Model;
+use squid_n_core::model::{ElementData, Material, Model, RigidZone, Section};
+use squid_n_core::rc_capacity::{rc_qsu_simple, RcCapacityInput};
+use squid_n_core::section_shape::{BarSet, RcRebar, SectionShape};
 use squid_n_element::behavior::{Ctx, ElemState, ElementBehavior, LocalVec};
 use squid_n_element::factory::build_nonlinear_behavior;
+use squid_n_element::transform::LocalFrame;
 use squid_n_math::solver::{make_solver, SolverBackend};
 
 /// 性能曲線の1点（P5 §7.4）
@@ -42,11 +45,23 @@ pub enum MechanismType {
     Partial,
 }
 
+/// せん断降伏イベント（RESP-D マニュアル計算編03「応力解析」§段階的耐力喪失解析）。
+///
+/// 部材端のせん断力（局所 Vy・Vz の材端最大値）がせん断降伏耐力 Qy
+/// （[`compute_shear_yield_qy`] 参照）を超えたステップを記録する。曲げヒンジ
+/// （[`HingeEvent`]）とは独立に判定され、曲げ降伏の有無に関わらず記録される。
+pub struct ShearYieldEvent {
+    pub step: u32,
+    pub elem: ElemId,
+}
+
 /// プッシュオーバー解析結果（P5 §7.4）
 pub struct PushoverResult {
     pub steps: Vec<PushoverStep>,
     pub capacity_curve: Vec<CapacityPoint>,
     pub hinges: Vec<HingeEvent>,
+    /// せん断降伏イベント履歴（段階的耐力喪失解析の判定に使用、`strength_loss` モジュール参照）。
+    pub shear_yields: Vec<ShearYieldEvent>,
     pub mechanism: MechanismType,
     pub qu: f64,
 }
@@ -56,6 +71,10 @@ pub struct PushoverStep {
     pub top_disp: f64,
     pub base_shear: f64,
     pub story_drifts: Vec<f64>,
+    /// 当該ステップ確定時点の全自由節点変位（`DofMap` のアクティブ添字順）。
+    /// 段階的耐力喪失解析（`strength_loss` モジュール）が部材変形角を算定するための
+    /// 記録で、既定では収集しない（オプトイン、`pushover_analysis_recording` 参照）。
+    pub node_disp: Option<Vec<f64>>,
 }
 
 pub(crate) fn assemble_k(
@@ -237,6 +256,37 @@ pub fn pushover_analysis(
     use_arc_length: bool,
     arc_length_dl: f64,
 ) -> Result<PushoverResult, String> {
+    pushover_analysis_recording(
+        model,
+        dofmap,
+        reducer,
+        dir,
+        max_steps,
+        max_disp,
+        use_kg,
+        use_arc_length,
+        arc_length_dl,
+        false,
+    )
+}
+
+/// プッシュオーバー解析（P5 §7）。`record_node_disp` が真の場合、各ステップの
+/// `PushoverStep::node_disp` に全自由節点変位を記録する（段階的耐力喪失解析の
+/// 部材変形角算定用、`strength_loss` モジュール参照）。既存 API を壊さないよう
+/// `pushover_analysis` は本関数に `record_node_disp = false` で委譲する薄いラッパー。
+#[allow(clippy::too_many_arguments)]
+pub fn pushover_analysis_recording(
+    model: &mut Model,
+    dofmap: &DofMap,
+    reducer: &Reducer,
+    dir: SeismicDir,
+    max_steps: usize,
+    max_disp: f64,
+    use_kg: bool,
+    use_arc_length: bool,
+    arc_length_dl: f64,
+    record_node_disp: bool,
+) -> Result<PushoverResult, String> {
     let n_active = dofmap.n_active();
     if n_active == 0 {
         return Err("no active DOF".into());
@@ -294,7 +344,9 @@ pub fn pushover_analysis(
     }
 
     let thresholds = compute_hinge_thresholds(model);
+    let shear_thresholds = compute_shear_yield_thresholds(model);
     let mut hinges = Vec::new();
+    let mut shear_yields = Vec::new();
     let mut capacity_curve = Vec::new();
     let mut steps: Vec<PushoverStep> = Vec::new();
     let mut total_disp = vec![0.0; n_active];
@@ -381,6 +433,7 @@ pub fn pushover_analysis(
                     top_disp: roof,
                     base_shear,
                     story_drifts: story_drift,
+                    node_disp: record_node_disp.then(|| total_disp.clone()),
                 });
                 track_hinges(
                     model,
@@ -389,6 +442,13 @@ pub fn pushover_analysis(
                     &thresholds,
                     step as u32,
                     &mut hinges,
+                );
+                track_shear_yield(
+                    model,
+                    &behaviors,
+                    &shear_thresholds,
+                    step as u32,
+                    &mut shear_yields,
                 );
                 step_ok = true;
                 if max_disp > 0.0 && roof >= max_disp {
@@ -503,8 +563,16 @@ pub fn pushover_analysis(
                             top_disp: roof,
                             base_shear,
                             story_drifts: story_drift,
+                            node_disp: record_node_disp.then(|| total_disp.clone()),
                         });
                         track_hinges(model, dofmap, &behaviors, &thresholds, cstep, &mut hinges);
+                        track_shear_yield(
+                            model,
+                            &behaviors,
+                            &shear_thresholds,
+                            cstep,
+                            &mut shear_yields,
+                        );
                         step_ok = true;
                         break;
                     } else {
@@ -596,6 +664,7 @@ pub fn pushover_analysis(
                         top_disp: roof,
                         base_shear,
                         story_drifts: story_drift,
+                        node_disp: record_node_disp.then(|| total_disp.clone()),
                     });
                 }
                 _ => {
@@ -617,6 +686,7 @@ pub fn pushover_analysis(
         steps,
         capacity_curve,
         hinges,
+        shear_yields,
         mechanism,
         qu,
     })
@@ -695,6 +765,347 @@ fn track_hinges(
             level,
             ductility: if th.my > 0.0 { m_max / th.my } else { 0.0 },
         });
+    }
+}
+
+/// せん断降伏耐力 Qy の判定しきい値（部材ごと、局所 y・z 方向、独立）。
+///
+/// `y` は局所 y 方向せん断力 Vy（弱軸曲げに伴う、`Section.as_y`）、
+/// `z` は局所 z 方向せん断力 Vz（強軸曲げに伴う、`Section.as_z`）に対する
+/// しきい値であり、`track_shear_yield` で Vy vs `y.qy(..)`・Vz vs `z.qy(..)` を
+/// 独立に判定する（v1 のような「合力 vs min(qy_y,qy_z)」の丸めは行わない）。
+/// RC矩形（[`DirThreshold::RcArakawa`]）方向は、各ステップの部材軸力（圧縮）
+/// から動的に σ0 を反映した Qy を都度算定する（精緻化2、`track_shear_yield` 参照）。
+struct ShearThreshold {
+    y: DirThreshold,
+    z: DirThreshold,
+}
+
+/// せん断降伏耐力 Qy の算定方式（方向別）。
+///
+/// `Static` は解析開始時に一度だけ算定される軸力非依存のしきい値（鋼系、または
+/// 配筋情報が無い／算定不能な RC のフォールバック）。`RcArakawa` は RC矩形
+/// （`SectionShape::RcRect`）の荒川mean式系の略算式で、σ0 を除く入力一式を
+/// 保持しておき、各ステップの軸力から求めた σ0 で上書きして
+/// [`rc_qsu_simple`] を呼び直す（精緻化2）。
+enum DirThreshold {
+    Static(f64),
+    RcArakawa {
+        /// σ0 抜きの入力一式（`sigma_0` は常に 0.0 のプレースホルダ。
+        /// [`DirThreshold::qy`] が呼び出しのたびに軸力由来の値へ差し替える）。
+        input: RcCapacityInput,
+        /// 全断面積 [mm²]（= b・D。方向によらず同一値。σ0 = 圧縮軸力/gross_area
+        /// の算定に用いる）。
+        gross_area: f64,
+    },
+}
+
+impl DirThreshold {
+    /// 圧縮軸力 `n_compress`（[N]、0 以上。引張は呼び出し側で 0 として渡す
+    /// 規約、`axial_compression` 参照）から Qy [N] を求める。
+    ///
+    /// `Static` は軸力によらず一定値。`RcArakawa` は σ0 = n_compress/gross_area
+    /// （荒川式の適用範囲 0〜0.4Fc へのクランプは [`rc_qsu_simple`] 内で行う）を
+    /// 反映した Qsu を都度算定する。
+    fn qy(&self, n_compress: f64) -> f64 {
+        match self {
+            DirThreshold::Static(v) => *v,
+            DirThreshold::RcArakawa { input, gross_area } => {
+                let sigma_0 = if *gross_area > 0.0 {
+                    n_compress / gross_area
+                } else {
+                    0.0
+                };
+                let mut inp = *input;
+                inp.sigma_0 = sigma_0;
+                rc_qsu_simple(&inp)
+            }
+        }
+    }
+}
+
+/// せん断降伏耐力 Qy 算定対象の方向（局所座標系）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ShearDir {
+    /// 局所 y 方向（弱軸曲げに伴うせん断、`Section.as_y`・`RcRebar.main_y` 対応）。
+    Y,
+    /// 局所 z 方向（強軸曲げに伴うせん断、`Section.as_z`・`RcRebar.main_x` 対応）。
+    Z,
+}
+
+/// `SectionShape::RcRect` の配筋情報から、指定方向の荒川mean式系の略算式
+/// （[`squid_n_core::rc_capacity::rc_qsu_simple`]）用入力一式を組み立てる。
+/// σ0 は 0.0 のプレースホルダとし、[`DirThreshold::qy`] が各ステップの軸力から
+/// 動的に上書きする（精緻化2。旧実装は σ0=0 固定の安全側簡略化だった）。
+///
+/// 変換規則は `squid-n-app::app::rc_capacity_input_from_rect` と同一の規約
+/// （上下対称配筋を仮定・at=引張側総断面積の半分、σy=fy or 345、σwy=295 固定、
+/// せん断補強筋は legs 組数を考慮）に合わせる:
+/// - 強軸（局所 z 方向せん断、`dir=Z`）: b=幅, d=せい、引張鉄筋は `rebar.main_x`。
+/// - 弱軸（局所 y 方向せん断、`dir=Y`）: b と d を入れ替え、引張鉄筋は `rebar.main_y`。
+///
+/// `clear_span`（h0）は [`effective_clear_span`] が剛域長を控除して算定した値を
+/// 渡す（精緻化1。旧実装は剛域控除を省略し節点間長をそのまま用いる簡略化だった）。
+/// `fc` 未設定の場合は None（呼び出し側で慣用値へフォールバックする）。
+fn rc_rect_capacity_input(
+    b: f64,
+    d: f64,
+    main: &BarSet,
+    rebar: &RcRebar,
+    mat: &Material,
+    clear_span: f64,
+) -> Option<RcCapacityInput> {
+    let fc = mat.fc?;
+    let bar_area = |bs: &BarSet| bs.count as f64 * std::f64::consts::PI / 4.0 * bs.dia * bs.dia;
+    // 上下対称配筋を仮定し、引張側主筋量は総断面積の半分。
+    let at = bar_area(main) / 2.0;
+    let d_eff = d - rebar.cover - main.dia / 2.0;
+    let shear_area =
+        std::f64::consts::PI / 4.0 * rebar.shear.dia * rebar.shear.dia * rebar.shear.legs as f64;
+    let pw = if rebar.shear.pitch > 0.0 {
+        shear_area / (b * rebar.shear.pitch)
+    } else {
+        0.0
+    };
+    Some(RcCapacityInput {
+        b,
+        d,
+        at,
+        d_eff,
+        sigma_y: mat.fy.unwrap_or(345.0), // SD345 相当、要・原典照合
+        fc,
+        pw,
+        sigma_wy: 295.0, // SD295 相当、要・原典照合
+        clear_span,
+        sigma_0: 0.0, // プレースホルダ。DirThreshold::qy が軸力から都度上書きする。
+    })
+}
+
+/// 方向別のせん断降伏耐力しきい値（[`DirThreshold`]）を組み立てる。
+///
+/// RC矩形（`SectionShape::RcRect`）で `fy` が無く、配筋情報から Qsu(σ0=0) が
+/// 算定可能（正の値）な場合のみ [`DirThreshold::RcArakawa`] を採用し、各ステップ
+/// で軸力から動的算定した σ0 を反映する。それ以外（鋼系・配筋情報が無い／
+/// 算定不能な RC・有効せん断断面積や材料情報が無い場合）は、解析開始時に一度だけ
+/// 算定した [`DirThreshold::Static`] を用いる（採用式は下記）:
+/// - 鋼系部材（材料に `fy` が設定されている）: Qy = as・fy / √3
+///   （純せん断降伏条件 τy = fy/√3（von Mises）に有効せん断断面積を乗じた慣用式）。
+/// - RC 系部材で `RcRect` 形状が無い、または Qsu 算定不能な場合: Qy = as・0.7√fc
+///   （コンクリートのせん断終局強度に対する簡易慣用値。荒川式等の精算は行わない）。
+/// - 有効せん断断面積 `as_area` が 0（未設定）、または材料・強度情報が無い場合は
+///   判定対象外として Qy = +∞（その方向のせん断では耐力喪失を判定しない）。
+fn build_dir_threshold(
+    as_area: f64,
+    material: Option<&Material>,
+    section: Option<&Section>,
+    dir: ShearDir,
+    clear_span: f64,
+) -> DirThreshold {
+    if as_area <= 0.0 {
+        return DirThreshold::Static(f64::INFINITY);
+    }
+    let Some(mat) = material else {
+        return DirThreshold::Static(f64::INFINITY);
+    };
+    if let Some(fy) = mat.fy {
+        return DirThreshold::Static(as_area * fy / 3.0_f64.sqrt());
+    }
+    let Some(fc) = mat.fc else {
+        return DirThreshold::Static(f64::INFINITY);
+    };
+    if let Some(Section {
+        shape: Some(SectionShape::RcRect { b, d, rebar }),
+        ..
+    }) = section
+    {
+        let input = match dir {
+            ShearDir::Z => rc_rect_capacity_input(*b, *d, &rebar.main_x, rebar, mat, clear_span),
+            ShearDir::Y => rc_rect_capacity_input(*d, *b, &rebar.main_y, rebar, mat, clear_span),
+        };
+        if let Some(input) = input {
+            if rc_qsu_simple(&input) > 0.0 {
+                return DirThreshold::RcArakawa {
+                    gross_area: input.b * input.d,
+                    input,
+                };
+            }
+        }
+    }
+    DirThreshold::Static(as_area * 0.7 * fc.sqrt())
+}
+
+/// せん断降伏耐力 Qy [N] を算定する（RESP-D マニュアル計算編03「応力解析」
+/// §段階的耐力喪失解析のせん断降伏判定に使用）。
+///
+/// 軸力なし（σ0=0）の静的評価。単体テスト・後方互換用の薄いラッパーで、
+/// [`build_dir_threshold`] が返す [`DirThreshold`] を `n_compress=0` で評価する
+/// ことと等価（実解析 `track_shear_yield` は各ステップの軸力から動的に σ0 を
+/// 反映するため、本関数は呼ばない。テスト専用のため `#[cfg(test)]`）。
+#[cfg(test)]
+fn compute_shear_yield_qy(
+    as_area: f64,
+    material: Option<&Material>,
+    section: Option<&Section>,
+    dir: ShearDir,
+    clear_span: f64,
+) -> f64 {
+    build_dir_threshold(as_area, material, section, dir, clear_span).qy(0.0)
+}
+
+/// 部材長（節点間距離）[mm]。節点参照が欠落・退化（長さ0）の場合は None。
+/// RC のせん断降伏耐力算定における内法スパン h0 は、この節点間長から
+/// [`effective_clear_span`] が剛域長を控除して求める（精緻化1）。
+fn elem_length(model: &Model, elem: &ElementData) -> Option<f64> {
+    if elem.nodes.len() < 2 {
+        return None;
+    }
+    let pi = model.nodes.get(elem.nodes[0].index())?;
+    let pj = model.nodes.get(elem.nodes[1].index())?;
+    let dx = pj.coord[0] - pi.coord[0];
+    let dy = pj.coord[1] - pi.coord[1];
+    let dz = pj.coord[2] - pi.coord[2];
+    let len = (dx * dx + dy * dy + dz * dz).sqrt();
+    (len > 0.0).then_some(len)
+}
+
+/// 剛域控除後の内法スパン h0 [mm]（荒川式のせん断スパン比算定に用いる、精緻化1）。
+///
+/// h0 = 節点間長（`raw_length`） − (`rigid_zone.length_i` + `rigid_zone.length_j`)。
+/// 控除後が 0 以下（浮動小数点誤差により実質 0 とみなせる極小値を含む、
+/// 1e-6mm 以下）になる異常な剛域指定（剛域長の入力誤りで節点間長を超過する等）
+/// では、h0 を過小評価しないよう節点間長そのものへフォールバックする
+/// （`rc_qsu_simple` 側でもせん断スパン比 h0/(2d_e) は 1.0〜3.0 にクランプされる
+/// ため過大な Qsu には至らないが、異常値の握り潰しではなくフォールバックとして
+/// 明示する）。
+fn effective_clear_span(raw_length: f64, rigid_zone: &RigidZone) -> f64 {
+    let net = raw_length - rigid_zone.length_i - rigid_zone.length_j;
+    if net > 1e-6 {
+        net
+    } else {
+        raw_length
+    }
+}
+
+fn compute_shear_yield_thresholds(model: &Model) -> Vec<ShearThreshold> {
+    model
+        .elements
+        .iter()
+        .map(|elem| {
+            let sec = elem.section.and_then(|sid| model.sections.get(sid.index()));
+            let mat = elem
+                .material
+                .and_then(|mid| model.materials.get(mid.index()));
+            let (as_y, as_z) = sec.map(|s| (s.as_y, s.as_z)).unwrap_or((0.0, 0.0));
+            let raw_length = elem_length(model, elem).unwrap_or(0.0);
+            let clear_span = effective_clear_span(raw_length, &elem.rigid_zone);
+            ShearThreshold {
+                y: build_dir_threshold(as_y, mat, sec, ShearDir::Y, clear_span),
+                z: build_dir_threshold(as_z, mat, sec, ShearDir::Z, clear_span),
+            }
+        })
+        .collect()
+}
+
+fn dot3(v: [f64; 3], w: [f64; 3]) -> f64 {
+    v[0] * w[0] + v[1] * w[1] + v[2] * w[2]
+}
+
+/// 材端力（グローバル、i端 `f_i`・j端 `f_j`）と局所 `ex`（i→j 方向単位ベクトル、
+/// グローバル成分）から、部材の軸方向圧縮力 N_compress [N]（圧縮のみ採用、
+/// 引張は 0）を算定する（精緻化2、σ0 = N_compress/gross_area の入力）。
+///
+/// ## 符号規約（単純片持ち柱による検算）
+/// 標準的なトラス/梁要素の軸剛性行列は局所座標で
+/// `[[EA/L, -EA/L], [-EA/L, EA/L]]`（i端・j端の軸方向 DOF）であり、
+/// 引張正のひずみ `eps0 = (u_j − u_i)/L` に対し軸力 `N = EA・eps0`（引張正）
+/// を生じる。この行列を軸方向変位 `(u_i, u_j)` に適用すると、i端の局所x方向
+/// 内力は `f_local_x(i) = -N`、j端は `f_local_x(j) = +N` となる
+/// （`squid-n-element` の `FiberBeam`・`Beam` とも同一の規約。剛性行列／
+/// B行列の符号から導出、要素実装のいずれでも一致）。
+///
+/// 具体例（節点 i=(0,0,0)・節点 j=(0,0,3000)、`ref_vector=[1,0,0]` の片持ち柱、
+/// `LocalFrame::from_nodes` により `ex=[0,0,1]`）で軸圧縮を検算する: 柱頭（j端）
+/// を Δ=-1mm だけ ex 方向と逆向き（縮む向き）に変位させると、局所x方向変位は
+/// `u_i=0, u_j=dot(Δ,ex)=-1`。ひずみ `eps0=(u_j-u_i)/L=-1/L<0`（圧縮）となり
+/// `N=EA・eps0<0`。よって `f_local_x(i)=-N>0`、`f_local_x(j)=N<0`。
+///
+/// `ElementBehavior::internal_force` はグローバル力を返す契約であり、
+/// 局所x軸（`ex`）方向の内力成分はグローバル内力を `ex` へ射影すれば得られる
+/// （`AxisTransform::rotate_to_local` の定義 `v_local[0]=dot(ex,v_global)` より）。
+/// よって `dot(f_i, ex) = f_local_x(i) = -N`、`dot(f_j, ex) = f_local_x(j) = +N`。
+///
+/// 圧縮（N<0）成分のみ正の値として取り出すため、i端は `dot(f_i, ex)` を、
+/// j端は `-dot(f_j, ex)` を、それぞれ 0 未満をクランプ（引張は 0 とみなす）して
+/// 採用し、両端のうち大きい方を部材の代表圧縮力とする（安全側の丸めではなく
+/// 実勢値を採る規約。プリズマティック部材で軸方向分布荷重が無ければ理論上
+/// 両端は一致するが、数値誤差・分布荷重の影響を考慮し大きい方を採用する）。
+fn axial_compression(f_i: [f64; 3], f_j: [f64; 3], ex: [f64; 3]) -> f64 {
+    let from_i = dot3(f_i, ex).max(0.0);
+    let from_j = (-dot3(f_j, ex)).max(0.0);
+    from_i.max(from_j)
+}
+
+/// せん断降伏イベントの追跡（`track_hinges` と対をなす、曲げとは独立の判定）。
+///
+/// `ElementBehavior::internal_force` が返す材端節点力はグローバル座標成分
+/// （`f.data[0..3]`＝i端, `f.data[6..9]`＝j端）である。要素の局所座標系
+/// （`LocalFrame::from_nodes(p_i, p_j, elem.local_axis.ref_vector)`、
+/// `rot[0]=ex, rot[1]=ey, rot[2]=ez`）の `ey`・`ez` へ材端力を射影することで
+/// 局所 Vy・Vz を厳密に分離し、Vy は `qy_y`、Vz は `qy_z` と独立に比較する
+/// （v1 の「軸直交合力 vs min(qy_y,qy_z)」から改良）。各材端のうち大きい方を
+/// 部材の代表値とし、Vy・Vz のいずれかがしきい値を超えた部材を、当該ステップの
+/// せん断降伏イベントとして記録する。
+///
+/// ## 軸力 σ0 の動的反映（精緻化2）
+/// Vy・Vz と同様に材端力を局所 `ex` へ射影し、[`axial_compression`] で部材の
+/// 圧縮軸力（引張は 0、両端のうち大きい方を実勢値として採用）を求める。
+/// RC矩形の [`DirThreshold::RcArakawa`] 方向は σ0 = 圧縮軸力/(b・D) として
+/// [`DirThreshold::qy`] に渡し、`rc_qsu_simple` を呼び直して Qy を都度算定する。
+/// 鋼系・フォールバック RC（[`DirThreshold::Static`]）はこの軸力を無視し、
+/// 解析開始時の静的値をそのまま用いる。
+fn track_shear_yield(
+    model: &Model,
+    behaviors: &[Box<dyn ElementBehavior>],
+    thresholds: &[ShearThreshold],
+    step: u32,
+    events: &mut Vec<ShearYieldEvent>,
+) {
+    let state = ElemState::default();
+    let ctx = Ctx { model };
+    for (i, (elem, b)) in model.elements.iter().zip(behaviors).enumerate() {
+        if elem.nodes.len() < 2 {
+            continue;
+        }
+        let (Some(pi), Some(pj)) = (
+            model.nodes.get(elem.nodes[0].index()),
+            model.nodes.get(elem.nodes[1].index()),
+        ) else {
+            continue;
+        };
+        if elem_length(model, elem).is_none() {
+            continue;
+        }
+        let frame = LocalFrame::from_nodes(pi.coord, pj.coord, elem.local_axis.ref_vector);
+        let ex = frame.rot[0];
+        let ey = frame.rot[1];
+        let ez = frame.rot[2];
+
+        let f = b.internal_force(&state, &ctx);
+        let f_i = [f.data[0], f.data[1], f.data[2]];
+        let f_j = [f.data[6], f.data[7], f.data[8]];
+        let vy = dot3(f_i, ey).abs().max(dot3(f_j, ey).abs());
+        let vz = dot3(f_i, ez).abs().max(dot3(f_j, ez).abs());
+        let n_compress = axial_compression(f_i, f_j, ex);
+
+        let th = &thresholds[i];
+        let qy_y = th.y.qy(n_compress);
+        let qy_z = th.z.qy(n_compress);
+        if vy >= qy_y || vz >= qy_z {
+            events.push(ShearYieldEvent {
+                step,
+                elem: elem.id,
+            });
+        }
     }
 }
 
@@ -827,6 +1238,7 @@ mod tests {
         Constraint, DiaphragmDef, ElementData, ElementKind, EndCondition, ForceRegime, LocalAxis,
         Material, Node, Section, Story,
     };
+    use squid_n_core::section_shape::ShearBar;
 
     /// 1層・鉛直ファイバ柱の片持ちプッシュオーバー（P5 §10 相当の最小統合テスト）。
     /// 配線済み非線形要素（FiberBeam）＋座標変換＋NR 反復＋降伏追跡が
@@ -864,6 +1276,7 @@ mod tests {
                 force_regime: ForceRegime::Auto,
                 rigid_zone: Default::default(),
                 plastic_zone: None,
+                spring: None,
             }],
             sections: vec![Section {
                 id: SectionId(0),
@@ -1078,6 +1491,7 @@ mod tests {
                     force_regime: ForceRegime::Auto,
                     rigid_zone: Default::default(),
                     plastic_zone: None,
+                    spring: None,
                 },
                 ElementData {
                     id: ElemId(1),
@@ -1092,6 +1506,7 @@ mod tests {
                     force_regime: ForceRegime::Auto,
                     rigid_zone: Default::default(),
                     plastic_zone: None,
+                    spring: None,
                 },
             ],
             sections: vec![sec],
@@ -1215,6 +1630,7 @@ mod tests {
                 force_regime: ForceRegime::Auto,
                 rigid_zone: Default::default(),
                 plastic_zone: None,
+                spring: None,
             },
             ElementData {
                 id: ElemId(1),
@@ -1229,6 +1645,7 @@ mod tests {
                 force_regime: ForceRegime::Auto,
                 rigid_zone: Default::default(),
                 plastic_zone: None,
+                spring: None,
             },
             ElementData {
                 id: ElemId(2),
@@ -1243,6 +1660,7 @@ mod tests {
                 force_regime: ForceRegime::Auto,
                 rigid_zone: Default::default(),
                 plastic_zone: None,
+                spring: None,
             },
         ];
         let portal = Model {
@@ -1405,6 +1823,7 @@ mod tests {
                     force_regime: ForceRegime::Auto,
                     rigid_zone: Default::default(),
                     plastic_zone: None,
+                    spring: None,
                 },
                 ElementData {
                     id: ElemId(1),
@@ -1419,6 +1838,7 @@ mod tests {
                     force_regime: ForceRegime::Auto,
                     rigid_zone: Default::default(),
                     plastic_zone: None,
+                    spring: None,
                 },
                 ElementData {
                     id: ElemId(2),
@@ -1433,6 +1853,7 @@ mod tests {
                     force_regime: ForceRegime::Auto,
                     rigid_zone: Default::default(),
                     plastic_zone: None,
+                    spring: None,
                 },
             ],
             sections: vec![Section {
@@ -1593,5 +2014,629 @@ mod tests {
                 std::mem::discriminant(other)
             ),
         }
+    }
+
+    // ---- せん断降伏耐力 Qy の単体テスト ----
+
+    #[test]
+    fn test_compute_shear_yield_qy_steel() {
+        // 鋼系（fy 設定あり）: Qy = as・fy/√3（RcRect 形状の有無・方向によらない）。
+        let mat = Material {
+            id: MaterialId(0),
+            name: "s".to_string(),
+            young: 205000.0,
+            poisson: 0.3,
+            density: 0.0,
+            shear: None,
+            fc: None,
+            fy: Some(200.0),
+        };
+        let qy = compute_shear_yield_qy(1000.0, Some(&mat), None, ShearDir::Z, 3000.0);
+        let expected = 1000.0 * 200.0 / 3.0_f64.sqrt();
+        assert!(
+            (qy - expected).abs() < 1e-6,
+            "qy={qy} should equal as*fy/sqrt(3)={expected}"
+        );
+    }
+
+    #[test]
+    fn test_compute_shear_yield_qy_rc_fallback_without_rc_rect_shape() {
+        // RC系（fy 無し・fc 設定あり）かつ断面形状情報（RcRect）が無い場合:
+        // Qy = as・0.7√fc（慣用値へフォールバック）。
+        let mat = Material {
+            id: MaterialId(0),
+            name: "rc".to_string(),
+            young: 23000.0,
+            poisson: 0.2,
+            density: 0.0,
+            shear: None,
+            fc: Some(24.0),
+            fy: None,
+        };
+        let qy = compute_shear_yield_qy(50000.0, Some(&mat), None, ShearDir::Z, 3000.0);
+        let expected = 50000.0 * 0.7 * 24.0_f64.sqrt();
+        assert!(
+            (qy - expected).abs() < 1e-6,
+            "qy={qy} should equal as*0.7*sqrt(fc)={expected}"
+        );
+    }
+
+    #[test]
+    fn test_compute_shear_yield_qy_zero_as_is_infinite() {
+        // 有効せん断断面積が 0 の断面は判定対象外（Qy=∞扱い）。
+        let mat = Material {
+            id: MaterialId(0),
+            name: "s".to_string(),
+            young: 205000.0,
+            poisson: 0.3,
+            density: 0.0,
+            shear: None,
+            fc: None,
+            fy: Some(200.0),
+        };
+        assert_eq!(
+            compute_shear_yield_qy(0.0, Some(&mat), None, ShearDir::Z, 3000.0),
+            f64::INFINITY
+        );
+        // 材料未設定でも∞扱い。
+        assert_eq!(
+            compute_shear_yield_qy(1000.0, None, None, ShearDir::Z, 3000.0),
+            f64::INFINITY
+        );
+    }
+
+    /// RC 矩形断面（`SectionShape::RcRect`）+ 配筋情報がある場合、Qy は荒川式
+    /// （`rc_qsu_simple`）による方向別算定値に一致すること。
+    /// z 方向（強軸・main_x）、y 方向（弱軸・main_y、b/d 入れ替え）の双方を検証する。
+    #[test]
+    fn test_compute_shear_yield_qy_rc_rect_matches_arakawa_handcalc() {
+        let rebar = RcRebar {
+            main_x: BarSet {
+                count: 6,
+                dia: 25.0,
+                layers: 1,
+            },
+            main_y: BarSet {
+                count: 4,
+                dia: 19.0,
+                layers: 1,
+            },
+            cover: 40.0,
+            shear: ShearBar {
+                dia: 10.0,
+                pitch: 100.0,
+                legs: 2,
+                grade: None,
+            },
+        };
+        let (b, d) = (400.0, 600.0);
+        let shape = SectionShape::RcRect {
+            b,
+            d,
+            rebar: rebar.clone(),
+        };
+        let sec = shape.to_section(SectionId(0), "RC-400x600".into());
+        let mat = Material {
+            id: MaterialId(0),
+            name: "rc".to_string(),
+            young: 23000.0,
+            poisson: 0.2,
+            density: 0.0,
+            shear: None,
+            fc: Some(24.0),
+            fy: None,
+        };
+        let clear_span = 3000.0;
+
+        // z 方向（強軸）: b=幅, d=せい, 引張鉄筋 main_x。
+        let bar_area = |bs: &BarSet| bs.count as f64 * std::f64::consts::PI / 4.0 * bs.dia * bs.dia;
+        let qsu_z_handcalc = rc_qsu_simple(&RcCapacityInput {
+            b,
+            d,
+            at: bar_area(&rebar.main_x) / 2.0,
+            d_eff: d - rebar.cover - rebar.main_x.dia / 2.0,
+            sigma_y: 345.0,
+            fc: 24.0,
+            pw: (std::f64::consts::PI / 4.0 * 10.0 * 10.0 * 2.0) / (b * 100.0),
+            sigma_wy: 295.0,
+            clear_span,
+            sigma_0: 0.0,
+        });
+        let qy_z =
+            compute_shear_yield_qy(sec.as_z, Some(&mat), Some(&sec), ShearDir::Z, clear_span);
+        assert!(
+            (qy_z - qsu_z_handcalc).abs() < 1e-6,
+            "qy_z={qy_z} should equal rc_qsu_simple handcalc={qsu_z_handcalc}"
+        );
+
+        // y 方向（弱軸）: b と d を入れ替え、引張鉄筋 main_y。
+        let qsu_y_handcalc = rc_qsu_simple(&RcCapacityInput {
+            b: d,
+            d: b,
+            at: bar_area(&rebar.main_y) / 2.0,
+            d_eff: b - rebar.cover - rebar.main_y.dia / 2.0,
+            sigma_y: 345.0,
+            fc: 24.0,
+            pw: (std::f64::consts::PI / 4.0 * 10.0 * 10.0 * 2.0) / (d * 100.0),
+            sigma_wy: 295.0,
+            clear_span,
+            sigma_0: 0.0,
+        });
+        let qy_y =
+            compute_shear_yield_qy(sec.as_y, Some(&mat), Some(&sec), ShearDir::Y, clear_span);
+        assert!(
+            (qy_y - qsu_y_handcalc).abs() < 1e-6,
+            "qy_y={qy_y} should equal rc_qsu_simple handcalc={qsu_y_handcalc}"
+        );
+        // 断面が非正方形（b≠d、主筋も非対称）なので z・y の Qy は異なるはず。
+        assert!((qy_z - qy_y).abs() > 1.0, "qy_z={qy_z} qy_y={qy_y}");
+    }
+
+    /// as_y/as_z を明示的に与えた片持ち柱モデル（`single_column_model` のせん断有効
+    /// 断面積を差し替えたもの）。せん断降伏耐力 Qy は as_y/as_z と材料強度のみに
+    /// 依存し、実際に生じるせん断力（`track_shear_yield`）は材端力の釣合いから
+    /// 求まるため、せん断バネ剛性（材料のせん断弾性係数）を変更する必要はない。
+    fn single_column_model_with_shear(fy: f64, seismic_weight: f64, as_shear: f64) -> Model {
+        let mut model = single_column_model(fy, seismic_weight);
+        model.sections[0].as_y = as_shear;
+        model.sections[0].as_z = as_shear;
+        model
+    }
+
+    #[test]
+    fn test_pushover_shear_yield_event_recorded() {
+        // せん断有効断面積を小さく設定してせん断降伏耐力 Qy を小さくすることで、
+        // 水平荷重漸増中にせん断降伏イベントが記録されることを確認する
+        // （曲げヒンジ判定 `track_hinges` とは独立の判定経路の検証）。
+        let mut model = single_column_model_with_shear(235.0, 80_000.0, 50.0);
+        let dofmap = DofMap::build(&model);
+        let reducer = Reducer::build(&model, &dofmap);
+
+        let result = pushover_analysis(
+            &mut model,
+            &dofmap,
+            &reducer,
+            SeismicDir::X,
+            20,
+            0.0,
+            false,
+            false,
+            0.0,
+        )
+        .expect("pushover should run end-to-end");
+
+        assert!(
+            !result.shear_yields.is_empty(),
+            "shear yield event should be recorded when Qy is small relative to applied shear"
+        );
+    }
+
+    /// as_y・as_z を独立に設定した片持ち柱モデル（局所 y・z 方向分離の検証用）。
+    fn single_column_model_with_shear_yz(
+        fy: f64,
+        seismic_weight: f64,
+        as_y: f64,
+        as_z: f64,
+    ) -> Model {
+        let mut model = single_column_model(fy, seismic_weight);
+        model.sections[0].as_y = as_y;
+        model.sections[0].as_z = as_z;
+        model
+    }
+
+    /// `single_column_model` は節点 (0,0,0)→(0,0,3000)、`local_axis.ref_vector=[1,0,0]`
+    /// なので局所座標系は ex=[0,0,1], ey=[1,0,0], ez=[0,1,0]（`LocalFrame::from_nodes`）。
+    /// `SeismicDir::X` でプッシュすると力はグローバル X＝局所 y（ey）方向に生じ、
+    /// 局所 z（ez＝グローバル Y）方向にはほぼ生じない。
+    fn run_pushover_has_shear_yield(as_y: f64, as_z: f64) -> bool {
+        let mut model = single_column_model_with_shear_yz(235.0, 80_000.0, as_y, as_z);
+        let dofmap = DofMap::build(&model);
+        let reducer = Reducer::build(&model, &dofmap);
+        let result = pushover_analysis(
+            &mut model,
+            &dofmap,
+            &reducer,
+            SeismicDir::X,
+            20,
+            0.0,
+            false,
+            false,
+            0.0,
+        )
+        .expect("pushover should run end-to-end");
+        !result.shear_yields.is_empty()
+    }
+
+    /// 局所 y/z 方向の厳密分離（改良1）の検証:
+    /// 実際に力が生じる方向（局所 y）の Qy を小さくすればせん断降伏イベントが
+    /// 記録されるが、力がほぼ生じない方向（局所 z）の Qy をどれだけ小さくしても
+    /// 記録されないこと。v1（軸直交合力 vs min(qy_y,qy_z)）では後者でも
+    /// 誤って記録されてしまっていた（qy_z が min を支配してしまうため）。
+    #[test]
+    fn test_pushover_shear_yield_direction_independent() {
+        assert!(
+            run_pushover_has_shear_yield(50.0, 1.0e12),
+            "small as_y (the actually-stressed local direction) should trigger a shear yield event"
+        );
+        assert!(
+            !run_pushover_has_shear_yield(1.0e12, 50.0),
+            "small as_z (the unstressed local direction) should NOT trigger a shear yield event \
+             once Vy/Vz are judged independently against qy_y/qy_z"
+        );
+    }
+
+    // ---- 精緻化1: h0 への剛域控除の単体テスト ----
+
+    #[test]
+    fn test_effective_clear_span_deducts_rigid_zone_lengths() {
+        let rz = RigidZone {
+            length_i: 500.0,
+            length_j: 300.0,
+            ..Default::default()
+        };
+        // h0 = 節点間長3000 − (500+300) = 2200。
+        assert!((effective_clear_span(3000.0, &rz) - 2200.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_effective_clear_span_falls_back_when_non_positive() {
+        // 剛域長の合計が節点間長を超える異常入力 → 節点間長へフォールバック。
+        let rz_over = RigidZone {
+            length_i: 2000.0,
+            length_j: 1500.0,
+            ..Default::default()
+        };
+        assert_eq!(effective_clear_span(3000.0, &rz_over), 3000.0);
+
+        // ちょうど0（または極小の浮動小数点誤差域）でもフォールバック。
+        let rz_zero = RigidZone {
+            length_i: 1500.0,
+            length_j: 1500.0,
+            ..Default::default()
+        };
+        assert_eq!(effective_clear_span(3000.0, &rz_zero), 3000.0);
+    }
+
+    /// RC矩形断面 + 配筋情報を持つ要素モデル（剛域テスト共通）。
+    /// 節点間距離3000mm、`rigid_zone` は呼び出し側で差し替える。
+    fn rc_column_model_with_rigid_zone(rigid_zone: RigidZone) -> (Model, RcRebar, f64, f64) {
+        let rebar = RcRebar {
+            main_x: BarSet {
+                count: 6,
+                dia: 25.0,
+                layers: 1,
+            },
+            main_y: BarSet {
+                count: 4,
+                dia: 19.0,
+                layers: 1,
+            },
+            cover: 40.0,
+            shear: ShearBar {
+                dia: 10.0,
+                pitch: 100.0,
+                legs: 2,
+                grade: None,
+            },
+        };
+        let (b, d) = (400.0, 600.0);
+        let shape = SectionShape::RcRect {
+            b,
+            d,
+            rebar: rebar.clone(),
+        };
+        let sec = shape.to_section(SectionId(0), "RC-400x600".into());
+        let mat = Material {
+            id: MaterialId(0),
+            name: "rc".to_string(),
+            young: 23000.0,
+            poisson: 0.2,
+            density: 0.0,
+            shear: None,
+            fc: Some(24.0),
+            fy: None,
+        };
+        let model = Model {
+            nodes: vec![
+                Node {
+                    id: NodeId(0),
+                    coord: [0.0, 0.0, 0.0],
+                    restraint: Dof6Mask::FIXED,
+                    mass: None,
+                    story: None,
+                },
+                Node {
+                    id: NodeId(1),
+                    coord: [0.0, 0.0, 3000.0],
+                    restraint: Dof6Mask::FREE,
+                    mass: None,
+                    story: Some(StoryId(0)),
+                },
+            ],
+            elements: vec![ElementData {
+                id: ElemId(0),
+                kind: ElementKind::Fiber,
+                nodes: smallvec::smallvec![NodeId(0), NodeId(1)],
+                section: Some(SectionId(0)),
+                material: Some(MaterialId(0)),
+                local_axis: LocalAxis {
+                    ref_vector: [1.0, 0.0, 0.0],
+                },
+                end_cond: [EndCondition::Fixed, EndCondition::Fixed],
+                force_regime: ForceRegime::Auto,
+                rigid_zone,
+                plastic_zone: None,
+                spring: None,
+            }],
+            sections: vec![sec],
+            materials: vec![mat],
+            ..Default::default()
+        };
+        (model, rebar, b, d)
+    }
+
+    #[test]
+    fn test_compute_shear_yield_thresholds_rc_rect_uses_rigid_zone_reduced_clear_span() {
+        // 剛域: length_i=400, length_j=200 → h0 = 3000-600 = 2400。
+        let rigid_zone = RigidZone {
+            length_i: 400.0,
+            length_j: 200.0,
+            ..Default::default()
+        };
+        let (model, rebar, b, d) = rc_column_model_with_rigid_zone(rigid_zone);
+        let thresholds = compute_shear_yield_thresholds(&model);
+        let th = &thresholds[0];
+
+        let bar_area = |bs: &BarSet| bs.count as f64 * std::f64::consts::PI / 4.0 * bs.dia * bs.dia;
+        let expected_clear_span = 2400.0;
+
+        // z方向（強軸・main_x）: RcArakawa を採用し、h0=2400 での rc_qsu_simple 手計算に一致。
+        let qsu_z_handcalc = rc_qsu_simple(&RcCapacityInput {
+            b,
+            d,
+            at: bar_area(&rebar.main_x) / 2.0,
+            d_eff: d - rebar.cover - rebar.main_x.dia / 2.0,
+            sigma_y: 345.0,
+            fc: 24.0,
+            pw: (std::f64::consts::PI / 4.0 * 10.0 * 10.0 * 2.0) / (b * 100.0),
+            sigma_wy: 295.0,
+            clear_span: expected_clear_span,
+            sigma_0: 0.0,
+        });
+        match &th.z {
+            DirThreshold::RcArakawa { input, gross_area } => {
+                assert!(
+                    (input.clear_span - expected_clear_span).abs() < 1e-9,
+                    "clear_span={} expected={}",
+                    input.clear_span,
+                    expected_clear_span
+                );
+                assert!((gross_area - b * d).abs() < 1e-9);
+            }
+            DirThreshold::Static(_) => panic!("expected RcArakawa for RcRect with rebar"),
+        }
+        assert!(
+            (th.z.qy(0.0) - qsu_z_handcalc).abs() < 1e-6,
+            "qy(0.0)={} handcalc={}",
+            th.z.qy(0.0),
+            qsu_z_handcalc
+        );
+    }
+
+    #[test]
+    fn test_compute_shear_yield_thresholds_rc_rect_falls_back_when_rigid_zone_exceeds_length() {
+        // 剛域長の合計(2000+1500=3500)が節点間長(3000)を超える異常入力
+        // → h0 は節点間長3000へフォールバックする。
+        let rigid_zone = RigidZone {
+            length_i: 2000.0,
+            length_j: 1500.0,
+            ..Default::default()
+        };
+        let (model, rebar, b, d) = rc_column_model_with_rigid_zone(rigid_zone);
+        let thresholds = compute_shear_yield_thresholds(&model);
+        let th = &thresholds[0];
+
+        let bar_area = |bs: &BarSet| bs.count as f64 * std::f64::consts::PI / 4.0 * bs.dia * bs.dia;
+        let qsu_z_handcalc = rc_qsu_simple(&RcCapacityInput {
+            b,
+            d,
+            at: bar_area(&rebar.main_x) / 2.0,
+            d_eff: d - rebar.cover - rebar.main_x.dia / 2.0,
+            sigma_y: 345.0,
+            fc: 24.0,
+            pw: (std::f64::consts::PI / 4.0 * 10.0 * 10.0 * 2.0) / (b * 100.0),
+            sigma_wy: 295.0,
+            clear_span: 3000.0, // フォールバック後の値
+            sigma_0: 0.0,
+        });
+        assert!((th.z.qy(0.0) - qsu_z_handcalc).abs() < 1e-6);
+    }
+
+    // ---- 精緻化2: 軸力σ0の動的反映の単体テスト ----
+
+    #[test]
+    fn test_dir_threshold_qy_axial_term_matches_handcalc() {
+        // rc_capacity::tests::sample_input と同一の断面（b=400,D=600,pw=0.002等）で
+        // DirThreshold::RcArakawa を直接構成し、圧縮軸力からの σ0 反映を検算する。
+        let b = 400.0;
+        let d = 600.0;
+        let d_eff = 530.0;
+        let input = RcCapacityInput {
+            b,
+            d,
+            at: 1935.0,
+            d_eff,
+            sigma_y: 345.0,
+            fc: 24.0,
+            pw: 0.002,
+            sigma_wy: 295.0,
+            clear_span: 3000.0,
+            sigma_0: 0.0, // プレースホルダ（qy() が上書きする）
+        };
+        let gross_area = b * d;
+        let th = DirThreshold::RcArakawa { input, gross_area };
+
+        let qy_base = th.qy(0.0);
+        let qsu_base_handcalc = rc_qsu_simple(&input);
+        assert!((qy_base - qsu_base_handcalc).abs() < 1e-6);
+
+        // 圧縮軸力 N_compress = 5.0 * gross_area → σ0 = 5.0 [N/mm²]（適用範囲0〜0.4Fc=9.6内）。
+        let sigma_0 = 5.0;
+        let n_compress = sigma_0 * gross_area;
+        let qy_with_axial = th.qy(n_compress);
+        let j = 7.0 * d_eff / 8.0;
+        let expected_delta = 0.1 * sigma_0 * b * j;
+        assert!(
+            (qy_with_axial - qy_base - expected_delta).abs() < 1e-6,
+            "delta={} expected={}",
+            qy_with_axial - qy_base,
+            expected_delta
+        );
+
+        // 引張（n_compress=0、呼び出し側で既にクランプ済みの規約）は σ0=0 のまま、
+        // Qy は base と一致（増えない）。
+        assert!((th.qy(0.0) - qy_base).abs() < 1e-9);
+    }
+
+    /// 軸力符号規約の検算（単純片持ち柱、節点 i=(0,0,0)・j=(0,0,3000)、
+    /// `ref_vector=[1,0,0]` → `LocalFrame::from_nodes` により ex=[0,0,1]）。
+    ///
+    /// 柱頭（j端）を Δ=-1mm（ex と逆向き、圧縮方向）変位させたときの内力を
+    /// 手計算（f_local_x(i)=-N>0, f_local_x(j)=N<0、doc `axial_compression` 参照）
+    /// で再現し、`axial_compression` がこの圧縮を正しく検出することを確認する。
+    #[test]
+    fn test_axial_compression_sign_convention_handcalc() {
+        let ex = [0.0, 0.0, 1.0];
+        // 圧縮（N<0、|N|=1000）: f_i はコンプレッション側 = +|N|・ex、f_j = -|N|・ex。
+        let n_compress_mag = 1000.0;
+        let f_i_comp = [0.0, 0.0, n_compress_mag];
+        let f_j_comp = [0.0, 0.0, -n_compress_mag];
+        assert!(
+            (axial_compression(f_i_comp, f_j_comp, ex) - n_compress_mag).abs() < 1e-9,
+            "compression should be detected as a positive n_compress"
+        );
+
+        // 引張（N>0）: 圧縮側の符号が反転 → axial_compression は 0（圧縮なし）。
+        let f_i_tension = [0.0, 0.0, -n_compress_mag];
+        let f_j_tension = [0.0, 0.0, n_compress_mag];
+        assert_eq!(
+            axial_compression(f_i_tension, f_j_tension, ex),
+            0.0,
+            "pure tension must not be treated as compression (sigma_0=0 for tension)"
+        );
+
+        // 片端のみ圧縮成分がある非対称ケース（数値誤差や分布荷重を模擬）:
+        // 両端のうち大きい方（実勢値）を採用する。
+        let f_i_asym = [0.0, 0.0, n_compress_mag];
+        let f_j_asym = [0.0, 0.0, -0.5 * n_compress_mag];
+        assert!(
+            (axial_compression(f_i_asym, f_j_asym, ex) - n_compress_mag).abs() < 1e-9,
+            "should take the larger of the two end-derived compression values"
+        );
+    }
+
+    /// `ElementBehavior::internal_force` が固定のグローバル材端力を返すだけのテスト
+    /// スタブ（`track_shear_yield` は `global_dofs`/剛性を使わないため他は無関係）。
+    struct FixedForceBehavior {
+        f: LocalVec,
+    }
+
+    impl ElementBehavior for FixedForceBehavior {
+        fn n_dof(&self) -> usize {
+            12
+        }
+        fn global_dofs(&self, _dof: &DofMap) -> SmallVec<[usize; 24]> {
+            SmallVec::new()
+        }
+        fn tangent_stiffness(
+            &self,
+            _state: &ElemState,
+            _ctx: &Ctx,
+        ) -> squid_n_element::behavior::LocalMat {
+            squid_n_element::behavior::LocalMat::zeros(12)
+        }
+        fn internal_force(&self, _state: &ElemState, _ctx: &Ctx) -> LocalVec {
+            LocalVec {
+                data: self.f.data.clone(),
+            }
+        }
+        fn mass_matrix(
+            &self,
+            _opt: squid_n_element::behavior::MassOption,
+        ) -> squid_n_element::behavior::LocalMat {
+            squid_n_element::behavior::LocalMat::zeros(12)
+        }
+    }
+
+    /// 精緻化2のエンドツーエンド確認: 同一のせん断力 Vz デマンドに対し、
+    /// 軸圧縮が作用する場合は σ0 反映で Qy が増え判定を免れるが、圧縮が無い
+    /// （引張・軸力ゼロ）場合は従来どおり判定に掛かることを、実際の
+    /// `track_shear_yield` を通して確認する（`compute_shear_yield_thresholds` の
+    /// 構築から一貫して検証）。
+    #[test]
+    fn test_track_shear_yield_axial_compression_raises_qy_end_to_end() {
+        let (model, _rebar, b, d) = rc_column_model_with_rigid_zone(RigidZone::default());
+        let thresholds = compute_shear_yield_thresholds(&model);
+        let (input, gross_area) = match &thresholds[0].z {
+            DirThreshold::RcArakawa { input, gross_area } => (*input, *gross_area),
+            DirThreshold::Static(_) => panic!("expected RcArakawa"),
+        };
+        assert!((gross_area - b * d).abs() < 1e-6);
+
+        let qy_base = rc_qsu_simple(&input);
+        let sigma_0 = 5.0; // 0〜0.4Fc=9.6 の範囲内
+        let n_compress = sigma_0 * gross_area;
+        let mut inp_axial = input;
+        inp_axial.sigma_0 = sigma_0;
+        let qy_boosted = rc_qsu_simple(&inp_axial);
+        assert!(qy_boosted > qy_base, "axial term should raise Qy");
+
+        // Vz を base と boosted のちょうど中間に設定: base では降伏、boosted では非降伏。
+        // モデルは node i=(0,0,0)・j=(0,0,3000)、ref_vector=[1,0,0] のため
+        // ex=[0,0,1], ey=[1,0,0], ez=[0,1,0]（既存テストの局所座標系規約と同じ）。
+        // よって Vz は global y 成分（f.data[1]/f.data[7]）、N は global z 成分
+        // （f.data[2]/f.data[8]）に対応する。
+        let vz_demand = (qy_base + qy_boosted) / 2.0;
+
+        // ケースA: 軸圧縮あり（N_compress = sigma_0*gross_area）→ 判定を免れるはず。
+        let f_comp = LocalVec {
+            data: SmallVec::from_slice(&[
+                0.0,
+                vz_demand,
+                n_compress,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                -vz_demand,
+                -n_compress,
+                0.0,
+                0.0,
+                0.0,
+            ]),
+        };
+        let behaviors_comp: Vec<Box<dyn ElementBehavior>> =
+            vec![Box::new(FixedForceBehavior { f: f_comp })];
+        let mut events_comp = Vec::new();
+        track_shear_yield(&model, &behaviors_comp, &thresholds, 0, &mut events_comp);
+        assert!(
+            events_comp.is_empty(),
+            "compression should raise Qy above the shear demand, suppressing the event"
+        );
+
+        // ケースB: 軸力なし（同じ Vz デマンド）→ 従来どおり判定に掛かるはず。
+        let f_zero = LocalVec {
+            data: SmallVec::from_slice(&[
+                0.0, vz_demand, 0.0, 0.0, 0.0, 0.0, 0.0, -vz_demand, 0.0, 0.0, 0.0, 0.0,
+            ]),
+        };
+        let behaviors_zero: Vec<Box<dyn ElementBehavior>> =
+            vec![Box::new(FixedForceBehavior { f: f_zero })];
+        let mut events_zero = Vec::new();
+        track_shear_yield(&model, &behaviors_zero, &thresholds, 0, &mut events_zero);
+        assert!(
+            !events_zero.is_empty(),
+            "without axial compression the same Vz demand should still trigger the event"
+        );
     }
 }

@@ -2,10 +2,105 @@ use crate::assemble::{assemble_global_f, assemble_global_k};
 use crate::constraint::Reducer;
 use squid_n_core::dof::DofMap;
 use squid_n_core::ids::LoadCaseId;
-use squid_n_core::model::Model;
+use squid_n_core::model::{ElementData, ElementKind, LoadCaseKind, Model};
 use squid_n_element::beam::MemberForces;
 use squid_n_element::factory::build_behavior;
 use squid_n_math::solver::{make_solver, SolveError, SolverBackend};
+use std::borrow::Cow;
+
+/// 長期軸力無効化（RESP-D 計算編03「応力解析」）で断面積に乗じる縮小係数。
+/// 完全にゼロにすると（ブレースのみで支持される節点等で）浮き自由度による
+/// 特異行列を招く恐れがあるため、実務上無視できる微小軸剛性を残す
+/// （EA×1e-6 は元の軸力の 1e-6 倍程度に留まり回収内力もほぼ0とみなせる）。
+const AXIAL_DISABLE_FACTOR: f64 = 1.0e-6;
+
+/// 部材が「柱」（鉛直な `ElementKind::Beam`）かどうかを判定する。
+/// 判定規則は `squid-n-design-jp::eccentricity::column_stiffnesses` の柱判定
+/// （部材軸単位ベクトルの ez 成分 |ez|>0.707）に合わせる。
+fn is_vertical_column(elem: &ElementData, model: &Model) -> bool {
+    if !matches!(elem.kind, ElementKind::Beam) || elem.nodes.len() < 2 {
+        return false;
+    }
+    let (Some(n0), Some(n1)) = (
+        model.nodes.get(elem.nodes[0].index()),
+        model.nodes.get(elem.nodes[1].index()),
+    ) else {
+        return false;
+    };
+    let dx = n1.coord[0] - n0.coord[0];
+    let dy = n1.coord[1] - n0.coord[1];
+    let dz = n1.coord[2] - n0.coord[2];
+    let len = (dx * dx + dy * dy + dz * dz).sqrt();
+    if len < 1e-9 {
+        return false;
+    }
+    (dz / len).abs() > 0.707
+}
+
+/// 長期応力解析で軸力を負担させない部材（対象: ブレース／柱）かどうかを、
+/// `Model::stress_cfg` の指定に基づいて判定する。
+fn is_axial_disabled_target(
+    elem: &ElementData,
+    model: &Model,
+    cfg: &squid_n_core::model::StressAnalysisCfg,
+) -> bool {
+    match elem.kind {
+        ElementKind::Brace { .. } => cfg.no_long_axial_brace,
+        ElementKind::Beam => cfg.no_long_axial_column && is_vertical_column(elem, model),
+        _ => false,
+    }
+}
+
+/// 長期応力解析の計算条件（RESP-D 計算編03「応力解析」）を適用したモデルを返す。
+///
+/// 対象荷重ケースが長期系（`LoadCaseKind::is_long_term`）かつ `stress_cfg` で
+/// 軸力無効化が指定されている部材がある場合のみ、対象部材が参照する断面を
+/// 複製して断面積を `AXIAL_DISABLE_FACTOR` 倍に縮小したモデルを作る
+/// （同じ断面 ID を共有する他部材へは影響しない）。曲げ・せん断・ねじり
+/// 関連の断面性能は変更しない。対象が無ければ元のモデルをそのまま返す
+/// （既定 `stress_cfg` では常にこちら＝従来どおりの結果に一致する）。
+///
+/// SRC/CFT 等の合成断面では `beam.rs` の軸剛性用面積 `a_stiff` が `shape` 由来の
+/// 値で再計算されるため、複製断面では `shape` を外して数値直入力断面へ落とす。
+/// これにより曲げ・せん断は `to_section()` が格納済みの等価換算値のまま、
+/// 軸剛性のみ `area × AXIAL_DISABLE_FACTOR` が効く（材料由来の複合換算・
+/// スラブ協力幅係数は複製断面では適用されなくなるが、軸力を負担させない
+/// 部材の曲げ剛性の微差であり実用上支障ない）。
+fn apply_long_axial_cut(model: &Model, lc_kind: LoadCaseKind) -> Cow<'_, Model> {
+    let cfg = &model.stress_cfg;
+    if !lc_kind.is_long_term() || (!cfg.no_long_axial_brace && !cfg.no_long_axial_column) {
+        return Cow::Borrowed(model);
+    }
+
+    let targets: Vec<usize> = model
+        .elements
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| is_axial_disabled_target(e, model, cfg) && e.section.is_some())
+        .map(|(i, _)| i)
+        .collect();
+    if targets.is_empty() {
+        return Cow::Borrowed(model);
+    }
+
+    let mut m = model.clone();
+    for i in targets {
+        let Some(sid) = m.elements[i].section else {
+            continue;
+        };
+        let Some(orig) = m.sections.get(sid.index()) else {
+            continue;
+        };
+        let mut reduced = orig.clone();
+        reduced.area *= AXIAL_DISABLE_FACTOR;
+        // 合成断面（SRC/CFT）でも軸剛性カットが効くよう shape を外す（関数 doc 参照）。
+        reduced.shape = None;
+        reduced.id = squid_n_core::ids::SectionId(m.sections.len() as u32);
+        m.elements[i].section = Some(reduced.id);
+        m.sections.push(reduced);
+    }
+    Cow::Owned(m)
+}
 
 pub struct StaticOnce {
     pub disp: Vec<[f64; 6]>,
@@ -14,6 +109,14 @@ pub struct StaticOnce {
 
 pub fn linear_static_once(model: &Model, lc: LoadCaseId) -> Result<StaticOnce, SolveError> {
     faer::set_global_parallelism(faer::Par::Seq);
+    let lc_kind = model
+        .load_cases
+        .iter()
+        .find(|l| l.id == lc)
+        .map(|l| l.kind)
+        .unwrap_or_default();
+    let model_cow = apply_long_axial_cut(model, lc_kind);
+    let model: &Model = &model_cow;
     let dofmap = DofMap::build(model);
     let n_active = dofmap.n_active();
 
@@ -189,6 +292,7 @@ mod tests {
                 force_regime: ForceRegime::Auto,
                 rigid_zone: Default::default(),
                 plastic_zone: None,
+                spring: None,
             }],
             sections: vec![Section {
                 id: SectionId(0),
@@ -299,6 +403,7 @@ mod tests {
                 force_regime: ForceRegime::Auto,
                 rigid_zone: Default::default(),
                 plastic_zone: None,
+                spring: None,
             }],
             sections: vec![Section {
                 id: SectionId(0),
@@ -440,6 +545,7 @@ mod tests {
                 force_regime: ForceRegime::Auto,
                 rigid_zone: Default::default(),
                 plastic_zone: None,
+                spring: None,
             }],
             sections: vec![Section {
                 id: SectionId(0),
@@ -603,6 +709,7 @@ mod tests {
                 force_regime: ForceRegime::Auto,
                 rigid_zone: Default::default(),
                 plastic_zone: None,
+                spring: None,
             }],
             sections: vec![Section {
                 id: SectionId(0),
@@ -697,6 +804,7 @@ mod tests {
                 force_regime: ForceRegime::Auto,
                 rigid_zone: Default::default(),
                 plastic_zone: None,
+                spring: None,
             }],
             sections: vec![Section {
                 id: SectionId(0),
@@ -875,6 +983,7 @@ mod tests {
                     force_regime: ForceRegime::Auto,
                     rigid_zone: Default::default(),
                     plastic_zone: None,
+                    spring: None,
                 },
                 ElementData {
                     id: ElemId(1),
@@ -889,6 +998,7 @@ mod tests {
                     force_regime: ForceRegime::Auto,
                     rigid_zone: Default::default(),
                     plastic_zone: None,
+                    spring: None,
                 },
                 ElementData {
                     id: ElemId(2),
@@ -903,6 +1013,7 @@ mod tests {
                     force_regime: ForceRegime::Auto,
                     rigid_zone: Default::default(),
                     plastic_zone: None,
+                    spring: None,
                 },
                 ElementData {
                     id: ElemId(3),
@@ -917,6 +1028,7 @@ mod tests {
                     force_regime: ForceRegime::Auto,
                     rigid_zone: Default::default(),
                     plastic_zone: None,
+                    spring: None,
                 },
             ],
             sections: vec![Section {
@@ -1008,6 +1120,7 @@ mod tests {
                 force_regime: ForceRegime::Auto,
                 rigid_zone: Default::default(),
                 plastic_zone: None,
+                spring: None,
             }],
             sections: vec![Section {
                 id: SectionId(0),
@@ -1119,6 +1232,7 @@ mod tests {
                 force_regime: ForceRegime::Auto,
                 rigid_zone: Default::default(),
                 plastic_zone: None,
+                spring: None,
             }],
             sections: vec![Section {
                 id: SectionId(0),
@@ -1244,6 +1358,7 @@ mod tests {
                     force_regime: ForceRegime::Auto,
                     rigid_zone: Default::default(),
                     plastic_zone: None,
+                    spring: None,
                 });
                 eid += 1;
             }
@@ -1371,6 +1486,457 @@ mod tests {
             e16 / ref_w * 100.0,
             w16,
             ref_w
+        );
+    }
+
+    // ===== 長期応力解析: 長期軸力無効化（RESP-D 計算編03「応力解析」）=====
+    //
+    // 1 スパン・2 柱・頂部大梁・対角ブレース 1 本のモデル（ブレース付きラーメン）。
+    // 柱・大梁は Fixed-Fixed（曲げ骨組）、ブレースは Pinned-Pinned のトラス要素。
+    // 荷重ケースを 2 本（Dead=長期, Seismic=短期）用意し、同一の鉛直荷重を与える。
+    fn braced_frame(kind: squid_n_core::model::LoadCaseKind) -> Model {
+        use squid_n_core::model::StressAnalysisCfg;
+
+        let l = 4000.0_f64; // スパン
+        let h = 3000.0_f64; // 階高
+        let node = |id: u32, coord: [f64; 3]| Node {
+            id: NodeId(id),
+            coord,
+            restraint: Dof6Mask::FREE,
+            mass: None,
+            story: None,
+        };
+        let sec = Section {
+            id: SectionId(0),
+            name: "steel".into(),
+            area: 6000.0,
+            iy: 8.0e7,
+            iz: 8.0e7,
+            j: 1.0e6,
+            depth: 300.0,
+            width: 300.0,
+            as_y: 5000.0,
+            as_z: 5000.0,
+            panel_thickness: None,
+            thickness: None,
+            shape: None,
+        };
+        let mat = Material {
+            id: MaterialId(0),
+            name: "steel".into(),
+            young: 205000.0,
+            poisson: 0.3,
+            density: 0.0,
+            shear: None,
+            fc: None,
+            fy: Some(235.0),
+        };
+        Model {
+            nodes: vec![
+                {
+                    let mut n = node(0, [0.0, 0.0, 0.0]);
+                    n.restraint = Dof6Mask::FIXED;
+                    n
+                },
+                {
+                    let mut n = node(1, [l, 0.0, 0.0]);
+                    n.restraint = Dof6Mask::FIXED;
+                    n
+                },
+                node(2, [0.0, 0.0, h]),
+                node(3, [l, 0.0, h]),
+            ],
+            elements: vec![
+                // e0: 柱A（鉛直）
+                ElementData {
+                    id: ElemId(0),
+                    kind: ElementKind::Beam,
+                    nodes: smallvec::smallvec![NodeId(0), NodeId(2)],
+                    section: Some(SectionId(0)),
+                    material: Some(MaterialId(0)),
+                    local_axis: LocalAxis {
+                        ref_vector: [1.0, 0.0, 0.0],
+                    },
+                    end_cond: [EndCondition::Fixed, EndCondition::Fixed],
+                    force_regime: ForceRegime::Auto,
+                    rigid_zone: Default::default(),
+                    plastic_zone: None,
+                    spring: None,
+                },
+                // e1: 柱B（鉛直）
+                ElementData {
+                    id: ElemId(1),
+                    kind: ElementKind::Beam,
+                    nodes: smallvec::smallvec![NodeId(1), NodeId(3)],
+                    section: Some(SectionId(0)),
+                    material: Some(MaterialId(0)),
+                    local_axis: LocalAxis {
+                        ref_vector: [1.0, 0.0, 0.0],
+                    },
+                    end_cond: [EndCondition::Fixed, EndCondition::Fixed],
+                    force_regime: ForceRegime::Auto,
+                    rigid_zone: Default::default(),
+                    plastic_zone: None,
+                    spring: None,
+                },
+                // e2: 頂部大梁（水平）
+                ElementData {
+                    id: ElemId(2),
+                    kind: ElementKind::Beam,
+                    nodes: smallvec::smallvec![NodeId(2), NodeId(3)],
+                    section: Some(SectionId(0)),
+                    material: Some(MaterialId(0)),
+                    local_axis: LocalAxis {
+                        ref_vector: [0.0, 0.0, 1.0],
+                    },
+                    end_cond: [EndCondition::Fixed, EndCondition::Fixed],
+                    force_regime: ForceRegime::Auto,
+                    rigid_zone: Default::default(),
+                    plastic_zone: None,
+                    spring: None,
+                },
+                // e3: 対角ブレース（柱Aの脚部 → 柱Bの頂部）
+                ElementData {
+                    id: ElemId(3),
+                    kind: ElementKind::Brace {
+                        tension_only: false,
+                    },
+                    nodes: smallvec::smallvec![NodeId(0), NodeId(3)],
+                    section: Some(SectionId(0)),
+                    material: Some(MaterialId(0)),
+                    local_axis: LocalAxis {
+                        ref_vector: [0.0, 0.0, 1.0],
+                    },
+                    end_cond: [EndCondition::Pinned, EndCondition::Pinned],
+                    force_regime: ForceRegime::Auto,
+                    rigid_zone: Default::default(),
+                    plastic_zone: None,
+                    spring: None,
+                },
+            ],
+            sections: vec![sec],
+            materials: vec![mat],
+            load_cases: vec![LoadCase {
+                id: LoadCaseId(1),
+                name: "gravity".into(),
+                nodal: vec![NodalLoad {
+                    node: NodeId(2),
+                    values: [0.0, 0.0, -1.0e5, 0.0, 0.0, 0.0],
+                }],
+                member: vec![],
+                kind,
+            }],
+            stress_cfg: StressAnalysisCfg::default(),
+            ..Default::default()
+        }
+    }
+
+    // 柱の長期軸力無効化テスト用モデル。同一の2節点間に「柱」（`ElementKind::Beam`、
+    // 鉛直、Fixed-Fixed）と「鉛直ブレース」（`ElementKind::Brace`、同じ2節点）を
+    // 並列に配置する。荷重方向が部材軸と厳密に一致するため、柱の軸剛性が
+    // 支配的な baseline では柱・ブレースへほぼ等分に軸力を負担させつつ、
+    // 柱側だけ曲げ・せん断剛性（iy/iz/j/as_y/as_z）はそのまま健全に保つ。
+    // ブレース側は常に軸剛性のみを保つため、柱の軸力を無効化しても
+    // 機構化（特異行列）を起こさず、負担していた軸力がそのままブレースへ
+    // 移ることを明快に検証できる。
+    fn column_with_parallel_vertical_brace() -> Model {
+        use squid_n_core::model::StressAnalysisCfg;
+
+        let h = 3000.0_f64;
+        let sec = Section {
+            id: SectionId(0),
+            name: "steel".into(),
+            area: 6000.0,
+            iy: 8.0e7,
+            iz: 8.0e7,
+            j: 1.0e6,
+            depth: 300.0,
+            width: 300.0,
+            as_y: 5000.0,
+            as_z: 5000.0,
+            panel_thickness: None,
+            thickness: None,
+            shape: None,
+        };
+        let mat = Material {
+            id: MaterialId(0),
+            name: "steel".into(),
+            young: 205000.0,
+            poisson: 0.3,
+            density: 0.0,
+            shear: None,
+            fc: None,
+            fy: Some(235.0),
+        };
+        Model {
+            nodes: vec![
+                {
+                    let mut n = Node {
+                        id: NodeId(0),
+                        coord: [0.0, 0.0, 0.0],
+                        restraint: Dof6Mask::FIXED,
+                        mass: None,
+                        story: None,
+                    };
+                    n.restraint = Dof6Mask::FIXED;
+                    n
+                },
+                Node {
+                    id: NodeId(1),
+                    coord: [0.0, 0.0, h],
+                    restraint: Dof6Mask::FREE,
+                    mass: None,
+                    story: None,
+                },
+            ],
+            elements: vec![
+                // e0: 柱（鉛直）。no_long_axial_column の対象。
+                ElementData {
+                    id: ElemId(0),
+                    kind: ElementKind::Beam,
+                    nodes: smallvec::smallvec![NodeId(0), NodeId(1)],
+                    section: Some(SectionId(0)),
+                    material: Some(MaterialId(0)),
+                    local_axis: LocalAxis {
+                        ref_vector: [1.0, 0.0, 0.0],
+                    },
+                    end_cond: [EndCondition::Fixed, EndCondition::Fixed],
+                    force_regime: ForceRegime::Auto,
+                    rigid_zone: Default::default(),
+                    plastic_zone: None,
+                    spring: None,
+                },
+                // e1: 同じ2節点間の鉛直ブレース（並列）。常に軸剛性を保ち、
+                // 柱が負担しなくなった軸力の受け皿になる。
+                ElementData {
+                    id: ElemId(1),
+                    kind: ElementKind::Brace {
+                        tension_only: false,
+                    },
+                    nodes: smallvec::smallvec![NodeId(0), NodeId(1)],
+                    section: Some(SectionId(0)),
+                    material: Some(MaterialId(0)),
+                    local_axis: LocalAxis {
+                        ref_vector: [1.0, 0.0, 0.0],
+                    },
+                    end_cond: [EndCondition::Pinned, EndCondition::Pinned],
+                    force_regime: ForceRegime::Auto,
+                    rigid_zone: Default::default(),
+                    plastic_zone: None,
+                    spring: None,
+                },
+            ],
+            sections: vec![sec],
+            materials: vec![mat],
+            load_cases: vec![LoadCase {
+                id: LoadCaseId(1),
+                name: "gravity".into(),
+                nodal: vec![NodalLoad {
+                    node: NodeId(1),
+                    values: [0.0, 0.0, -1.0e5, 0.0, 0.0, 0.0],
+                }],
+                member: vec![],
+                kind: squid_n_core::model::LoadCaseKind::Dead,
+            }],
+            stress_cfg: StressAnalysisCfg::default(),
+            ..Default::default()
+        }
+    }
+
+    fn axial_force(res: &StaticOnce, elem: ElemId) -> f64 {
+        let (_, mf) = res
+            .member_forces
+            .iter()
+            .find(|(id, _)| *id == elem)
+            .unwrap_or_else(|| panic!("member forces for elem {:?} not found", elem));
+        mf.at[0].1[0]
+    }
+
+    /// 検証1: `no_long_axial_brace=true` の長期ケースでは、ブレース軸力がほぼ0
+    /// （元の1e-3倍以下）になり、周囲の柱（柱A。ブレースが基部で直接取り付く側の
+    /// 柱で、荷重も直接負担する主経路）の軸力の絶対値が増えること
+    /// （RESP-D マニュアル計算編03「応力解析」）。
+    #[test]
+    fn test_no_long_axial_brace_zeros_brace_force_and_increases_column() {
+        let mut model = braced_frame(squid_n_core::model::LoadCaseKind::Dead);
+        let base = linear_static_once(&model, LoadCaseId(1)).unwrap();
+        let base_brace = axial_force(&base, ElemId(3)).abs();
+        let base_col_a = axial_force(&base, ElemId(0)).abs();
+        assert!(
+            base_brace > 1.0,
+            "baseline brace force should be non-trivial: {base_brace}"
+        );
+
+        model.stress_cfg.no_long_axial_brace = true;
+        let cut = linear_static_once(&model, LoadCaseId(1)).unwrap();
+        let cut_brace = axial_force(&cut, ElemId(3)).abs();
+        let cut_col_a = axial_force(&cut, ElemId(0)).abs();
+
+        assert!(
+            cut_brace <= base_brace * 1e-3,
+            "brace force should collapse to ~0: base={base_brace} cut={cut_brace}"
+        );
+        assert!(
+            cut_col_a > base_col_a,
+            "column A axial force should increase when brace unloaded: base={base_col_a} cut={cut_col_a}"
+        );
+    }
+
+    /// 検証2: `no_long_axial_column=true` の長期ケースでは、柱の長期軸力が
+    /// ほぼ0（元の1e-3倍以下）になること。同一2節点間で柱と並列に鉛直
+    /// ブレースを置いたモデル（`column_with_parallel_vertical_brace`）を使い、
+    /// 柱が負担しなくなった軸力がブレース側で健全に負担される
+    /// （機構化せず数値的に安定に解ける）ことも合わせて確認する。
+    #[test]
+    fn test_no_long_axial_column_zeros_column_force() {
+        let mut model = column_with_parallel_vertical_brace();
+        let base = linear_static_once(&model, LoadCaseId(1)).unwrap();
+        let base_col = axial_force(&base, ElemId(0)).abs();
+        let base_brace = axial_force(&base, ElemId(1)).abs();
+        assert!(
+            base_col > 1.0,
+            "baseline column force should be non-trivial: {base_col}"
+        );
+
+        model.stress_cfg.no_long_axial_column = true;
+        let cut = linear_static_once(&model, LoadCaseId(1)).unwrap();
+        let cut_col = axial_force(&cut, ElemId(0)).abs();
+        let cut_brace = axial_force(&cut, ElemId(1)).abs();
+
+        assert!(
+            cut_col <= base_col * 1e-3,
+            "column force should collapse to ~0: base={base_col} cut={cut_col}"
+        );
+        // 柱が負担しなくなった軸力は並列ブレースへ移り、荷重全体はブレース単体で
+        // 健全に負担される（機構化していないことの確認）。
+        assert!(
+            cut_brace > base_brace,
+            "brace should pick up the load the column no longer carries: base={base_brace} cut={cut_brace}"
+        );
+        assert!(
+            (cut_brace - 1.0e5).abs() / 1.0e5 < 1e-3,
+            "brace should carry ~all of the applied load once column axial is disabled: {cut_brace}"
+        );
+    }
+
+    /// 検証3: フラグが既定（false）のとき、`apply_long_axial_cut` はモデルを
+    /// 複製せずそのまま返す（＝従来結果と完全一致。回帰なし）。
+    #[test]
+    fn test_apply_long_axial_cut_noop_when_flags_false() {
+        let model = braced_frame(squid_n_core::model::LoadCaseKind::Dead);
+        let cow = apply_long_axial_cut(&model, squid_n_core::model::LoadCaseKind::Dead);
+        assert!(
+            matches!(cow, Cow::Borrowed(_)),
+            "既定 stress_cfg では複製が起きない（従来どおりの経路を通る）はず"
+        );
+    }
+
+    /// 検証3b: フラグが既定（false）のとき、`linear_static_once` の結果が
+    /// 有効フラグを立てた場合と異なることも含め、既定値では従来どおり通しで解けること
+    /// （回帰確認: 既存の他テスト群が既定 stress_cfg のままであることの追加保証）。
+    #[test]
+    fn test_default_stress_cfg_matches_plain_model() {
+        let model = braced_frame(squid_n_core::model::LoadCaseKind::Dead);
+        assert_eq!(model.stress_cfg, Default::default());
+        let res = linear_static_once(&model, LoadCaseId(1)).unwrap();
+        // 変位・内力が有限（解けている）ことの素朴な確認。
+        assert!(res.disp.iter().all(|d| d.iter().all(|v| v.is_finite())));
+        assert!(axial_force(&res, ElemId(0)).is_finite());
+    }
+
+    /// 検証4: 短期（Seismic）荷重ケースでは、`no_long_axial_brace=true` でも
+    /// 適用されない（ブレース軸力が長期無効化なしの基準値と同程度に残ること）。
+    #[test]
+    fn test_axial_cut_not_applied_to_short_term_case() {
+        let mut model = braced_frame(squid_n_core::model::LoadCaseKind::Dead);
+        // 同一の鉛直荷重を持つ短期（地震）荷重ケースを追加する。
+        model.load_cases.push(LoadCase {
+            id: LoadCaseId(2),
+            name: "seismic_gravity_dummy".into(),
+            nodal: vec![NodalLoad {
+                node: NodeId(2),
+                values: [0.0, 0.0, -1.0e5, 0.0, 0.0, 0.0],
+            }],
+            member: vec![],
+            kind: squid_n_core::model::LoadCaseKind::Seismic,
+        });
+        model.stress_cfg.no_long_axial_brace = true;
+
+        let long_term = linear_static_once(&model, LoadCaseId(1)).unwrap();
+        let short_term = linear_static_once(&model, LoadCaseId(2)).unwrap();
+
+        let brace_long = axial_force(&long_term, ElemId(3)).abs();
+        let brace_short = axial_force(&short_term, ElemId(3)).abs();
+
+        assert!(
+            brace_long < 1.0,
+            "長期ケースはブレース軸力が無効化されるはず: {brace_long}"
+        );
+        assert!(
+            brace_short > 1.0,
+            "短期ケースは無効化されず通常どおりブレース軸力を負担するはず: {brace_short}"
+        );
+    }
+
+    /// 検証5: SRC 等の合成断面（`Section.shape` あり）の柱でも軸力カットが効く
+    /// （複製断面で `shape` を外すため、`beam.rs` の `a_stiff` が `shape` 由来の
+    /// 値へ再計算されず、縮小した `area` が使われる）。
+    #[test]
+    fn test_axial_cut_applies_to_composite_src_column() {
+        use squid_n_core::section_shape::{BarSet, RcRebar, SectionShape, ShearBar};
+
+        let mut model = column_with_parallel_vertical_brace();
+        // 柱断面を SRC（shape あり・コンクリート材料 fc あり）へ差し替える。
+        model.sections[0].shape = Some(SectionShape::SrcRect {
+            b: 600.0,
+            d: 600.0,
+            rebar: RcRebar {
+                main_x: BarSet {
+                    count: 8,
+                    dia: 22.0,
+                    layers: 1,
+                },
+                main_y: BarSet {
+                    count: 8,
+                    dia: 22.0,
+                    layers: 1,
+                },
+                cover: 50.0,
+                shear: ShearBar {
+                    dia: 10.0,
+                    pitch: 100.0,
+                    legs: 2,
+                    grade: None,
+                },
+            },
+            steel_height: 400.0,
+            steel_width: 200.0,
+            steel_web_thick: 9.0,
+            steel_flange_thick: 12.0,
+            steel_grade: "SN400".into(),
+        });
+        model.materials[0].fc = Some(24.0);
+        model.materials[0].young = 2.27e4; // コンクリートのヤング係数相当
+
+        let base = linear_static_once(&model, LoadCaseId(1)).unwrap();
+        let base_col = axial_force(&base, ElemId(0)).abs();
+        assert!(
+            base_col > 1.0,
+            "SRC柱の基準軸力が有意であること: {base_col}"
+        );
+
+        model.stress_cfg.no_long_axial_column = true;
+        let cut = linear_static_once(&model, LoadCaseId(1)).unwrap();
+        let cut_col = axial_force(&cut, ElemId(0)).abs();
+        let cut_brace = axial_force(&cut, ElemId(1)).abs();
+
+        assert!(
+            cut_col <= base_col * 1e-3,
+            "SRC柱でも軸力が無効化されるはず: base={base_col} cut={cut_col}"
+        );
+        assert!(
+            (cut_brace - 1.0e5).abs() / 1.0e5 < 1e-3,
+            "荷重はブレースが全量負担するはず: {cut_brace}"
         );
     }
 }

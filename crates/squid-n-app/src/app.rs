@@ -776,10 +776,12 @@ impl App {
             "静的解析結果がありません。地震静的(Ai)を実行してください。".to_string()
         })?;
 
-        let metrics = crate::summary::compute_story_metrics(
+        let ctx = crate::summary::metrics_ctx_from_results(self.results.as_ref());
+        let metrics = crate::summary::compute_story_metrics_with(
             &self.model,
             &st.disp,
             self.analysis_cfg.seismic_dir,
+            &ctx,
         );
 
         // 地震重量: 下階→上階順（model.stories は生成時から下階→上階順に格納される）。
@@ -3820,6 +3822,7 @@ mod tests {
                 force_regime: ForceRegime::Auto,
                 rigid_zone: Default::default(),
                 plastic_zone: None,
+                spring: None,
             });
         }
 
@@ -4228,6 +4231,7 @@ mod tests {
             force_regime: ForceRegime::Auto,
             rigid_zone: Default::default(),
             plastic_zone: None,
+            spring: None,
         };
         Model {
             nodes: vec![
@@ -4796,6 +4800,7 @@ mod tests {
                 force_regime: ForceRegime::Auto,
                 rigid_zone: Default::default(),
                 plastic_zone: None,
+                spring: None,
             });
         }
         model.load_cases.push(LoadCase {
@@ -4995,6 +5000,7 @@ mod tests {
                 force_regime: ForceRegime::Auto,
                 rigid_zone: Default::default(),
                 plastic_zone: None,
+                spring: None,
             }],
             load_cases: vec![LoadCase {
                 kind: Default::default(),
@@ -5138,6 +5144,7 @@ mod tests {
                 force_regime: ForceRegime::Auto,
                 rigid_zone: Default::default(),
                 plastic_zone: None,
+                spring: None,
             }],
             load_cases: vec![
                 LoadCase {
@@ -5242,6 +5249,7 @@ mod tests {
             force_regime: ForceRegime::Auto,
             rigid_zone: Default::default(),
             plastic_zone: None,
+            spring: None,
         };
         let elements = vec![
             mk_beam(0, 0, 1),
@@ -5344,6 +5352,7 @@ mod tests {
             force_regime: ForceRegime::Auto,
             rigid_zone: Default::default(),
             plastic_zone: None,
+            spring: None,
         };
         let elements = vec![
             mk_beam(0, 0, 1),
@@ -5705,6 +5714,7 @@ mod tests {
                 force_regime: ForceRegime::Auto,
                 rigid_zone: Default::default(),
                 plastic_zone: None,
+                spring: None,
             });
         };
         push_elem(0, 0, 1);
@@ -5731,6 +5741,7 @@ mod tests {
             force_regime: ForceRegime::Auto,
             rigid_zone: Default::default(),
             plastic_zone: None,
+            spring: None,
         });
 
         let factors = column_live_load_factors(&model);

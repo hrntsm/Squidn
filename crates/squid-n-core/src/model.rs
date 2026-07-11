@@ -28,6 +28,13 @@ pub enum ElementKind {
     Brace {
         tension_only: bool,
     },
+    /// 節点バネ要素（RESP-D マニュアル計算編03「応力解析」§部材の変形と自由度）。
+    ///
+    /// マニュアルの「部材の変形と自由度」表で、節点バネは θX=―（非考慮）、
+    /// θY=○, θZ=○, γY=○, γZ=○, δX=○。すなわちねじり以外の曲げ・せん断・
+    /// 軸方向の変形成分を独立なバネ剛性として持ちうる 2 節点要素。
+    /// 各自由度のバネ定数は `ElementData::spring` に保持する（局所軸 6 成分）。
+    NodalSpring,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -112,6 +119,14 @@ pub struct ElementData {
     /// モデル化（材端剛塑性ばねと適合するファイバーモデル化）に用いる。
     #[serde(default)]
     pub plastic_zone: Option<f64>,
+    /// 節点バネ要素（`ElementKind::NodalSpring`）の局所軸バネ定数
+    /// `[kx, ky, kz, krx, kry, krz]`（軸[N/mm]・せん断[N/mm]・回転[N·mm/rad]）。
+    /// RESP-D マニュアル計算編03「応力解析」§部材の変形と自由度により、節点バネは
+    /// ねじり（θX）を非考慮とするのが既定だが、本実装では全 6 成分を入力可能とし、
+    /// `krx` を明示的に 0 とすることで既定挙動に合わせる（入力で 0 以外も指定できる）。
+    /// `None` は他要素種別、またはバネ定数未指定（剛性ゼロ扱い）。
+    #[serde(default)]
+    pub spring: Option<[f64; 6]>,
 }
 
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -356,6 +371,20 @@ pub enum LoadCaseKind {
     Seismic,
     #[default]
     Other,
+}
+
+impl LoadCaseKind {
+    /// 長期応力解析の対象となる荷重ケース種別か（RESP-D マニュアル計算編03「応力解析」）。
+    ///
+    /// 固定・積載・積雪（多雪区域の 0.7S 相当を含む常時荷重として登録される想定）と、
+    /// 種別未指定 `Other`（従来の「先頭ケースを重力とみなす」フォールバック）を長期として扱う。
+    /// 地震用積載（`LiveSeismic`。重量集計専用）・風・地震は短期側なので対象外。
+    pub fn is_long_term(&self) -> bool {
+        matches!(
+            self,
+            LoadCaseKind::Dead | LoadCaseKind::Live | LoadCaseKind::Snow | LoadCaseKind::Other
+        )
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -695,6 +724,49 @@ pub struct MiscWall {
     /// 荷重伝達タイプ。
     #[serde(default)]
     pub transfer: MiscWallTransfer,
+    /// 壁厚 [mm]。雑壁剛性の n 倍法（`StressAnalysisCfg::misc_wall_n`）で
+    /// 断面積 Aw' = 壁長 × 壁厚 の算定に用いる。`None` は剛性評価の対象外
+    /// （重量のみ考慮）。
+    #[serde(default)]
+    pub thickness: Option<f64>,
+}
+
+/// 長期応力解析の計算条件（RESP-D マニュアル計算編03「応力解析」）。
+///
+/// マニュアル原文:「長期応力解析においては、計算条件の指定により以下の部材について
+/// 長期軸力を負担させないことも可能です。― ブレース ― 柱、制振間柱」。
+///
+/// 制振間柱（damper-equipped mullion column）は本リポジトリに要素種別が未実装のため、
+/// 対象外（既知の制約）。ブレースと柱（鉛直部材）のみ対応する。
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct StressAnalysisCfg {
+    /// 長期応力解析でブレース（`ElementKind::Brace`）に軸力を負担させない。
+    pub no_long_axial_brace: bool,
+    /// 長期応力解析で柱（鉛直な `ElementKind::Beam`）に軸力を負担させない。
+    pub no_long_axial_column: bool,
+    /// 剛性率・偏心率算定時の雑壁剛性の n 倍法係数（RESP-D「(7) 雑壁の剛性評価」
+    /// `Kw' = n·Aw'·ΣKc/ΣAc` の n。入力値）。`None` は雑壁剛性を考慮しない。
+    #[serde(default)]
+    pub misc_wall_n: Option<f64>,
+    /// 層間変形角の制限値の分母（令82条の2）。原則 200（1/200）。帳壁・仕上げ等に
+    /// 著しい損傷の恐れがない場合は 120（1/120）へ緩和できる。
+    #[serde(default = "default_drift_limit_denom")]
+    pub drift_limit_denom: f64,
+}
+
+fn default_drift_limit_denom() -> f64 {
+    200.0
+}
+
+impl Default for StressAnalysisCfg {
+    fn default() -> Self {
+        StressAnalysisCfg {
+            no_long_axial_brace: false,
+            no_long_axial_column: false,
+            misc_wall_n: None,
+            drift_limit_denom: default_drift_limit_denom(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
@@ -730,6 +802,9 @@ pub struct Model {
     /// フレーム外雑壁。
     #[serde(default)]
     pub misc_walls: Vec<MiscWall>,
+    /// 応力解析の計算条件（RESP-D 計算編03「応力解析」。長期軸力を負担させない部材の指定）。
+    #[serde(default)]
+    pub stress_cfg: StressAnalysisCfg,
     #[serde(skip)]
     pub dof_map: crate::dof::DofMap,
 }
@@ -905,6 +980,7 @@ impl Model {
             && self.load_cfg == other.load_cfg
             && self.wall_attrs == other.wall_attrs
             && self.misc_walls == other.misc_walls
+            && self.stress_cfg == other.stress_cfg
     }
 }
 
@@ -995,6 +1071,7 @@ mod tests {
                 force_regime: ForceRegime::Auto,
                 rigid_zone: Default::default(),
                 plastic_zone: None,
+                spring: None,
             }],
             ..Default::default()
         };
@@ -1212,6 +1289,39 @@ mod tests {
         let elem: ElementData = serde_json::from_str(json).unwrap();
         assert_eq!(elem.plastic_zone, None);
         assert_eq!(elem.rigid_zone, RigidZone::default());
+    }
+
+    /// 長期系（固定・積載・積雪・種別未指定）は長期、地震用積載・風・地震は短期
+    /// （RESP-D マニュアル計算編03「応力解析」の長期軸力無効化条件の適用範囲）。
+    #[test]
+    fn test_load_case_kind_is_long_term() {
+        assert!(LoadCaseKind::Dead.is_long_term());
+        assert!(LoadCaseKind::Live.is_long_term());
+        assert!(LoadCaseKind::Snow.is_long_term());
+        assert!(LoadCaseKind::Other.is_long_term());
+        assert!(!LoadCaseKind::LiveSeismic.is_long_term());
+        assert!(!LoadCaseKind::Wind.is_long_term());
+        assert!(!LoadCaseKind::Seismic.is_long_term());
+    }
+
+    #[test]
+    fn test_stress_cfg_default_is_false() {
+        let cfg = StressAnalysisCfg::default();
+        assert!(!cfg.no_long_axial_brace);
+        assert!(!cfg.no_long_axial_column);
+        assert_eq!(Model::default().stress_cfg, cfg);
+    }
+
+    #[test]
+    fn test_model_stress_cfg_default_missing_field() {
+        // 旧スキーマ（stress_cfg フィールドが無い JSON）からの互換性を確認する。
+        let json = r#"{
+            "nodes": [], "elements": [], "sections": [], "materials": [],
+            "stories": [], "slabs": [], "constraints": [], "load_cases": [],
+            "combinations": []
+        }"#;
+        let model: Model = serde_json::from_str(json).unwrap();
+        assert_eq!(model.stress_cfg, StressAnalysisCfg::default());
     }
 
     #[test]

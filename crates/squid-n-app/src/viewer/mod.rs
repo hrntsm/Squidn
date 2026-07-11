@@ -710,6 +710,7 @@ pub fn viewer_panel(ui: &mut egui::Ui, app: &mut App) {
                                         force_regime: squid_n_core::model::ForceRegime::Auto,
                                         rigid_zone: Default::default(),
                                         plastic_zone: None,
+                                        spring: None,
                                     };
                                     app.undo.run(
                                         &mut app.model,
@@ -762,6 +763,7 @@ pub fn viewer_panel(ui: &mut egui::Ui, app: &mut App) {
                                 force_regime: squid_n_core::model::ForceRegime::Auto,
                                 rigid_zone: Default::default(),
                                 plastic_zone: None,
+                                spring: None,
                             };
                             app.undo
                                 .run(&mut app.model, Box::new(squid_n_edit::AddMember { elem }));

@@ -5,7 +5,12 @@ use squid_n_core::model::Model;
 use std::io::{Read, Write};
 use std::path::Path;
 
-pub const CURRENT_SCHEMA_VERSION: u32 = 4;
+// 未リリースのため後方互換なし。リリース前のスキーマ変更は版を上げずにこのまま 1 とする。
+pub const CURRENT_SCHEMA_VERSION: u32 = 1;
+
+/// manifest への記載が必須な zip エントリ。ここに無い名前はハッシュ検証されないまま
+/// 読み込まれてしまうため、読込時に存在を強制する。
+const REQUIRED_ENTRIES: [&str; 2] = ["model.msgpack", "settings.json"];
 
 #[derive(Debug, thiserror::Error)]
 pub enum IoError {
@@ -17,6 +22,8 @@ pub enum IoError {
     Decode(String),
     #[error("hash mismatch for entry {0}")]
     HashMismatch(String),
+    #[error("manifest missing required entry {0}")]
+    MissingEntry(String),
     #[error("unsupported schema version: {0}")]
     UnsupportedVersion(u32),
 }
@@ -77,10 +84,30 @@ pub fn save_scz(path: &Path, model: &Model) -> Result<(), IoError> {
             .map_err(|e| IoError::Zip(e.to_string()))?;
         zip.write_all(&settings_bytes)?;
 
-        zip.finish().map_err(|e| IoError::Zip(e.to_string()))?;
+        // rename 前に内容をディスクへ永続化する。fsync を挟まないと rename が
+        // 原子的でも電源断で新ファイルが空・破損になり得る。
+        let f = zip.finish().map_err(|e| IoError::Zip(e.to_string()))?;
+        f.sync_all()?;
     }
 
     std::fs::rename(&tmp_path, path)?;
+    sync_parent_dir(path)?;
+    Ok(())
+}
+
+/// rename というディレクトリエントリ変更自体を永続化する（Unix のみ。
+/// Windows はディレクトリを fsync できないため no-op）。
+#[cfg(unix)]
+fn sync_parent_dir(path: &Path) -> std::io::Result<()> {
+    let parent = match path.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => Path::new("."),
+    };
+    std::fs::File::open(parent)?.sync_all()
+}
+
+#[cfg(not(unix))]
+fn sync_parent_dir(_path: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
@@ -96,14 +123,20 @@ pub fn load_scz(path: &Path) -> Result<Model, IoError> {
     let manifest: Manifest =
         serde_json::from_slice(&manifest_bytes).map_err(|e| IoError::Decode(e.to_string()))?;
 
-    // 未知版（サポート範囲外）のみここで弾く。既知の旧版（1..=現行）は
-    // model.msgpack 読込後に migrate() で最新版へ移行する。
-    // 「現行版以外を一律弾く」と migrate の旧版分岐が到達不能になり、
-    // 後方互換（§5.1）が機能しなくなるため、ここでは範囲チェックに留める。
-    if !(1..=CURRENT_SCHEMA_VERSION).contains(&manifest.schema_version) {
+    // 未リリースのため後方互換なし。現行版以外は弾く（migrate は将来の版上げ用の骨子）。
+    if manifest.schema_version != CURRENT_SCHEMA_VERSION {
         return Err(IoError::UnsupportedVersion(manifest.schema_version));
     }
 
+    // 必須エントリが manifest に列挙されていることを強制する。これが無いと、
+    // manifest から model.msgpack を落としたファイルがハッシュ未検証のまま読めてしまう。
+    for required in REQUIRED_ENTRIES {
+        if !manifest.entries.iter().any(|e| e.name == required) {
+            return Err(IoError::MissingEntry(required.to_string()));
+        }
+    }
+
+    let mut model_data = None;
     for entry in &manifest.entries {
         let mut data = Vec::new();
         archive
@@ -114,13 +147,13 @@ pub fn load_scz(path: &Path) -> Result<Model, IoError> {
         if actual_hash != entry.sha256 {
             return Err(IoError::HashMismatch(entry.name.clone()));
         }
+        if entry.name == "model.msgpack" {
+            model_data = Some(data);
+        }
     }
 
-    let mut model_data = Vec::new();
-    archive
-        .by_name("model.msgpack")
-        .map_err(|e| IoError::Zip(e.to_string()))?
-        .read_to_end(&mut model_data)?;
+    // REQUIRED_ENTRIES チェック済みなので必ず Some だが、防御的に扱う。
+    let model_data = model_data.ok_or_else(|| IoError::MissingEntry("model.msgpack".into()))?;
 
     let model_data = migrate(manifest.schema_version, model_data)?;
 
@@ -184,34 +217,39 @@ mod tests {
         let dir = std::env::temp_dir();
         let path = dir.join("p_hash.scz");
         save_scz(&path, &model).unwrap();
+        let settings_bytes = {
+            let f = std::fs::File::open(&path).unwrap();
+            let mut ar = zip::ZipArchive::new(f).unwrap();
+            let mut sb = Vec::new();
+            ar.by_name("settings.json")
+                .unwrap()
+                .read_to_end(&mut sb)
+                .unwrap();
+            sb
+        };
 
-        // corrupt model.msgpack by writing bad data into a new zip
+        // model.msgpack を改竄相当のバイト列に差し替え、manifest のハッシュと食い違わせる。
+        // settings.json は正しいハッシュにして、必須エントリチェックではなく
+        // ハッシュ検証そのものでエラーになることを確認する。
         let bad_manifest = Manifest {
             schema_version: CURRENT_SCHEMA_VERSION,
             units: "internal: N-mm-s".to_string(),
             created_by: "test".to_string(),
-            entries: vec![crate::manifest::EntryHash {
-                name: "model.msgpack".to_string(),
-                sha256: "badhash".to_string(),
-            }],
+            entries: vec![
+                crate::manifest::EntryHash {
+                    name: "model.msgpack".to_string(),
+                    sha256: "badhash".to_string(),
+                },
+                crate::manifest::EntryHash {
+                    name: "settings.json".to_string(),
+                    sha256: sha256_of(&settings_bytes),
+                },
+            ],
         };
-        let bad_bytes = serde_json::to_vec(&bad_manifest).unwrap();
-        let tmp_path = path.with_extension("scz.tmp");
-        {
-            let f = std::fs::File::create(&tmp_path).unwrap();
-            let mut zip = zip::ZipWriter::new(f);
-            let opts = zip::write::FileOptions::<()>::default()
-                .compression_method(zip::CompressionMethod::Deflated);
-            zip.start_file("manifest.json", opts).unwrap();
-            zip.write_all(&bad_bytes).unwrap();
-            zip.start_file("model.msgpack", opts).unwrap();
-            zip.write_all(&[0u8; 4]).unwrap();
-            zip.finish().unwrap();
-        }
-        std::fs::rename(&tmp_path, &path).unwrap();
+        write_zip_with_manifest(&path, &bad_manifest, &[0u8; 4], &settings_bytes);
 
         let result = load_scz(&path);
-        assert!(result.is_err());
+        assert!(matches!(result, Err(IoError::HashMismatch(ref name)) if name == "model.msgpack"));
         let _ = std::fs::remove_file(&path);
     }
 
@@ -246,15 +284,13 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    /// 旧版（v2）の .scz が migrate 経由で読めること（後方互換 §5.1）。
-    /// 現行フォーマットの model.msgpack のまま manifest の版だけ 2 に書換えても、
-    /// migrate(2,..) が round-trip して読み込めることを確認する
-    /// （= migrate の旧版分岐が到達可能であることの回帰テスト）。
+    /// 未リリースのため後方互換なし: 現行版以外（例: 旧版 2 を名乗るファイル）は
+    /// UnsupportedVersion で拒否されること。
     #[test]
-    fn test_migrate_old_version_loads() {
+    fn test_old_version_rejected() {
         let model = make_3node_model();
         let dir = std::env::temp_dir();
-        let path = dir.join("p_migrate_v2.scz");
+        let path = dir.join("p_old_ver.scz");
         // まず通常保存し、その model.msgpack / settings.json を取り出す。
         save_scz(&path, &model).unwrap();
         let (model_bytes, settings_bytes) = {
@@ -289,8 +325,62 @@ mod tests {
                 },
             ],
         };
-        let manifest_bytes = serde_json::to_vec_pretty(&manifest).unwrap();
+        write_zip_with_manifest(&path, &manifest, &model_bytes, &settings_bytes);
 
+        let result = load_scz(&path);
+        assert!(matches!(result, Err(IoError::UnsupportedVersion(2))));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// manifest.entries から model.msgpack を落としたファイルが、ハッシュ未検証のまま
+    /// 読めてしまわないこと（MissingEntry で拒否される）。
+    #[test]
+    fn test_manifest_missing_required_entry_rejected() {
+        let model = make_3node_model();
+        let dir = std::env::temp_dir();
+        let path = dir.join("p_missing_entry.scz");
+        save_scz(&path, &model).unwrap();
+        let (model_bytes, settings_bytes) = {
+            let f = std::fs::File::open(&path).unwrap();
+            let mut ar = zip::ZipArchive::new(f).unwrap();
+            let mut mb = Vec::new();
+            ar.by_name("model.msgpack")
+                .unwrap()
+                .read_to_end(&mut mb)
+                .unwrap();
+            let mut sb = Vec::new();
+            ar.by_name("settings.json")
+                .unwrap()
+                .read_to_end(&mut sb)
+                .unwrap();
+            (mb, sb)
+        };
+
+        // model.msgpack のエントリだけを manifest から落とす（zip 内には実体を残す）。
+        let manifest = Manifest {
+            schema_version: CURRENT_SCHEMA_VERSION,
+            units: "internal: N-mm-s".to_string(),
+            created_by: "test".to_string(),
+            entries: vec![crate::manifest::EntryHash {
+                name: "settings.json".to_string(),
+                sha256: sha256_of(&settings_bytes),
+            }],
+        };
+        write_zip_with_manifest(&path, &manifest, &model_bytes, &settings_bytes);
+
+        let result = load_scz(&path);
+        assert!(matches!(result, Err(IoError::MissingEntry(ref name)) if name == "model.msgpack"));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// テスト用: 指定 manifest と実バイトで .scz を書き直す。
+    fn write_zip_with_manifest(
+        path: &Path,
+        manifest: &Manifest,
+        model_bytes: &[u8],
+        settings_bytes: &[u8],
+    ) {
+        let manifest_bytes = serde_json::to_vec_pretty(manifest).unwrap();
         let tmp_path = path.with_extension("scz.tmp");
         {
             let f = std::fs::File::create(&tmp_path).unwrap();
@@ -300,16 +390,12 @@ mod tests {
             zip.start_file("manifest.json", opts).unwrap();
             zip.write_all(&manifest_bytes).unwrap();
             zip.start_file("model.msgpack", opts).unwrap();
-            zip.write_all(&model_bytes).unwrap();
+            zip.write_all(model_bytes).unwrap();
             zip.start_file("settings.json", opts).unwrap();
-            zip.write_all(&settings_bytes).unwrap();
+            zip.write_all(settings_bytes).unwrap();
             zip.finish().unwrap();
         }
-        std::fs::rename(&tmp_path, &path).unwrap();
-
-        let back = load_scz(&path).expect("v2 は migrate 経由で読めるべき");
-        assert!(model.eq_ignoring_dofmap(&back));
-        let _ = std::fs::remove_file(&path);
+        std::fs::rename(&tmp_path, path).unwrap();
     }
 
     /// UI設計 §4.2: Section は SectionShape の派生。`to_section` で生成した断面を
@@ -359,6 +445,7 @@ mod tests {
             force_regime: ForceRegime::Auto,
             rigid_zone: RigidZone::default(),
             plastic_zone: None,
+            spring: None,
         });
 
         let dir = std::env::temp_dir();

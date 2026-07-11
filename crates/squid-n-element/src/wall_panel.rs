@@ -423,6 +423,7 @@ mod tests {
             force_regime: ForceRegime::Auto,
             rigid_zone: Default::default(),
             plastic_zone: None,
+            spring: None,
         };
         (model, data)
     }
@@ -599,6 +600,7 @@ mod tests {
                 force_regime: ForceRegime::Auto,
                 rigid_zone: Default::default(),
                 plastic_zone: None,
+                spring: None,
             });
         }
         let wall_cols = WallPanelElement::try_new(&data, &model).unwrap();

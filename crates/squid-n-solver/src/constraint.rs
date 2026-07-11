@@ -295,6 +295,7 @@ mod tests {
                 force_regime: squid_n_core::model::ForceRegime::Auto,
                 rigid_zone: Default::default(),
                 plastic_zone: None,
+                spring: None,
             }],
             sections: vec![Section {
                 id: SectionId(0),

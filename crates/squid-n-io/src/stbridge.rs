@@ -355,6 +355,7 @@ fn make_member(
         force_regime: ForceRegime::Auto,
         rigid_zone: Default::default(),
         plastic_zone: None,
+        spring: None,
     })
 }
 
@@ -471,6 +472,7 @@ mod tests {
             force_regime: ForceRegime::Auto,
             rigid_zone: Default::default(),
             plastic_zone: None,
+            spring: None,
         });
         m.elements.push(ElementData {
             id: ElemId(1),
@@ -485,6 +487,7 @@ mod tests {
             force_regime: ForceRegime::Auto,
             rigid_zone: Default::default(),
             plastic_zone: None,
+            spring: None,
         });
         m.elements.push(ElementData {
             id: ElemId(2),
@@ -499,6 +502,7 @@ mod tests {
             force_regime: ForceRegime::Auto,
             rigid_zone: Default::default(),
             plastic_zone: None,
+            spring: None,
         });
         m.load_cases.push(LoadCase {
             kind: Default::default(),
