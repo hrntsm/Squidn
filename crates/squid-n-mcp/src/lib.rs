@@ -447,6 +447,7 @@ pub mod server {
                     shape: None,
                 }],
                 materials: vec![Material {
+                    concrete_class: Default::default(),
                     id: MaterialId(0),
                     name: "SN400".into(),
                     young: 20000.0,
@@ -535,6 +536,7 @@ pub mod server {
                     shape: None,
                 }],
                 materials: vec![Material {
+                    concrete_class: Default::default(),
                     id: MaterialId(0),
                     name: "steel".into(),
                     young: 205000.0,
@@ -1412,12 +1414,18 @@ fn compute_design_check_job(model: &Model, load_case: Option<u32>) -> Result<Job
             (Some(a), Some(b)) => Some((a, b)),
             _ => None,
         };
+        // 柱の座屈長さ lk = K・h（app.rs run_design_check と同じ規則）。
+        let lk = if kind == squid_n_design_jp::MemberKind::Column {
+            squid_n_design_jp::buckling::steel_column_k(model, elem).map(|k| k * length)
+        } else {
+            None
+        };
         let ctx = squid_n_design_jp::DesignCtx {
             term: squid_n_design_jp::LoadTerm::Long,
             kind,
             length,
             lb: None,
-            lk: None,
+            lk,
             shear_span,
             rc_damage_control: true,
             end_moments_z,

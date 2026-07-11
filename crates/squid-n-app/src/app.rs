@@ -850,19 +850,36 @@ impl App {
                         continue;
                     };
                     let rank = if is_steel(&mat.name) {
-                        // 鋼部材: 形状情報がない断面(カタログ数値直入力等)・
-                        // 円形鋼管等の幅厚比対象外形状はスキップ。
+                        // 鋼部材: 形状情報がない断面(カタログ数値直入力等)はスキップ。
                         let Some(shape) = sec.shape.as_ref() else {
                             continue;
                         };
-                        let Some(wt) = max_width_thickness(shape) else {
-                            continue;
+                        // 構造規定の幅厚比表（部材種別×断面×部位×鋼種級）で判定
+                        // （RESP-D マニュアル 04 断面検定「幅厚比の検討」）。
+                        // 表の対象外形状（溝形・T形・山形等）は旧・単一幅厚比法へ
+                        // フォールバックする。
+                        let member_use = match member_kind_of(elem, &self.model) {
+                            squid_n_design_jp::MemberKind::Column => {
+                                squid_n_design_jp::ds::SteelMemberUse::Column
+                            }
+                            _ => squid_n_design_jp::ds::SteelMemberUse::Beam,
                         };
-                        // F 値は材料名の前方一致で引く(例 "SN400B"→235)。引けなければ 235。
-                        // 板厚は形状の最大板厚（板厚 40mm 超は F 値低減の区分）。
-                        let f_value = steel_f_value_prefix(&mat.name, steel_max_thickness(shape))
-                            .unwrap_or(235.0);
-                        s_member_rank_scaled(wt, f_value, &RankCriteria::default())
+                        match squid_n_design_jp::ds::s_member_rank_by_kihon(
+                            shape, member_use, &mat.name,
+                        ) {
+                            Some(rank) => rank,
+                            None => {
+                                let Some(wt) = max_width_thickness(shape) else {
+                                    continue;
+                                };
+                                // F 値は材料名の前方一致で引く(例 "SN400B"→235)。
+                                // 引けなければ 235。板厚は形状の最大板厚。
+                                let f_value =
+                                    steel_f_value_prefix(&mat.name, steel_max_thickness(shape))
+                                        .unwrap_or(235.0);
+                                s_member_rank_scaled(wt, f_value, &RankCriteria::default())
+                            }
+                        }
                     } else {
                         // RC 部材: RcRect のみ対応。RcCircle・形状未設定・
                         // コンクリート強度(fc)未設定の材料はスキップ(選択値へフォールバック)。
@@ -1140,6 +1157,8 @@ impl App {
             wind_y: None,
             snow,
             heavy_snow_zone: self.analysis_cfg.heavy_snow_zone,
+            // δ1/δ2/δ3 は現状 UI 未対応のため既定値（0.7/0.35/0.35）。
+            snow_factors: None,
         };
         let combos = squid_n_load::combo::standard_combinations(&input);
         for combo in combos {
@@ -1526,12 +1545,20 @@ impl App {
                 (Some(a), Some(b)) => Some((a, b)),
                 _ => None,
             };
+            // 柱の座屈長さ lk = K・h（鋼構造塑性設計指針、水平移動が拘束されない
+            // 場合。K は節点まわり剛度比 G から算定）。柱以外は None（lk=部材長）。
+            // RC 柱の検定は lk を使わないため、柱一律で設定して問題ない。
+            let lk = if kind == squid_n_design_jp::MemberKind::Column {
+                squid_n_design_jp::buckling::steel_column_k(&self.model, elem).map(|k| k * length)
+            } else {
+                None
+            };
             let ctx = DesignCtx {
                 term: self.design_term,
                 kind,
                 length,
                 lb: None,
-                lk: None,
+                lk,
                 shear_span,
                 rc_damage_control: true,
                 end_moments_z,
@@ -3795,6 +3822,7 @@ mod tests {
             .push(beam_shape.to_section(SectionId(1), "梁 RC-200x400".into()));
 
         model.materials.push(Material {
+            concrete_class: Default::default(),
             id: squid_n_core::ids::MaterialId(0),
             name: "FC24".into(),
             young: 23000.0,
@@ -4256,6 +4284,7 @@ mod tests {
                 shape: None,
             }],
             materials: vec![Material {
+                concrete_class: Default::default(),
                 id: MaterialId(0),
                 name: "mat".into(),
                 young,
@@ -4635,6 +4664,7 @@ mod tests {
         };
         // 材料名は "FC24"（is_steel が false になる、かつ fc 設定あり）を想定。
         let mat = Material {
+            concrete_class: Default::default(),
             id: MaterialId(0),
             name: "FC24".into(),
             young: 23000.0,
@@ -4772,6 +4802,7 @@ mod tests {
             ],
             sections: vec![rc_shape.to_section(SectionId(0), "RC-400x600".into())],
             materials: vec![Material {
+                concrete_class: Default::default(),
                 id: MaterialId(0),
                 name: "FC24".into(),
                 young: 23000.0,
@@ -4978,6 +5009,7 @@ mod tests {
             ],
             sections: vec![rc_shape.to_section(SectionId(0), "RC-400x600".into())],
             materials: vec![Material {
+                concrete_class: Default::default(),
                 id: MaterialId(0),
                 name: "FC24".into(),
                 young: 23000.0,
@@ -5122,6 +5154,7 @@ mod tests {
             ],
             sections: vec![rc_shape.to_section(SectionId(0), "RC-400x600".into())],
             materials: vec![Material {
+                concrete_class: Default::default(),
                 id: MaterialId(0),
                 name: "FC24".into(),
                 young: 23000.0,

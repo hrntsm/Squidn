@@ -411,6 +411,11 @@ pub struct WallSideColumn {
     pub pw: f64,
     /// 帯筋の短期許容引張応力度 [N/mm²]。
     pub w_ft: f64,
+    /// SRC 側柱の内蔵鉄骨によるせん断負担分 `sfs・As` [N]（RC 側柱・鉄骨なしは
+    /// 0.0）。`sfs`: 鉄骨の許容せん断応力度、`As`: 側柱内蔵鉄骨のせん断断面積
+    /// （ウェブ全せい×ウェブ厚）。[`rc_wall_shear_check`] の `Qc` に単純加算する
+    /// （下記 doc 参照）。
+    pub steel_shear: f64,
 }
 
 /// RC 造耐震壁のせん断検定の入力。
@@ -447,9 +452,19 @@ pub struct RcWallInput {
 /// ## 壁筋＋側柱負担分（短期のみ有効）
 /// `Q2 = r・(Qw + ΣQc)`
 /// - `Qw = ps・t・le・w_ft`
-/// - 側柱1本あたり `Qc = b・j・(1.5・fs + 0.5・w_ft・(pw − 0.002))`
+/// - RC 側柱1本あたり `Qc = b・j・(1.5・fs + 0.5・w_ft・(pw − 0.002))`
 ///   （`j = 7/8・d`、`(pw − 0.002)` が負の場合は 0 とする。係数 `1.5・fs` は
 ///   マニュアル原文通りの値をそのまま用いる。）
+/// - SRC 側柱（内蔵鉄骨あり）は鉄骨のせん断負担分を加え
+///   `Qc = b・j・(1.5・fs + 0.5・w_ft・(pw − 0.002)) + sfs・As`
+///   （[`WallSideColumn::steel_shear`] = `sfs・As`。`sfs`: 鉄骨の許容せん断
+///   応力度、`As`: 側柱内蔵鉄骨のせん断断面積）。RC 側柱は `steel_shear=0` で
+///   従来式に一致する。
+///
+///   **注記（再構成）**: マニュアルの SRC 造耐震壁の Qc は `0.5・wft・pw`
+///   （`pw` に `−0.002` のオフセットが無い）と読める記載になっているが、
+///   RC 造耐震壁の式（本関数の `(pw − 0.002)`）と整合させ、既存の RC 実装
+///   （オフセット付き）をそのまま維持する（鉄骨項の加算のみ SRC 固有とする）。
 /// - 壁の有効長さ `le`: 側柱2本 = `l′`、側柱1本 = `0.9・l′`、側柱なし = `0.8・l′`
 ///
 /// ## 開口低減係数
@@ -492,7 +507,7 @@ pub fn rc_wall_shear_check(inp: &RcWallInput) -> CheckResult {
         .map(|c| {
             let j = 7.0 / 8.0 * c.d_eff;
             let pw_term = (c.pw - 0.002).max(0.0);
-            c.b * j * (1.5 * fs + 0.5 * c.w_ft * pw_term)
+            c.b * j * (1.5 * fs + 0.5 * c.w_ft * pw_term) + c.steel_shear
         })
         .sum();
     let q2 = r * (qw + sum_qc);
@@ -511,6 +526,132 @@ pub fn rc_wall_shear_check(inp: &RcWallInput) -> CheckResult {
     let detail = format!(
         "fs={:.4} N/mm2, r={:.4}, le={:.1} mm, Q1={:.1} N, Qw={:.1} N, SumQc={:.1} N, Q2={:.1} N, Qa={:.1} N, ratio={:.4}",
         fs, r, le, q1, qw, sum_qc, q2, qa, ratio
+    );
+
+    CheckResult {
+        ratio,
+        ok,
+        basis,
+        detail,
+    }
+}
+
+// ============================================================================
+// 5. SRC 造柱梁接合部（パネルゾーン）のせん断検定
+// ============================================================================
+
+/// SRC 造柱梁接合部（パネルゾーン）のせん断検定の入力。
+pub struct SrcPanelInput {
+    /// 接合部の形状区分（[`JointShape`] を流用）。
+    /// 接合部形状係数 jδ: 十字形=3、T字形・ト字形=2、L字形=1。
+    pub shape: JointShape,
+    /// コンクリート設計基準強度 Fc [N/mm²]。
+    pub fc: f64,
+    /// 長期荷重時の検定かどうか（`true`=長期、`false`=短期）。
+    pub long_term: bool,
+    /// 柱幅 Cb [mm]。
+    pub col_width: f64,
+    /// 梁幅 Bb [mm]（`beam_is_steel=true` の場合は未使用）。
+    pub beam_width: f64,
+    /// 梁の上下主筋間距離 mBd [mm]（`beam_is_steel=true` の場合は梁鉄骨の
+    /// フランジ重心間距離 sBd を渡す）。
+    pub m_bd: f64,
+    /// 柱の左右主筋間距離 mCd [mm]。
+    pub m_cd: f64,
+    /// 接合部鉄骨ウェブ厚 Jtw [mm]（鉄骨なし=0）。
+    pub j_tw: f64,
+    /// 柱鉄骨のフランジ重心間距離 sCd [mm]。
+    pub s_cd: f64,
+    /// 梁が S 造かどうか（`cVe` の係数切替。`true` なら `m_bd` に sBd が渡って
+    /// いる前提）。
+    pub beam_is_steel: bool,
+    /// ヤング係数比 n（[`crate::rc::young_ratio_n`]）。
+    pub n_ratio: f64,
+    /// 階高/内法階高比 h/h′（不明なら 1.0）。
+    pub h_ratio: f64,
+    /// 接合部に取り付く大梁端モーメントの絶対値和 BM1+BM2 [N・mm]。
+    pub sum_beam_moments: f64,
+}
+
+/// SRC 造柱梁接合部（パネルゾーン）のせん断検定（SRC 規準）。
+///
+/// ## 検定式
+/// `cVe・jδ・fs・(1+β) ≧ (h/h′)・(BM1+BM2)`
+///
+/// 左辺が許容値 `Ma`、右辺が設計値 `Md`。検定比 = `Md/Ma`（1.0 以下で OK）。
+/// - `fs`: コンクリートの許容せん断応力度（長期/短期、
+///   [`crate::rc::concrete_allowable_shear`]）。
+/// - `jδ`: 接合部形状係数。十字形=3、T字形・ト字形=2、L字形=1
+///   （[`JointShape`] を流用）。
+///
+/// **注記（式の解釈について・重要）**: マニュアル原文は `cVe・3fs・(1+β)` と
+/// 読める記載になっている。この「3」を [`rc_joint_shear_check`] の κA
+/// （RC 規準 15 条、十字形=10/T字形=7/ト字形=5/L字形=3）と同様に接合部形状に
+/// 応じた割増係数と解釈し、「3」は十字形の場合の値（jδ=3）とみなして
+/// `jδ・fs` の形に一般化した。他形状（T字形・ト字形=2、L字形=1）は、
+/// κA の相対比（10:7:5:3）ほど細分化する根拠がマニュアル抽出テキストからは
+/// 読み取れなかったため、より単純な整数比 3:2:2:1（十字形のみ他形状の
+/// 1.5倍、T字形とト字形は同値）を暫定的に採用した。この対応関係は
+/// マニュアル原文（SRC 規準原典）からは一意に確定できておらず、要再照合と
+/// する。
+///
+/// ## 諸元
+/// 梁が SRC/RC の場合（`beam_is_steel=false`）:
+/// - `cV = Cb・mBd・mCd`、`cVe = (Cb+Bb)/2・mBd・mCd`
+/// - `sV = Jtw・sBd・sCd`、`β = n・Jtw・sCd/(Cb・mCd)`
+///
+/// 梁が S 造の場合（`beam_is_steel=true`。`m_bd` に sBd を渡す前提）:
+/// - `cV = Cb・sBd・mCd`、`cVe = Cb/2・sBd・mCd`
+///
+/// `cV`・`sV` は検定式そのものには使わない（`β` は入力諸元から直接算定できる
+/// ため）。`Cb・mCd ≈ 0` の場合は `β=0` とする。
+pub fn src_panel_zone_check(inp: &SrcPanelInput) -> CheckResult {
+    let j_delta = match inp.shape {
+        JointShape::Cross => 3.0,
+        JointShape::Tee => 2.0,
+        JointShape::Knee => 2.0,
+        JointShape::Corner => 1.0,
+    };
+
+    let cve = if inp.beam_is_steel {
+        inp.col_width / 2.0 * inp.m_bd * inp.m_cd
+    } else {
+        (inp.col_width + inp.beam_width) / 2.0 * inp.m_bd * inp.m_cd
+    };
+
+    let denom = inp.col_width * inp.m_cd;
+    let beta = if denom.abs() > 1e-9 {
+        inp.n_ratio * inp.j_tw * inp.s_cd / denom
+    } else {
+        0.0
+    };
+
+    let fs = crate::rc::concrete_allowable_shear(inp.fc, inp.long_term);
+
+    let ma = cve * j_delta * fs * (1.0 + beta);
+    let md = inp.h_ratio * inp.sum_beam_moments;
+
+    let ratio = if ma > 0.0 {
+        md.abs() / ma
+    } else {
+        f64::INFINITY
+    };
+    let ok = ratio <= 1.0;
+
+    let shape_label = match inp.shape {
+        JointShape::Cross => "十字形(jdelta=3)",
+        JointShape::Tee => "T字形(jdelta=2)",
+        JointShape::Knee => "ト字形(jdelta=2)",
+        JointShape::Corner => "L字形(jdelta=1)",
+    };
+    let term_label = if inp.long_term { "長期" } else { "短期" };
+    let basis = format!(
+        "SRC規準 柱梁接合部（パネル）せん断検定 {} ({})",
+        shape_label, term_label
+    );
+    let detail = format!(
+        "cVe={:.1} mm2, beta={:.4}, jdelta={:.1}, fs={:.4} N/mm2, Ma={:.1} N*mm, Md={:.1} N*mm, ratio={:.4}",
+        cve, beta, j_delta, fs, ma, md, ratio
     );
 
     CheckResult {
@@ -843,12 +984,14 @@ mod tests {
                     d_eff: 500.0,
                     pw: 0.004,
                     w_ft: 195.0,
+                    steel_shear: 0.0,
                 },
                 WallSideColumn {
                     b: 500.0,
                     d_eff: 500.0,
                     pw: 0.004,
                     w_ft: 195.0,
+                    steel_shear: 0.0,
                 },
             ],
             opening: None,
@@ -946,6 +1089,138 @@ mod tests {
         let q2 = qw + sum_qc;
         let qa = q1.max(q2);
         let expected_ratio = inp.q_design.abs() / qa;
+        assert!((res.ratio - expected_ratio).abs() < 1e-6);
+    }
+
+    // ------------------------------------------------------------------
+    // 5. RC 造耐震壁（SRC 側柱の鉄骨せん断項）
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn rc_wall_steel_shear_adds_to_qc() {
+        let mut inp = base_wall_input();
+        // 片側柱に鉄骨せん断項 steel_shear=100,000N を追加（SRC 側柱相当）。
+        inp.side_columns[0].steel_shear = 100_000.0;
+        let res_with_steel = rc_wall_shear_check(&inp);
+        let res_without = rc_wall_shear_check(&base_wall_input());
+        // 鉄骨項の分だけ Q2（ひいては Qa）が大きくなり ratio は小さくなる
+        // （安全側の増分であることを確認）。
+        assert!(res_with_steel.ratio < res_without.ratio);
+
+        let fs = crate::rc::concrete_allowable_shear(inp.fc, false);
+        let q1 = inp.t * inp.l * fs;
+        let le = inp.l_clear;
+        let qw = inp.ps * inp.t * le * inp.w_ft;
+        let sum_qc: f64 = inp
+            .side_columns
+            .iter()
+            .map(|c| {
+                let j = 7.0 / 8.0 * c.d_eff;
+                let pw_term = (c.pw - 0.002).max(0.0);
+                c.b * j * (1.5 * fs + 0.5 * c.w_ft * pw_term) + c.steel_shear
+            })
+            .sum();
+        let q2 = qw + sum_qc;
+        let qa = q1.max(q2);
+        let expected_ratio = inp.q_design.abs() / qa;
+        assert!((res_with_steel.ratio - expected_ratio).abs() < 1e-6);
+    }
+
+    // ------------------------------------------------------------------
+    // 6. SRC 造柱梁接合部（パネルゾーン）
+    // ------------------------------------------------------------------
+
+    fn base_src_panel_input() -> SrcPanelInput {
+        SrcPanelInput {
+            shape: JointShape::Cross,
+            fc: 24.0,
+            long_term: false,
+            col_width: 600.0,
+            beam_width: 300.0,
+            m_bd: 400.0,
+            m_cd: 500.0,
+            j_tw: 12.0,
+            s_cd: 350.0,
+            beam_is_steel: false,
+            n_ratio: 15.0,
+            h_ratio: 1.0,
+            sum_beam_moments: 300_000_000.0,
+        }
+    }
+
+    #[test]
+    fn src_panel_hand_calc() {
+        let inp = base_src_panel_input();
+        let res = src_panel_zone_check(&inp);
+
+        let cve = (inp.col_width + inp.beam_width) / 2.0 * inp.m_bd * inp.m_cd;
+        let beta = inp.n_ratio * inp.j_tw * inp.s_cd / (inp.col_width * inp.m_cd);
+        let fs = crate::rc::concrete_allowable_shear(inp.fc, false);
+        let ma = cve * 3.0 * fs * (1.0 + beta); // jdelta=3 (十字形)
+        let expected_ratio = inp.sum_beam_moments / ma;
+
+        assert!((res.ratio - expected_ratio).abs() < 1e-6);
+    }
+
+    #[test]
+    fn src_panel_beta_zero_without_steel() {
+        let mut inp = base_src_panel_input();
+        inp.j_tw = 0.0; // 鉄骨ウェブ厚 0 → β=0
+        let res = src_panel_zone_check(&inp);
+
+        let cve = (inp.col_width + inp.beam_width) / 2.0 * inp.m_bd * inp.m_cd;
+        let fs = crate::rc::concrete_allowable_shear(inp.fc, false);
+        let ma = cve * 3.0 * fs; // (1+beta) = 1
+        let expected_ratio = inp.sum_beam_moments / ma;
+
+        assert!((res.ratio - expected_ratio).abs() < 1e-6);
+    }
+
+    #[test]
+    fn src_panel_shape_factor_ratio_cross_is_3x_corner() {
+        let cross = src_panel_zone_check(&base_src_panel_input());
+        let mut corner_input = base_src_panel_input();
+        corner_input.shape = JointShape::Corner;
+        let corner = src_panel_zone_check(&corner_input);
+
+        // Ma(十字形) = 3・Ma(L字形)（他諸元は同一）なので
+        // ratio(L字形) = 3・ratio(十字形)。
+        assert!((corner.ratio / cross.ratio - 3.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn src_panel_long_term_uses_long_term_fs() {
+        let mut inp = base_src_panel_input();
+        inp.long_term = true;
+        let res = src_panel_zone_check(&inp);
+
+        let cve = (inp.col_width + inp.beam_width) / 2.0 * inp.m_bd * inp.m_cd;
+        let beta = inp.n_ratio * inp.j_tw * inp.s_cd / (inp.col_width * inp.m_cd);
+        let fs_long = crate::rc::concrete_allowable_shear(inp.fc, true);
+        let fs_short = crate::rc::concrete_allowable_shear(inp.fc, false);
+        assert!(fs_long < fs_short);
+
+        let ma = cve * 3.0 * fs_long * (1.0 + beta);
+        let expected_ratio = inp.sum_beam_moments / ma;
+        assert!((res.ratio - expected_ratio).abs() < 1e-6);
+
+        // 長期は fs が小さく Ma も小さいため、ratio は短期より大きい。
+        let res_short = src_panel_zone_check(&base_src_panel_input());
+        assert!(res.ratio > res_short.ratio);
+    }
+
+    #[test]
+    fn src_panel_beam_is_steel_uses_half_cb() {
+        let mut inp = base_src_panel_input();
+        inp.beam_is_steel = true;
+        let res = src_panel_zone_check(&inp);
+
+        let cve = inp.col_width / 2.0 * inp.m_bd * inp.m_cd;
+        let beta = inp.n_ratio * inp.j_tw * inp.s_cd / (inp.col_width * inp.m_cd);
+        let fs = crate::rc::concrete_allowable_shear(inp.fc, false);
+        let ma = cve * 3.0 * fs * (1.0 + beta);
+        let expected_ratio = inp.sum_beam_moments / ma;
+
         assert!((res.ratio - expected_ratio).abs() < 1e-6);
     }
 }

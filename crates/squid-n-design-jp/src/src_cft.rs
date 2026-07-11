@@ -24,9 +24,12 @@
 //!    `rQD1 = rQL + (rM1+rM2)/l'` 等）は、部材端の許容/終局モーメントの
 //!    組み合わせを要するため実装せず、弾性分担に基づく一般化した
 //!    せん断力・せん断耐力の比較で代替する。
-//! 2. SRC 柱・CFT 柱の鋼管/鉄骨部分の許容圧縮応力度 `s_fc` は座屈長さ・
-//!    細長比を考慮せず、`s_fc = s_ft`（許容引張と同値）として扱う
-//!    （非保守的になり得るため、細長い柱では別途座屈検討が必要）。
+//! 2. CFT 柱の鋼管部分の許容圧縮応力度 `s_fc` は座屈を考慮する
+//!    （λ = lk/i を**鋼管単体**の断面二次半径で評価。充填コンクリートの
+//!    剛性寄与を無視するため安全側。[`cft_common_steel`] 参照）。
+//!    SRC 柱の内蔵鉄骨の `s_fc` は、被覆コンクリートによる拘束で単材座屈が
+//!    生じにくいことから `s_fc = s_ft` のままとする（SRC 規準の座屈検討は
+//!    別途必要になり得る）。
 //! 3. SRC 柱の RC 部分の中立軸圧縮側鉄骨面積 `s_ac`（fc′ 低減用）は
 //!    軸に依らず `steel_width・steel_flange_thick` の一つの値を用いる
 //!    （本来は曲げ軸ごとに異なりうる）。
@@ -36,7 +39,7 @@
 //!    分布を断面内で数値積分して求める（矩形の閉形式と同じ弾性仮定）。
 
 use crate::rc::{
-    concrete_allowable_compression, concrete_allowable_shear, rebar_allowable_shear,
+    concrete_allowable_compression_class, concrete_allowable_shear_class, rebar_allowable_shear,
     rebar_allowable_tension, young_ratio_n,
 };
 use crate::steel::{steel_f_value_prefix, steel_fs, steel_ft};
@@ -185,7 +188,6 @@ fn src_shear_check(
     w_ft: f64,
     s_fs: f64,
     steel_shear_area: f64,
-    term: LoadTerm,
     alpha_max: f64,
 ) -> SrcShearResult {
     let alpha = shear_alpha_src(m_for_alpha, q_for_alpha, rd, alpha_max);
@@ -197,7 +199,11 @@ fn src_shear_check(
 
     let s_qa = steel_shear_area * s_fs;
 
-    let pw_cap = if term == LoadTerm::Long { 0.006 } else { 0.012 };
+    // SRC 規準1987 準拠: 「pw が 0.6% を超える場合は 0.6% として算定する」
+    // （RESP-D マニュアル「04 断面検定」SRC 部分。長期・短期の区別は記載
+    // されていないため、長短期とも 0.6% を上限とする。RC の短期 1.2% とは
+    // 異なる点に注意）。
+    let pw_cap = 0.006;
     let pw = pw_raw.min(pw_cap);
 
     let r_qa1 = b * rj * (alpha * fs + 0.5 * pw * w_ft);
@@ -243,7 +249,9 @@ fn src_beam_check(
     let long_term = ctx.term == LoadTerm::Long;
     let grade = mat.name.as_str();
 
-    let fs = concrete_allowable_shear(fc_raw, long_term);
+    // 軽量コンクリート1種・2種は許容応力度を 0.9 倍に低減（マニュアル
+    // 「04 断面検定」。`mat.concrete_class` を考慮した class 対応版を使用）。
+    let fs = concrete_allowable_shear_class(fc_raw, mat.concrete_class, long_term);
     let shear_grade = rebar
         .shear
         .grade
@@ -290,7 +298,6 @@ fn src_beam_check(
         w_ft,
         s_fs,
         steel_web_thick * dw,
-        ctx.term,
         2.0,
     );
 
@@ -501,8 +508,10 @@ fn src_column_check(
     let long_term = ctx.term == LoadTerm::Long;
     let grade = mat.name.as_str();
 
-    let fc_allow = concrete_allowable_compression(fc_raw, long_term);
-    let fs = concrete_allowable_shear(fc_raw, long_term);
+    // 軽量コンクリート1種・2種は許容応力度（圧縮・せん断）を 0.9 倍に低減
+    // （マニュアル「04 断面検定」。class 対応版を使用）。
+    let fc_allow = concrete_allowable_compression_class(fc_raw, mat.concrete_class, long_term);
+    let fs = concrete_allowable_shear_class(fc_raw, mat.concrete_class, long_term);
     let n_ratio = young_ratio_n(fc_raw);
     let shear_grade = rebar
         .shear
@@ -599,7 +608,6 @@ fn src_column_check(
         w_ft,
         s_fs,
         steel_web_thick * (steel_height - 2.0 * steel_flange_thick),
-        ctx.term,
         1.5,
     );
 
@@ -620,7 +628,6 @@ fn src_column_check(
         w_ft,
         s_fs,
         2.0 * steel_flange_thick * steel_width,
-        ctx.term,
         1.5,
     );
 
@@ -786,11 +793,28 @@ fn cft_axis_capacity(
     }
 }
 
-fn cft_common_steel(f_value: f64, term: LoadTerm) -> (f64, f64, f64) {
+/// CFT 柱の鋼管部分の許容応力度 (s_ft, s_fs, s_fc)。
+///
+/// s_fc は座屈を考慮する（RESP-D マニュアル 04「CFT柱の断面検定」の記号
+/// λ=Lk/i・Lk/D に対応）。細長比 λ は**鋼管単体**の断面二次半径で評価する
+/// （充填コンクリートの曲げ剛性寄与を無視するため実際より λ が大きく
+/// 算定され、安全側）。λ=0（座屈長さ 0）のとき s_fc は長期 F/1.5（=s_ft）
+/// に一致し、従来実装（s_fc = s_ft）と連続する。
+fn cft_common_steel(f_value: f64, term: LoadTerm, lambda: f64) -> (f64, f64, f64) {
     let s_ft = steel_ft(f_value, term);
     let s_fs = steel_fs(f_value, term);
-    let s_fc = s_ft; // 座屈考慮なし（モジュール doc 参照）
+    let s_fc = crate::steel::steel_fc(f_value, lambda, term);
     (s_ft, s_fs, s_fc)
+}
+
+/// 鋼管単体の最小断面二次半径 i_min と座屈長さ lk から細長比 λ を求める。
+/// i_min・lk のいずれかが 0 以下なら λ=0（座屈無視）。
+fn cft_lambda(i_min: f64, lk: f64) -> f64 {
+    if i_min > 1e-9 && lk > 0.0 {
+        lk / i_min
+    } else {
+        0.0
+    }
 }
 
 fn cft_box_steel_props(height: f64, width: f64, thick: f64) -> (f64, f64, f64) {
@@ -829,12 +853,24 @@ fn cft_box_check(
     fc_raw: f64,
 ) -> CheckResult {
     let long_term = ctx.term == LoadTerm::Long;
-    let fc_allow = concrete_allowable_compression(fc_raw, long_term);
+    // 軽量コンクリート1種・2種は許容圧縮応力度を 0.9 倍に低減（class 対応版）。
+    let fc_allow = concrete_allowable_compression_class(fc_raw, mat.concrete_class, long_term);
 
     let f_value = steel_f_value_prefix(&mat.name, thick).unwrap_or(235.0);
-    let (s_ft, s_fs, s_fc) = cft_common_steel(f_value, ctx.term);
-
     let (sa, sz_z, sz_y) = cft_box_steel_props(height, width, thick);
+    // 鋼管単体の最小断面二次半径（弱軸）で細長比を評価（安全側）。
+    let shape = SectionShape::CftBox {
+        height,
+        width,
+        thick,
+    };
+    let i_min = if sa > 1e-9 {
+        (shape.calc_iy().min(shape.calc_iz()) / sa).max(0.0).sqrt()
+    } else {
+        0.0
+    };
+    let lambda = cft_lambda(i_min, ctx.lk.unwrap_or(ctx.length));
+    let (s_ft, s_fs, s_fc) = cft_common_steel(f_value, ctx.term, lambda);
     let s_nt = sa * s_ft;
     let s_nc = sa * s_fc;
 
@@ -899,12 +935,20 @@ fn cft_pipe_check(
     fc_raw: f64,
 ) -> CheckResult {
     let long_term = ctx.term == LoadTerm::Long;
-    let fc_allow = concrete_allowable_compression(fc_raw, long_term);
+    // 軽量コンクリート1種・2種は許容圧縮応力度を 0.9 倍に低減（class 対応版）。
+    let fc_allow = concrete_allowable_compression_class(fc_raw, mat.concrete_class, long_term);
 
     let f_value = steel_f_value_prefix(&mat.name, thick).unwrap_or(235.0);
-    let (s_ft, s_fs, s_fc) = cft_common_steel(f_value, ctx.term);
-
     let (sa, sz) = cft_pipe_steel_props(outer_dia, thick);
+    // 鋼管単体の断面二次半径で細長比を評価（安全側）。
+    let shape = SectionShape::CftPipe { outer_dia, thick };
+    let i_min = if sa > 1e-9 {
+        (shape.calc_iy() / sa).max(0.0).sqrt()
+    } else {
+        0.0
+    };
+    let lambda = cft_lambda(i_min, ctx.lk.unwrap_or(ctx.length));
+    let (s_ft, s_fs, s_fc) = cft_common_steel(f_value, ctx.term, lambda);
     let s_nt = sa * s_ft;
     let s_nc = sa * s_fc;
 
@@ -1088,11 +1132,14 @@ impl DesignCheck for CftDesign {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::rc::concrete_allowable_shear;
     use squid_n_core::ids::{MaterialId, SectionId};
     use squid_n_core::section_shape::{BarSet, RcRebar, SectionShape, ShearBar};
+    use squid_n_core::units::ConcreteClass;
 
     fn make_material(fc: f64, grade: &str) -> Material {
         Material {
+            concrete_class: Default::default(),
             id: MaterialId(0),
             name: grade.to_string(),
             young: 205000.0,
@@ -1106,6 +1153,7 @@ mod tests {
 
     fn make_material_no_fc(grade: &str) -> Material {
         Material {
+            concrete_class: Default::default(),
             id: MaterialId(0),
             name: grade.to_string(),
             young: 205000.0,
@@ -1264,11 +1312,49 @@ mod tests {
             w_ft,
             s_fs,
             9.0 * (500.0 - 2.0 * 14.0),
-            LoadTerm::Long,
             2.0,
         );
         assert!((shear.s_q - expected_s_q).abs() / expected_s_q < 1e-9);
         assert!((shear.s_q + shear.r_q - q).abs() < 1e-6);
+    }
+
+    /// SRC の pw 上限は SRC 規準1987 準拠で長短期とも 0.6%
+    /// （「pw が 0.6% を超える場合は 0.6% として算定する」）。
+    #[test]
+    fn test_src_shear_pw_capped_at_0_6_percent_both_terms() {
+        // 過大なせん断補強筋比（pw > 0.6%）を与え、算定に使われる pw が
+        // 0.6% に頭打ちされることを確認する。
+        let shape = src_rect_shape(
+            400.0, 700.0, 6, 22.0, 2, 40.0, 13.0, 30.0, 4, 500.0, 200.0, 9.0, 14.0, "SN400B",
+        );
+        let rebar = match &shape {
+            SectionShape::SrcRect { rebar, .. } => rebar.clone(),
+            _ => unreachable!(),
+        };
+        let props = src_rect_axis_props(400.0, 700.0, &rebar.main_x, &rebar);
+        assert!(props.pw > 0.006, "テストの前提として pw > 0.6% が必要");
+
+        let f_value = steel_f_value_prefix("SN400B", 14.0).unwrap();
+        for long_term in [true, false] {
+            let fs = concrete_allowable_shear(24.0, long_term);
+            let w_ft = rebar_allowable_shear("SD345", long_term);
+            let term = if long_term {
+                LoadTerm::Long
+            } else {
+                LoadTerm::Short
+            };
+            let s_fs = steel_fs(f_value, term);
+            let shear = src_shear_check(
+                100_000.0, 0.0, 100_000.0,
+                0.0, // 鉄骨寄与を 0 として RC 側の pw の効果だけを見る
+                props.at, props.j, props.d, props.b, 200.0, props.pw, fs, w_ft, s_fs, 0.0, 2.0,
+            );
+            assert!(
+                (shear.pw - 0.006).abs() < 1e-12,
+                "long_term={long_term}: pw={} は 0.6% に頭打ちされるはず",
+                shear.pw
+            );
+        }
     }
 
     // ------------------------------------------------------------------
@@ -1612,6 +1698,61 @@ mod tests {
         };
         let r = design.check(&forces, &sec, &mat, &ctx);
         assert!((r.ratio - 0.4).abs() < 1e-3, "ratio={}", r.ratio);
+    }
+
+    /// 軽量コンクリート1種の充填 CFT は cNc が 0.9 倍に低減され、
+    /// 圧縮軸力超過時の検定比が普通コンクリートより大きくなる
+    /// （`mat.concrete_class` が許容応力度算定に反映されている）。
+    #[test]
+    fn test_cft_box_lightweight_reduces_cnc() {
+        let sec = cft_box_section(400.0, 300.0, 9.0);
+        let mut mat_n = make_material(24.0, "SN400B");
+        mat_n.concrete_class = ConcreteClass::Normal;
+        let mut mat_l = make_material(24.0, "SN400B");
+        mat_l.concrete_class = ConcreteClass::Lightweight1;
+        let ctx = ctx_column(LoadTerm::Long);
+        let design = CftDesign;
+
+        // 圧縮容量を大きく超える軸力を与え、ratio_axial = N/(cNc+sNc) を比較する。
+        let forces = MemberForcesAt {
+            n: -50_000_000.0,
+            ..zero_forces()
+        };
+        let r_n = design.check(&forces, &sec, &mat_n, &ctx);
+        let r_l = design.check(&forces, &sec, &mat_l, &ctx);
+        assert!(
+            r_l.ratio > r_n.ratio,
+            "軽量1種は cNc 低減で検定比が大きいはず: normal={}, light={}",
+            r_n.ratio,
+            r_l.ratio
+        );
+    }
+
+    /// SRC 柱でも軽量コンクリートの 0.9 倍低減が rNc（RC 部分の許容圧縮）に
+    /// 反映される。
+    #[test]
+    fn test_src_column_lightweight_reduces_capacity() {
+        let shape = src_column_shape();
+        let sec = make_section(shape);
+        let mut mat_n = make_material(24.0, "SD345");
+        mat_n.concrete_class = ConcreteClass::Normal;
+        let mut mat_l = make_material(24.0, "SD345");
+        mat_l.concrete_class = ConcreteClass::Lightweight1;
+        let ctx = ctx_column(LoadTerm::Long);
+        let design = SrcDesign;
+
+        let forces = MemberForcesAt {
+            n: -50_000_000.0,
+            ..zero_forces()
+        };
+        let r_n = design.check(&forces, &sec, &mat_n, &ctx);
+        let r_l = design.check(&forces, &sec, &mat_l, &ctx);
+        assert!(
+            r_l.ratio > r_n.ratio,
+            "軽量1種は rNc 低減で検定比が大きいはず: normal={}, light={}",
+            r_n.ratio,
+            r_l.ratio
+        );
     }
 
     #[test]

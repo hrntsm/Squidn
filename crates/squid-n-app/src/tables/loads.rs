@@ -729,6 +729,7 @@ fn combinations_section(ui: &mut egui::Ui, app: &mut App) {
                     wind_y: None,
                     snow: app.combo_draft.snow,
                     heavy_snow_zone: app.analysis_cfg.heavy_snow_zone,
+                    snow_factors: None,
                 };
                 let combos = squid_n_load::combo::standard_combinations(&input);
                 for combo in combos {

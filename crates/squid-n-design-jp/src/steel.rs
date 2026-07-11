@@ -404,6 +404,87 @@ fn nonzero(z: f64) -> f64 {
 }
 
 // ---------------------------------------------------------------------
+// 断面欠損（継手部・スカラップ）と横座屈長さ
+// （RESP-D マニュアル 04 断面検定「鉄骨の断面検定における断面性能」）
+// ---------------------------------------------------------------------
+
+/// H形鋼の欠損考慮断面係数 Z'（強軸）。
+///
+/// マニュアル原文の式:
+/// - 継手部: `If' = If・(1−βf/100)`、`Iw' = Iw・(1−βw/100)`
+///   （βf/βw: フランジ/ウェブの欠損率 [%]）
+/// - スカラップ: `Iw'' = tw・((H−2tf)(1−αw/100))³/12`
+///   （αw: スカラップによるウェブ欠損率 [%]）
+///
+/// フランジ寄与分 `If = (B・H³ − B・(H−2tf)³)/12`、ウェブ寄与分
+/// `Iw = tw・(H−2tf)³/12` は、全断面の強軸断面二次モーメント
+/// `Iy = (B・H³ − (B−tw)・(H−2tf)³)/12`（[`squid_n_core::section_shape`] の
+/// H形と同一の式）を `If + Iw = Iy` と分解したもの。
+///
+/// `is_end=true`（部材端部、スカラップが生じ得る位置）の場合は、ウェブ寄与分を
+/// スカラップ考慮の `Iw''` に置き換えたうえで継手欠損 `βw` も併せて乗じる
+/// （端部に継手とスカラップが重なる保守的な扱い）。`is_end=false`（継手部・
+/// 中間部）は `Iw'`（βw のみ）を用いる。
+///
+/// `Z' = (If' + Iw'') / (H/2)`。欠損率が 0 の場合は通常の H形強軸断面係数
+/// `Z = Iy/(H/2)` に一致する。
+pub fn steel_h_z_with_loss(
+    h: f64,
+    b: f64,
+    tw: f64,
+    tf: f64,
+    beta_f: f64,
+    beta_w: f64,
+    alpha_w: f64,
+    is_end: bool,
+) -> f64 {
+    let hw = (h - 2.0 * tf).max(0.0);
+    let i_f = (b * h.powi(3) - b * hw.powi(3)) / 12.0;
+    let i_f_prime = i_f * (1.0 - beta_f / 100.0).max(0.0);
+
+    let i_w_prime = if is_end {
+        let hw_scallop = hw * (1.0 - alpha_w / 100.0).max(0.0);
+        let i_w_scallop = tw * hw_scallop.powi(3) / 12.0;
+        i_w_scallop * (1.0 - beta_w / 100.0).max(0.0)
+    } else {
+        let i_w = tw * hw.powi(3) / 12.0;
+        i_w * (1.0 - beta_w / 100.0).max(0.0)
+    };
+
+    section_modulus(i_f_prime + i_w_prime, h / 2.0)
+}
+
+/// 横座屈長さ lb [mm] の解決（優先順位: 直接入力 > 等間隔横補剛 > 部材長）。
+///
+/// 1. `lb_direct = Some((始端, 中央, 終端))` が与えられていれば、`pos`
+///    （部材軸方向の無次元位置 0.0〜1.0）に応じて該当区間の値を返す:
+///    `pos<0.25` は始端、`pos<0.75` は中央、それ以外は終端。
+/// 2. 直接入力が無く `brace_count = Some(n)`（等間隔横補剛の本数）が
+///    あれば `lb = L/(n+1)`（`n` 本の補剛で部材が `n+1` 等分される）。
+/// 3. いずれも無ければ部材長 `length` をそのまま横座屈長さとする
+///    （横補剛なし＝全長で座屈）。
+pub fn resolve_lb(
+    pos: f64,
+    length: f64,
+    lb_direct: Option<(f64, f64, f64)>,
+    brace_count: Option<u32>,
+) -> f64 {
+    if let Some((start, mid, end)) = lb_direct {
+        return if pos < 0.25 {
+            start
+        } else if pos < 0.75 {
+            mid
+        } else {
+            end
+        };
+    }
+    if let Some(n) = brace_count {
+        return length / (n as f64 + 1.0);
+    }
+    length
+}
+
+// ---------------------------------------------------------------------
 // 大梁必要横補剛数（情報出力のみ。検定比には含めない）
 // ---------------------------------------------------------------------
 
@@ -793,6 +874,7 @@ mod tests {
 
     fn mat(name: &str) -> Material {
         Material {
+            concrete_class: Default::default(),
             id: MaterialId(0),
             name: name.to_string(),
             young: 205_000.0,
@@ -1430,6 +1512,107 @@ mod tests {
     }
 
     // -------------------------------------------------------------
+    // 断面欠損（継手部・スカラップ）と横座屈長さ
+    // -------------------------------------------------------------
+
+    /// βf=βw=αw=0 のとき、通常の H形強軸断面係数 Z=Iy/(H/2) に一致する
+    /// （`Iy` は [`squid_n_core::section_shape::SectionShape::SteelH`] と同一の
+    /// `(B・H³ − (B−tw)・(H−2tf)³)/12` 式）。
+    #[test]
+    fn test_z_with_loss_zero_matches_normal_z() {
+        let (h, b, tw, tf): (f64, f64, f64, f64) = (500.0, 200.0, 9.0, 14.0);
+        let hw = h - 2.0 * tf;
+        let iy = (b * h.powi(3) - (b - tw) * hw.powi(3)) / 12.0;
+        let z_expected = iy / (h / 2.0);
+
+        let z_mid = steel_h_z_with_loss(h, b, tw, tf, 0.0, 0.0, 0.0, false);
+        let z_end = steel_h_z_with_loss(h, b, tw, tf, 0.0, 0.0, 0.0, true);
+        assert!(
+            (z_mid - z_expected).abs() < 1e-6,
+            "z_mid={} expected={}",
+            z_mid,
+            z_expected
+        );
+        assert!(
+            (z_end - z_expected).abs() < 1e-6,
+            "z_end={} expected={}",
+            z_end,
+            z_expected
+        );
+    }
+
+    /// βf=100（フランジ全損）ならフランジ寄与 If' が消え、ウェブ寄与のみが
+    /// 残る（Z' = Iw'/(H/2)）。
+    #[test]
+    fn test_z_with_loss_beta_f_100_removes_flange_contribution() {
+        let (h, b, tw, tf): (f64, f64, f64, f64) = (500.0, 200.0, 9.0, 14.0);
+        let hw = h - 2.0 * tf;
+        let i_w = tw * hw.powi(3) / 12.0;
+        let z_expected = i_w / (h / 2.0);
+
+        let z = steel_h_z_with_loss(h, b, tw, tf, 100.0, 0.0, 0.0, false);
+        assert!(
+            (z - z_expected).abs() < 1e-6,
+            "z={} expected={}",
+            z,
+            z_expected
+        );
+    }
+
+    /// スカラップ αw の 3 乗効果: is_end=true で αw を大きくすると
+    /// Iw''=tw・(hw・(1−αw/100))³/12 は (1−αw/100)³ に比例して小さくなる。
+    #[test]
+    fn test_z_with_loss_scallop_cubic_effect() {
+        let (h, b, tw, tf): (f64, f64, f64, f64) = (500.0, 200.0, 9.0, 14.0);
+        let z_no_scallop = steel_h_z_with_loss(h, b, tw, tf, 0.0, 0.0, 0.0, true);
+        let z_scallop = steel_h_z_with_loss(h, b, tw, tf, 0.0, 0.0, 50.0, true);
+
+        let hw = h - 2.0 * tf;
+        let i_w_no_scallop = tw * hw.powi(3) / 12.0;
+        let i_w_scallop = tw * (hw * 0.5).powi(3) / 12.0;
+        // (1-0.5)^3 = 0.125 倍。
+        assert!((i_w_scallop / i_w_no_scallop - 0.125).abs() < 1e-9);
+
+        assert!(
+            z_scallop < z_no_scallop,
+            "z_scallop={} z_no_scallop={}",
+            z_scallop,
+            z_no_scallop
+        );
+        // is_end=false（スカラップ非適用）は αw の影響を受けない。
+        let z_mid_with_alpha = steel_h_z_with_loss(h, b, tw, tf, 0.0, 0.0, 50.0, false);
+        let z_mid_no_alpha = steel_h_z_with_loss(h, b, tw, tf, 0.0, 0.0, 0.0, false);
+        assert!((z_mid_with_alpha - z_mid_no_alpha).abs() < 1e-9);
+    }
+
+    /// resolve_lb: 直接入力があれば位置に応じて始端/中央/終端を返す。
+    #[test]
+    fn test_resolve_lb_direct_input_priority() {
+        let direct = Some((1000.0, 2000.0, 3000.0));
+        assert_eq!(resolve_lb(0.0, 9000.0, direct, Some(2)), 1000.0);
+        assert_eq!(resolve_lb(0.24, 9000.0, direct, Some(2)), 1000.0);
+        assert_eq!(resolve_lb(0.25, 9000.0, direct, Some(2)), 2000.0);
+        assert_eq!(resolve_lb(0.5, 9000.0, direct, Some(2)), 2000.0);
+        assert_eq!(resolve_lb(0.74, 9000.0, direct, Some(2)), 2000.0);
+        assert_eq!(resolve_lb(0.75, 9000.0, direct, Some(2)), 3000.0);
+        assert_eq!(resolve_lb(1.0, 9000.0, direct, Some(2)), 3000.0);
+    }
+
+    /// resolve_lb: 直接入力が無く等間隔横補剛の本数があれば L/(n+1)。
+    #[test]
+    fn test_resolve_lb_brace_count_when_no_direct() {
+        // n=2 本の補剛で 3 等分 → 9000/3=3000。
+        assert_eq!(resolve_lb(0.5, 9000.0, None, Some(2)), 3000.0);
+        assert_eq!(resolve_lb(0.0, 9000.0, None, Some(2)), 3000.0);
+    }
+
+    /// resolve_lb: どちらも無ければ部材長そのまま。
+    #[test]
+    fn test_resolve_lb_falls_back_to_length() {
+        assert_eq!(resolve_lb(0.5, 9000.0, None, None), 9000.0);
+    }
+
+    // -------------------------------------------------------------
     // 大梁必要横補剛数
     // -------------------------------------------------------------
 
@@ -1535,6 +1718,7 @@ mod tests {
         };
         let material = mat("SN400");
         let material = Material {
+            concrete_class: Default::default(),
             young: e,
             ..material
         };
