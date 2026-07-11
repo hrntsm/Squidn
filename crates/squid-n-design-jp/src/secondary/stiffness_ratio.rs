@@ -6,8 +6,9 @@
 //! - **剛性率算出用の層間変形角:** 重心位置の層間変位 δg を用いる:
 //!   `1/irs = iδg / iH`, `Rs = rs / r̄s ≧ 0.6`（r̄s は相加平均）
 //!
-//! 剛性率の式自体（Ks=H/δ, Rs=Ks/mean）は `holding_capacity::stiffness_ratios` を
-//! 再利用する。本モジュールは「δ に何を使うか」をマニュアル通りに揃える層。
+//! 剛性率の式自体（Ks=H/δ, Rs=Ks/mean）は
+//! `crate::secondary::holding_capacity::stiffness_ratios` を再利用する。
+//! 本モジュールは「δ に何を使うか」をマニュアル通りに揃える層である。
 
 use squid_n_core::ids::{ElemId, StoryId};
 use squid_n_core::model::{ElementKind, Model, Node};
@@ -128,7 +129,8 @@ pub fn cog_horizontal_disp(model: &Model, disp: &[[f64; 6]], dir: usize, story: 
 
 /// 全層の「重心位置の層間変位」δg [mm]（下階→上階順）。
 /// `iδg = 当該層の重心位置変位 − 直下層の重心位置変位`（最下層は基部変位 0 とみなす）。
-/// 剛性率 Rs の算出（`holding_capacity::stiffness_ratios`）にこの δg を渡す。
+/// 剛性率 Rs の算出（`crate::secondary::holding_capacity::stiffness_ratios`）に
+/// この δg を渡す。
 pub fn cog_story_drifts(model: &Model, disp: &[[f64; 6]], dir: usize) -> Vec<f64> {
     let disp_g: Vec<f64> = model
         .stories

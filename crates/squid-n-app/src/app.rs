@@ -299,14 +299,15 @@ pub struct App {
     /// モデルタブ内のサブタブ
     pub model_tab: ModelTab,
     /// 保有水平耐力（ルート3）判定の架構種別（Ds 表の行選択）
-    pub design_frame: squid_n_design_jp::holding_capacity::FrameType,
+    pub design_frame: squid_n_design_jp::secondary::holding_capacity::FrameType,
     /// 保有水平耐力（ルート3）判定の部材ランク（Ds 表の列選択）。
     /// `design_rank_auto == true` の場合はフォールバック用（幅厚比を算定できない
     /// 層のみに適用される）。
-    pub design_rank: squid_n_design_jp::holding_capacity::MemberRank,
+    pub design_rank: squid_n_design_jp::secondary::holding_capacity::MemberRank,
     /// 保有水平耐力（ルート3）の部材ランクを鋼部材の幅厚比から自動判定するか（UI-13）。
     /// true の場合、鋼部材かつ断面形状(`Section.shape`)を持つ部材について
-    /// `squid_n_design_jp::ds::max_width_thickness` → `s_member_rank` で算定し、
+    /// `squid_n_design_jp::secondary::width_thickness::max_width_thickness` →
+    /// `s_member_rank` で算定し、
     /// 算定できなかった層のみ `design_rank`（選択値）にフォールバックする。
     pub design_rank_auto: bool,
     /// 左ペインの幅（px）。ドラッグで調整可能（180–520 にクランプ）。
@@ -427,8 +428,8 @@ impl Default for App {
             nav: Navigator::default(),
             model_tab: ModelTab::default(),
             // サンプル(門型ラーメン)が鋼構造のため既定は S ラーメン
-            design_frame: squid_n_design_jp::holding_capacity::FrameType::SteelFrame,
-            design_rank: squid_n_design_jp::holding_capacity::MemberRank::FA,
+            design_frame: squid_n_design_jp::secondary::holding_capacity::FrameType::SteelFrame,
+            design_rank: squid_n_design_jp::secondary::holding_capacity::MemberRank::FA,
             design_rank_auto: false,
             #[cfg(feature = "gui")]
             left_panel_width: 280.0,
@@ -756,19 +757,20 @@ impl App {
         &mut self,
     ) -> Result<
         (
-            squid_n_design_jp::holding_capacity::HoldingCapacityResult,
-            Vec<squid_n_design_jp::holding_capacity::MemberRank>,
+            squid_n_design_jp::secondary::holding_capacity::HoldingCapacityResult,
+            Vec<squid_n_design_jp::secondary::holding_capacity::MemberRank>,
         ),
         String,
     > {
         use squid_n_core::section_shape::SectionShape;
-        use squid_n_design_jp::ds::{
-            max_width_thickness, rc_member_rank, s_member_rank_scaled, worst_rank, RankCriteria,
-        };
-        use squid_n_design_jp::holding_capacity::{
+        use squid_n_design_jp::secondary::holding_capacity::{
             check_holding_capacity, ds_value, qud_by_story, MemberRank,
         };
-        use squid_n_design_jp::rc_capacity::{rc_qmu_simple, rc_qsu_simple};
+        use squid_n_design_jp::secondary::member_rank::{
+            rc_member_rank, s_member_rank_scaled, worst_rank, RankCriteria,
+        };
+        use squid_n_design_jp::secondary::rc_capacity::{rc_qmu_simple, rc_qsu_simple};
+        use squid_n_design_jp::secondary::width_thickness::max_width_thickness;
         use squid_n_design_jp::steel_f_value_prefix;
 
         // rigid_zone（剛域長・face_i/j）を読むため、算定前に自動剛域を反映する
@@ -875,12 +877,12 @@ impl App {
                         // 表の対象外形状（溝形・T形・山形等）は旧・単一幅厚比法へ
                         // フォールバックする。
                         let member_use = match member_kind_of(elem, &self.model) {
-                            squid_n_design_jp::MemberKind::Column => {
-                                squid_n_design_jp::ds::SteelMemberUse::Column
-                            }
-                            _ => squid_n_design_jp::ds::SteelMemberUse::Beam,
-                        };
-                        match squid_n_design_jp::ds::s_member_rank_by_kihon(
+                        squid_n_design_jp::MemberKind::Column => {
+                            squid_n_design_jp::secondary::width_thickness::SteelMemberUse::Column
+                        }
+                        _ => squid_n_design_jp::secondary::width_thickness::SteelMemberUse::Beam,
+                    };
+                        match squid_n_design_jp::secondary::width_thickness::s_member_rank_by_kihon(
                             shape, member_use, &mat.name,
                         ) {
                             Some(rank) => rank,
@@ -1602,7 +1604,8 @@ impl App {
             // 場合。K は節点まわり剛度比 G から算定）。柱以外は None（lk=部材長）。
             // RC 柱の検定は lk を使わないため、柱一律で設定して問題ない。
             let lk = if kind == squid_n_design_jp::MemberKind::Column {
-                squid_n_design_jp::buckling::steel_column_k(&self.model, elem).map(|k| k * length)
+                squid_n_design_jp::steel::buckling::steel_column_k(&self.model, elem)
+                    .map(|k| k * length)
             } else {
                 None
             };
@@ -1723,7 +1726,7 @@ impl App {
             self.design_term,
         );
         // PCa 水平接合面の検定（PcaBeamAttr が登録された梁のみ。使用限界・終局限界）。
-        checks.extend(squid_n_design_jp::pca::collect_pca_checks(
+        checks.extend(squid_n_design_jp::rc::horizontal_joint::collect_pca_checks(
             &self.model,
             &mf_slices,
             self.design_term == LoadTerm::Long,
@@ -2142,7 +2145,7 @@ fn rc_capacity_input_from_rect(
     rebar: &squid_n_core::section_shape::RcRebar,
     mat: &squid_n_core::model::Material,
     clear_span: f64,
-) -> Option<squid_n_design_jp::rc_capacity::RcCapacityInput> {
+) -> Option<squid_n_design_jp::secondary::rc_capacity::RcCapacityInput> {
     let fc = mat.fc?;
     let bar_area = |bs: &squid_n_core::section_shape::BarSet| -> f64 {
         bs.count as f64 * std::f64::consts::PI / 4.0 * bs.dia * bs.dia
@@ -2157,7 +2160,7 @@ fn rc_capacity_input_from_rect(
     } else {
         0.0
     };
-    Some(squid_n_design_jp::rc_capacity::RcCapacityInput {
+    Some(squid_n_design_jp::secondary::rc_capacity::RcCapacityInput {
         b,
         d,
         at,
@@ -4951,8 +4954,11 @@ mod tests {
     /// - 梁(400級): フランジ 100/13≈7.69（≦9 → FA）、ウェブ 46.75（≦60 → FA）→ FA
     #[test]
     fn test_holding_capacity_rank_auto_from_width_thickness() {
-        use squid_n_design_jp::ds::{s_member_rank_by_kihon, worst_rank, SteelMemberUse};
-        use squid_n_design_jp::holding_capacity::MemberRank;
+        use squid_n_design_jp::secondary::holding_capacity::MemberRank;
+        use squid_n_design_jp::secondary::member_rank::worst_rank;
+        use squid_n_design_jp::secondary::width_thickness::{
+            s_member_rank_by_kihon, SteelMemberUse,
+        };
 
         let mut app = App::default();
         app.load_model(crate::sample::portal_frame());
@@ -5015,8 +5021,8 @@ mod tests {
         use squid_n_core::ids::MaterialId;
         use squid_n_core::model::Material;
         use squid_n_core::section_shape::{BarSet, RcRebar, ShearBar};
-        use squid_n_design_jp::ds::{rc_member_rank, RankCriteria};
-        use squid_n_design_jp::rc_capacity::{rc_qmu_simple, rc_qsu_simple};
+        use squid_n_design_jp::secondary::member_rank::{rc_member_rank, RankCriteria};
+        use squid_n_design_jp::secondary::rc_capacity::{rc_qmu_simple, rc_qsu_simple};
 
         let b = 400.0;
         let d = 600.0;
@@ -5102,7 +5108,10 @@ mod tests {
         let rank_handcalc = rc_member_rank(qsu_handcalc, qmu_handcalc, &RankCriteria::default());
         assert_eq!(rank, rank_handcalc);
         // Qsu/Qmu ≈ 2.12（曲げ降伏が十分先行する健全な配筋）なので FA になるはず。
-        assert_eq!(rank, squid_n_design_jp::holding_capacity::MemberRank::FA);
+        assert_eq!(
+            rank,
+            squid_n_design_jp::secondary::holding_capacity::MemberRank::FA
+        );
     }
 
     /// UI-13(RC): SectionShape::RcRect + fc 付き材料（コンクリート、is_steel=false）を
@@ -5118,8 +5127,8 @@ mod tests {
             MemberLoad, MemberLoadKind, Model, NodalLoad, Node,
         };
         use squid_n_core::section_shape::{BarSet, RcRebar, SectionShape, ShearBar};
-        use squid_n_design_jp::ds::{rc_member_rank, RankCriteria};
-        use squid_n_design_jp::rc_capacity::{rc_qmu_simple, rc_qsu_simple};
+        use squid_n_design_jp::secondary::member_rank::{rc_member_rank, RankCriteria};
+        use squid_n_design_jp::secondary::rc_capacity::{rc_qmu_simple, rc_qsu_simple};
 
         let rebar = RcRebar {
             main_x: BarSet {

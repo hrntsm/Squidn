@@ -152,9 +152,10 @@ use squid_n_solver::pushover::PushoverResult;
 ///
 /// 他の量は各タスクで算定した層別配列を渡す:
 /// - `qud_by_story`: 二次設計用の地震時層せん断（**Ai 分布・C0=1.0** で算定したもの。§2）。
-/// - `ds_by_story`: 層 Ds（[`crate::ds::story_ds`]）。
+/// - `ds_by_story`: 層 Ds（[`crate::secondary::member_rank::story_ds`]）。
 /// - `fes_by_story`: 形状係数 Fes（[`fes`]）。
-/// - `rs_by_story` / `re_by_story`: 剛性率（[`stiffness_ratios`]）・偏心率（[`crate::eccentricity`]）。
+/// - `rs_by_story` / `re_by_story`: 剛性率（[`stiffness_ratios`]）・偏心率
+///   （[`crate::secondary::eccentricity`]）。
 /// - `story_heights`: 階高（層間変形角＝層間変位/階高 の算定に使用）。
 /// - `member_ranks`: 部材ランク一覧（出力にそのまま格納）。
 ///

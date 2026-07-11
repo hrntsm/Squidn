@@ -1,8 +1,8 @@
 //! RC 矩形断面の簡易終局耐力算定（部材ランク判定・プッシュオーバーせん断降伏判定用）。
 //!
 //! squid-n-skeleton のファイバ解析（`build_rc_member_skeleton`）は Mu を精算できるが、
-//! 保有水平耐力の部材ランク自動判定（`squid_n_design_jp::ds::rc_member_rank`）は毎フレーム
-//! 実行されるため重すぎる。また `squid_n_solver::pushover` のせん断降伏判定
+//! 保有水平耐力の部材ランク自動判定（`squid_n_design_jp::secondary::member_rank::rc_member_rank`）
+//! は毎フレーム実行されるため重すぎる。また `squid_n_solver::pushover` のせん断降伏判定
 //! （`compute_shear_yield_qy`）も同様に軽量な閉形式解を必要とする。本モジュールは
 //! 閉形式の簡易式で Mu・Qsu・Qmu を算定し、両者の入力とする。係数は靭性指針・
 //! 技術基準解説書等の略算式に基づく代表値であり、全て要・原典照合
@@ -10,8 +10,9 @@
 //!
 //! squid-n-solver（Layer 4）が squid-n-design-jp（Layer 5）に依存できない
 //! （循環依存になる）ため、本体は Layer 0 の squid-n-core に置き、
-//! `squid_n_design_jp::rc_capacity` は本モジュールの再エクスポートとする
-//! （既存呼び出し `squid_n_design_jp::rc_capacity::{rc_qsu_simple, RcCapacityInput}` 等は
+//! `squid_n_design_jp::secondary::rc_capacity` は本モジュールの再エクスポートとする
+//! （既存呼び出し
+//! `squid_n_design_jp::secondary::rc_capacity::{rc_qsu_simple, RcCapacityInput}` 等は
 //! 無修正で動作する）。
 
 /// RC 矩形断面の簡易終局耐力算定用の入力一式。

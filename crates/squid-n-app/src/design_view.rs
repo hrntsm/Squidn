@@ -365,7 +365,7 @@ pub fn design_table(ui: &mut egui::Ui, app: &mut App) {
     ui.add_space(12.0);
     ui.strong("保有水平耐力（ルート3）");
     ui.horizontal(|ui| {
-        use squid_n_design_jp::holding_capacity::FrameType;
+        use squid_n_design_jp::secondary::holding_capacity::FrameType;
         ui.label("架構種別:");
         ui.selectable_value(&mut app.design_frame, FrameType::RcFrame, "RCラーメン");
         ui.selectable_value(&mut app.design_frame, FrameType::RcWall, "RC壁式");
@@ -388,7 +388,7 @@ pub fn design_table(ui: &mut egui::Ui, app: &mut App) {
         );
     });
     ui.horizontal(|ui| {
-        use squid_n_design_jp::holding_capacity::MemberRank;
+        use squid_n_design_jp::secondary::holding_capacity::MemberRank;
         ui.label(if app.design_rank_auto {
             "部材ランク（フォールバック用）:"
         } else {
@@ -400,7 +400,10 @@ pub fn design_table(ui: &mut egui::Ui, app: &mut App) {
         ui.selectable_value(&mut app.design_rank, MemberRank::FD, "FD");
     });
     if !app.design_rank_auto {
-        let ds = squid_n_design_jp::holding_capacity::ds_value(app.design_frame, app.design_rank);
+        let ds = squid_n_design_jp::secondary::holding_capacity::ds_value(
+            app.design_frame,
+            app.design_rank,
+        );
         ui.label(format!("Ds = {:.2}（部材ランク選択値による簡易運用）", ds));
     }
 
@@ -493,8 +496,8 @@ pub fn design_table(ui: &mut egui::Ui, app: &mut App) {
 }
 
 /// `MemberRank` の表示名（FA〜FD）。
-fn rank_label(r: squid_n_design_jp::holding_capacity::MemberRank) -> &'static str {
-    use squid_n_design_jp::holding_capacity::MemberRank;
+fn rank_label(r: squid_n_design_jp::secondary::holding_capacity::MemberRank) -> &'static str {
+    use squid_n_design_jp::secondary::holding_capacity::MemberRank;
     match r {
         MemberRank::FA => "FA",
         MemberRank::FB => "FB",

@@ -5,7 +5,12 @@
 //!    告示1792・武藤 D値法の閉形式そのもので、手計算と 1e-9 で一致する（DoD §8.1）。
 //! 2. **モデル抽出**（`column_stiffnesses` / `center_of_mass` / `story_centers`）。
 //!    実モデルから柱・梁を拾って 1. に渡す略算層。柱＝鉛直部材という幾何判定等、
-//!    明示した仮定の上に成り立つ（精算＝マスター節点 3×3 剛性は将来）。
+//!    明示した仮定の上に成り立つ（精算＝マスター節点 3×3 剛性は
+//!    [`crate::secondary::eccentricity_analysis`] を参照）。
+//!
+//! さらに雑壁（フレーム外の壁）の剛性を n 倍法で等価剛性要素へ換算し、剛心・
+//! ねじり剛性へ寄与させる層（`misc_wall_stiffness` / `append_misc_wall_stiffnesses`）
+//! を末尾に持つ。
 //!
 //! **方向の扱い（★最重要）:** 剛心座標は方向別 D 値で重み付けする。
 //! `Xs = Σ(Dy·x)/ΣDy`, `Ys = Σ(Dx·y)/ΣDx`。単一 D 値で済むのは対称架構のみ。
@@ -350,185 +355,6 @@ pub fn story_eccentricity(model: &Model, story: StoryId) -> Eccentricity {
     eccentricity(&cols, com, cor)
 }
 
-// ===== 精算層（応力解析結果に基づく。RESP-D 計算編 03「応力解析 §偏心率」）=====
-
-use squid_n_solver::linear::StaticOnce;
-
-/// 当該層に帰属する柱（鉛直 2 節点 Beam、柱頭節点の story が当該層）を列挙して
-/// `f(elem, 柱頭節点, 柱脚節点)` を呼ぶ。判定は `column_stiffnesses` と同一。
-fn for_each_story_column(
-    model: &Model,
-    story: StoryId,
-    mut f: impl FnMut(
-        &squid_n_core::model::ElementData,
-        &squid_n_core::model::Node,
-        &squid_n_core::model::Node,
-    ),
-) {
-    for elem in &model.elements {
-        if elem.kind != ElementKind::Beam || elem.nodes.len() != 2 {
-            continue;
-        }
-        let n0 = &model.nodes[elem.nodes[0].index()];
-        let n1 = &model.nodes[elem.nodes[1].index()];
-        let d = [
-            n1.coord[0] - n0.coord[0],
-            n1.coord[1] - n0.coord[1],
-            n1.coord[2] - n0.coord[2],
-        ];
-        let l = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
-        if l < 1e-12 || (d[2] / l).abs() <= 0.707 {
-            continue;
-        }
-        let (top, bot) = if n0.coord[2] < n1.coord[2] {
-            (n1, n0)
-        } else {
-            (n0, n1)
-        };
-        if top.story != Some(story) {
-            continue;
-        }
-        f(elem, top, bot);
-    }
-}
-
-/// 部材始端（xi 最小の評価点）の局所内力 [N, Qy, Qz] を全体座標の力ベクトルへ
-/// 変換して返す。`ref_vec` は要素の局所軸参照ベクトル。
-fn station_force_global(
-    p0: [f64; 3],
-    p1: [f64; 3],
-    ref_vec: [f64; 3],
-    local: [f64; 6],
-) -> [f64; 3] {
-    let frame = LocalFrame::from_nodes(p0, p1, ref_vec);
-    let ex = frame.rot[0];
-    let ey = frame.rot[1];
-    let ez = frame.rot[2];
-    let (n, qy, qz) = (local[0], local[1], local[2]);
-    [
-        n * ex[0] + qy * ey[0] + qz * ez[0],
-        n * ex[1] + qy * ey[1] + qz * ez[1],
-        n * ex[2] + qy * ey[2] + qz * ez[2],
-    ]
-}
-
-/// 地震時応力解析結果から柱の方向別水平剛性 `ki = Qi/δi` を算定する（精算。
-/// マニュアル「剛心は、その階の柱の水平方向剛性の中心として求めます。各柱の
-/// 水平剛性は、地震時応力解析結果のせん断力と層間変位により計算します」）。
-///
-/// - `res_x` / `res_y`: X / Y 方向加力時の弾性応力解析結果
-/// - `kX` は X 加力時の（せん断力 Qx, 層間変位 δx）から、`kY` は Y 加力時から。
-///   δ がほぼ 0 の柱は剛性 0 とする。
-pub fn column_stiffnesses_from_analysis(
-    model: &Model,
-    story: StoryId,
-    res_x: &StaticOnce,
-    res_y: &StaticOnce,
-) -> Vec<ColumnStiffness> {
-    use std::collections::HashMap;
-    let fx: HashMap<_, _> = res_x.member_forces.iter().map(|(id, f)| (*id, f)).collect();
-    let fy: HashMap<_, _> = res_y.member_forces.iter().map(|(id, f)| (*id, f)).collect();
-
-    let mut out = Vec::new();
-    for_each_story_column(model, story, |elem, top, bot| {
-        let p0 = model.nodes[elem.nodes[0].index()].coord;
-        let p1 = model.nodes[elem.nodes[1].index()].coord;
-        let k_of =
-            |res: &StaticOnce,
-             forces: &HashMap<squid_n_core::ids::ElemId, &squid_n_element::beam::MemberForces>,
-             dir: usize|
-             -> f64 {
-                let (Some(ut), Some(ub)) =
-                    (res.disp.get(top.id.index()), res.disp.get(bot.id.index()))
-                else {
-                    return 0.0;
-                };
-                let delta = (ut[dir] - ub[dir]).abs();
-                if delta < 1e-9 {
-                    return 0.0;
-                }
-                let Some(mf) = forces.get(&elem.id) else {
-                    return 0.0;
-                };
-                let Some(&(_, local)) = mf.at.first() else {
-                    return 0.0;
-                };
-                let g = station_force_global(p0, p1, elem.local_axis.ref_vector, local);
-                g[dir].abs() / delta
-            };
-        out.push(ColumnStiffness {
-            pos: [top.coord[0], top.coord[1]],
-            dx: k_of(res_x, &fx, 0),
-            dy: k_of(res_y, &fy, 1),
-        });
-    });
-    out
-}
-
-/// 長期応力解析の柱軸力から重心を算定する（マニュアル「各階の重心は、鉛直荷重を
-/// 支持する柱の長期荷重による軸力 N およびその部材の平面座標から計算します。
-/// gx = Σ(Ni·xi)/ΣNi」）。
-///
-/// 軸力は圧縮分を重みに用いる（引張柱は鉛直荷重を「支持」しないため重み 0）。
-/// ΣNi ≤ 0（柱なし・全柱引張）の場合は `None`（呼び出し側で質量重心へフォールバック）。
-pub fn center_of_gravity_from_axial(
-    model: &Model,
-    story: StoryId,
-    long_term: &StaticOnce,
-) -> Option<[f64; 2]> {
-    use std::collections::HashMap;
-    let forces: HashMap<_, _> = long_term
-        .member_forces
-        .iter()
-        .map(|(id, f)| (*id, f))
-        .collect();
-    let mut sum_n = 0.0;
-    let mut sum_nx = 0.0;
-    let mut sum_ny = 0.0;
-    for_each_story_column(model, story, |elem, top, _bot| {
-        let Some(mf) = forces.get(&elem.id) else {
-            return;
-        };
-        let Some(&(_, local)) = mf.at.first() else {
-            return;
-        };
-        // 局所軸力 n は引張正 → 圧縮 = −n を重みに使う。
-        let ni = (-local[0]).max(0.0);
-        sum_n += ni;
-        sum_nx += ni * top.coord[0];
-        sum_ny += ni * top.coord[1];
-    });
-    if sum_n > 0.0 {
-        Some([sum_nx / sum_n, sum_ny / sum_n])
-    } else {
-        None
-    }
-}
-
-/// 応力解析結果に基づく当該層の偏心率（精算ルート）。
-///
-/// - 剛心: `column_stiffnesses_from_analysis`（ki = Qi/δi）
-/// - 重心: `center_of_gravity_from_axial`（長期軸力。`long_term` が無い/算定不能なら
-///   質量重心 `center_of_mass` にフォールバック）
-///
-/// マニュアル注記「偏心率の計算は常に弾性解析結果から計算されます」に対応し、
-/// `res_x`/`res_y` には弾性解析の結果を渡すこと。
-pub fn story_eccentricity_from_analysis(
-    model: &Model,
-    story: StoryId,
-    res_x: &StaticOnce,
-    res_y: &StaticOnce,
-    long_term: Option<&StaticOnce>,
-) -> Eccentricity {
-    let mut cols = column_stiffnesses_from_analysis(model, story, res_x, res_y);
-    append_misc_wall_stiffnesses(model, story, &mut cols);
-    let cor = center_of_rigidity(&cols);
-    let com = long_term
-        .and_then(|lt| center_of_gravity_from_axial(model, story, lt))
-        .unwrap_or_else(|| center_of_mass(model, story));
-    eccentricity(&cols, com, cor)
-}
-
 // ===== 雑壁の剛性評価（n 倍法。マニュアル「(7) 雑壁の剛性評価」）=====
 
 /// 雑壁 1 枚の等価水平剛性 `Kw' = n·Aw'·ΣKc/ΣAc`。
@@ -547,7 +373,7 @@ pub fn misc_wall_stiffness(n: f64, aw: f64, sum_kc: f64, sum_ac: f64) -> f64 {
 /// 当該層の柱の断面積の和 ΣAc [mm²]。
 pub fn sum_column_area(model: &Model, story: StoryId) -> f64 {
     let mut sum = 0.0;
-    for_each_story_column(model, story, |elem, _top, _bot| {
+    super::eccentricity_analysis::for_each_story_column(model, story, |elem, _top, _bot| {
         if let Some(sid) = elem.section {
             sum += model.sections[sid.index()].area;
         }
@@ -616,188 +442,27 @@ pub fn append_misc_wall_stiffnesses(
     }
 }
 
+/// テスト専用のモデル構築ヘルパー。`crate::secondary::eccentricity` と
+/// `crate::secondary::eccentricity_analysis` の双方のテストから共用する。
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    // ---- d_value ----
-    #[test]
-    fn test_d_value_rigid_beams_general() {
-        // 梁が十分剛（ΣKb 大）→ k̄ 大 → a → 1 → D → Kc0
-        let e = 1.0;
-        let ic = 1.0;
-        let h = 1.0;
-        let kc0 = 12.0 * e * ic / (h * h * h);
-        let d = d_value(e, ic, h, 1e9, false);
-        assert!((d - kc0).abs() / kc0 < 1e-6, "a→1 で D→Kc0, got {d}");
-    }
-
-    #[test]
-    fn test_d_value_known_kbar() {
-        // kc = Ic/h = 1, ΣKb = 4 → k̄ = 4/(2·1) = 2 → a = 2/(2+2) = 0.5
-        // Kc0 = 12 → D = 0.5·12 = 6
-        let d = d_value(1.0, 1.0, 1.0, 4.0, false);
-        assert!((d - 6.0).abs() < 1e-9, "got {d}");
-    }
-
-    #[test]
-    fn test_d_value_first_story() {
-        // 最下階: k̄ = 2 → a = (0.5+2)/(2+2) = 0.625 → D = 0.625·12 = 7.5
-        let d = d_value(1.0, 1.0, 1.0, 4.0, true);
-        assert!((d - 7.5).abs() < 1e-9, "got {d}");
-    }
-
-    #[test]
-    fn test_d_value_degenerate() {
-        assert_eq!(d_value(1.0, 0.0, 1.0, 4.0, false), 0.0);
-        assert_eq!(d_value(1.0, 1.0, 0.0, 4.0, false), 0.0);
-    }
-
-    // ---- center_of_rigidity（DoD §8.1）----
-    #[test]
-    fn test_center_of_rigidity_dod_example() {
-        // 仕様 §5.2 の確定値: Dy=[100,300] @ x=[0,6000] → Xs = 4500
-        let cols = vec![
-            ColumnStiffness {
-                pos: [0.0, 0.0],
-                dx: 1.0,
-                dy: 100.0,
-            },
-            ColumnStiffness {
-                pos: [6000.0, 0.0],
-                dx: 1.0,
-                dy: 300.0,
-            },
-        ];
-        let cr = center_of_rigidity(&cols);
-        assert!((cr[0] - 4500.0).abs() < 1e-9, "Xs got {}", cr[0]);
-    }
-
-    #[test]
-    fn test_eccentricity_dod_example() {
-        // 上の剛心に重心 Xg=3000 → ex = 1500（DoD §8.1）
-        let cols = vec![
-            ColumnStiffness {
-                pos: [0.0, 0.0],
-                dx: 1.0,
-                dy: 100.0,
-            },
-            ColumnStiffness {
-                pos: [6000.0, 0.0],
-                dx: 1.0,
-                dy: 300.0,
-            },
-        ];
-        let cr = center_of_rigidity(&cols);
-        let ecc = eccentricity(&cols, [3000.0, 0.0], cr);
-        assert!((ecc.ex - 1500.0).abs() < 1e-9, "ex got {}", ecc.ex);
-    }
-
-    #[test]
-    fn test_eccentricity_symmetric_zero() {
-        // 対称 4 本柱 → 剛心＝重心＝中央 → 偏心率 0
-        let cols = vec![
-            ColumnStiffness {
-                pos: [0.0, 0.0],
-                dx: 100.0,
-                dy: 100.0,
-            },
-            ColumnStiffness {
-                pos: [6000.0, 0.0],
-                dx: 100.0,
-                dy: 100.0,
-            },
-            ColumnStiffness {
-                pos: [0.0, 6000.0],
-                dx: 100.0,
-                dy: 100.0,
-            },
-            ColumnStiffness {
-                pos: [6000.0, 6000.0],
-                dx: 100.0,
-                dy: 100.0,
-            },
-        ];
-        let cr = center_of_rigidity(&cols);
-        assert!((cr[0] - 3000.0).abs() < 1e-9);
-        assert!((cr[1] - 3000.0).abs() < 1e-9);
-        let ecc = eccentricity(&cols, [3000.0, 3000.0], cr);
-        assert!(ecc.re_x.abs() < 1e-9 && ecc.re_y.abs() < 1e-9);
-    }
-
-    #[test]
-    fn test_eccentricity_hand_calc() {
-        // 手計算照合（X 加力時偏心率）。
-        // 柱4本、すべて Dx=Dy=100 とし x=[0,0,6000,6000], y=[0,6000,0,6000]…ではなく
-        // 剛心をずらすため右側を強くする: Dy=[100,100,300,300] @ x=[0,0,6000,6000]
-        let cols = vec![
-            ColumnStiffness {
-                pos: [0.0, 0.0],
-                dx: 100.0,
-                dy: 100.0,
-            },
-            ColumnStiffness {
-                pos: [0.0, 6000.0],
-                dx: 100.0,
-                dy: 100.0,
-            },
-            ColumnStiffness {
-                pos: [6000.0, 0.0],
-                dx: 100.0,
-                dy: 300.0,
-            },
-            ColumnStiffness {
-                pos: [6000.0, 6000.0],
-                dx: 100.0,
-                dy: 300.0,
-            },
-        ];
-        let cr = center_of_rigidity(&cols);
-        // Xs = (100·0+100·0+300·6000+300·6000)/(100+100+300+300) = 3,600,000/800 = 4500
-        assert!((cr[0] - 4500.0).abs() < 1e-9, "Xs {}", cr[0]);
-        // Ys = (Σ Dx·y)/ΣDx = 100·(0+6000+0+6000)/400 = 3000
-        assert!((cr[1] - 3000.0).abs() < 1e-9, "Ys {}", cr[1]);
-
-        // 重心は幾何中央 (3000, 3000) とする → ex = 1500, ey = 0
-        let ecc = eccentricity(&cols, [3000.0, 3000.0], cr);
-        assert!((ecc.ex - 1500.0).abs() < 1e-9);
-        assert!(ecc.ey.abs() < 1e-9);
-
-        // KR = Σ Dx·ȳ² + Σ Dy·x̄²
-        //   x̄ = x-4500 = [-4500,-4500,1500,1500], ȳ = y-3000 = [-3000,3000,-3000,3000]
-        //   Σ Dx·ȳ² = 100·(3000²·4) = 100·4·9e6 = 3.6e9
-        //   Σ Dy·x̄² = 100·4500² + 100·4500² + 300·1500² + 300·1500²
-        //           = 2·100·2.025e7 + 2·300·2.25e6 = 4.05e9 + 1.35e9 = 5.4e9
-        //   KR = 3.6e9 + 5.4e9 = 9.0e9
-        assert!((ecc.kr - 9.0e9).abs() / 9.0e9 < 1e-12, "KR {}", ecc.kr);
-        // ΣDx = 400 → rex = √(9.0e9/400) = √2.25e7 = 4743.416...
-        let rex = (9.0e9_f64 / 400.0).sqrt();
-        assert!((ecc.rex - rex).abs() < 1e-6);
-        // Rex = ey/rex = 0（ey=0）, Rey = ex/rey
-        assert!(ecc.re_x.abs() < 1e-12);
-        let sum_dy = 800.0;
-        let rey = (9.0e9_f64 / sum_dy).sqrt();
-        assert!((ecc.re_y - 1500.0 / rey).abs() < 1e-9, "Rey {}", ecc.re_y);
-    }
-
-    // ===== モデル自動算定テスト =====
-
-    use smallvec::SmallVec;
-    use squid_n_core::dof::Dof6Mask;
-    use squid_n_core::ids::{ElemId, MaterialId, NodeId, SectionId};
-    use squid_n_core::model::{
-        ElementData, EndCondition, ForceRegime, LocalAxis, Material, Node, RigidZone, Section,
-        Story,
-    };
+pub(crate) mod test_support {
+    use squid_n_core::ids::StoryId;
+    use squid_n_core::model::Model;
 
     /// 対称4柱・田の字梁モデルを構築するヘルパー。
     /// 柱: 底 z=0（拘束）・頂 z=3000、story=Some(S0)。
     /// 梁: 上端節点間を X 方向・Y 方向に接続（同一 section）。
     /// 質量: 上端4節点に等質量（mass[0]=1.0）。
     /// section_iz_override: 右側 2 本（x=6000）の柱の iz を指定値に差し替え（None なら全同一）。
-    fn build_symmetric_frame(
-        section_iz_override: Option<f64>,
-    ) -> (squid_n_core::model::Model, StoryId) {
+    pub(crate) fn build_symmetric_frame(section_iz_override: Option<f64>) -> (Model, StoryId) {
+        use smallvec::SmallVec;
+        use squid_n_core::dof::Dof6Mask;
+        use squid_n_core::ids::{ElemId, MaterialId, NodeId, SectionId};
+        use squid_n_core::model::{
+            ElementData, ElementKind, EndCondition, ForceRegime, LocalAxis, Material, Node,
+            RigidZone, Section, Story,
+        };
+
         // 断面（共通: iy=iz=1.0e6）
         let sec_base = Section {
             id: SectionId(0),
@@ -981,7 +646,7 @@ mod tests {
             ]
         };
 
-        let model = squid_n_core::model::Model {
+        let model = Model {
             nodes,
             elements,
             sections,
@@ -991,6 +656,174 @@ mod tests {
         };
         (model, s0)
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use test_support::build_symmetric_frame;
+
+    // ---- d_value ----
+    #[test]
+    fn test_d_value_rigid_beams_general() {
+        // 梁が十分剛（ΣKb 大）→ k̄ 大 → a → 1 → D → Kc0
+        let e = 1.0;
+        let ic = 1.0;
+        let h = 1.0;
+        let kc0 = 12.0 * e * ic / (h * h * h);
+        let d = d_value(e, ic, h, 1e9, false);
+        assert!((d - kc0).abs() / kc0 < 1e-6, "a→1 で D→Kc0, got {d}");
+    }
+
+    #[test]
+    fn test_d_value_known_kbar() {
+        // kc = Ic/h = 1, ΣKb = 4 → k̄ = 4/(2·1) = 2 → a = 2/(2+2) = 0.5
+        // Kc0 = 12 → D = 0.5·12 = 6
+        let d = d_value(1.0, 1.0, 1.0, 4.0, false);
+        assert!((d - 6.0).abs() < 1e-9, "got {d}");
+    }
+
+    #[test]
+    fn test_d_value_first_story() {
+        // 最下階: k̄ = 2 → a = (0.5+2)/(2+2) = 0.625 → D = 0.625·12 = 7.5
+        let d = d_value(1.0, 1.0, 1.0, 4.0, true);
+        assert!((d - 7.5).abs() < 1e-9, "got {d}");
+    }
+
+    #[test]
+    fn test_d_value_degenerate() {
+        assert_eq!(d_value(1.0, 0.0, 1.0, 4.0, false), 0.0);
+        assert_eq!(d_value(1.0, 1.0, 0.0, 4.0, false), 0.0);
+    }
+
+    // ---- center_of_rigidity（DoD §8.1）----
+    #[test]
+    fn test_center_of_rigidity_dod_example() {
+        // 仕様 §5.2 の確定値: Dy=[100,300] @ x=[0,6000] → Xs = 4500
+        let cols = vec![
+            ColumnStiffness {
+                pos: [0.0, 0.0],
+                dx: 1.0,
+                dy: 100.0,
+            },
+            ColumnStiffness {
+                pos: [6000.0, 0.0],
+                dx: 1.0,
+                dy: 300.0,
+            },
+        ];
+        let cr = center_of_rigidity(&cols);
+        assert!((cr[0] - 4500.0).abs() < 1e-9, "Xs got {}", cr[0]);
+    }
+
+    #[test]
+    fn test_eccentricity_dod_example() {
+        // 上の剛心に重心 Xg=3000 → ex = 1500（DoD §8.1）
+        let cols = vec![
+            ColumnStiffness {
+                pos: [0.0, 0.0],
+                dx: 1.0,
+                dy: 100.0,
+            },
+            ColumnStiffness {
+                pos: [6000.0, 0.0],
+                dx: 1.0,
+                dy: 300.0,
+            },
+        ];
+        let cr = center_of_rigidity(&cols);
+        let ecc = eccentricity(&cols, [3000.0, 0.0], cr);
+        assert!((ecc.ex - 1500.0).abs() < 1e-9, "ex got {}", ecc.ex);
+    }
+
+    #[test]
+    fn test_eccentricity_symmetric_zero() {
+        // 対称 4 本柱 → 剛心＝重心＝中央 → 偏心率 0
+        let cols = vec![
+            ColumnStiffness {
+                pos: [0.0, 0.0],
+                dx: 100.0,
+                dy: 100.0,
+            },
+            ColumnStiffness {
+                pos: [6000.0, 0.0],
+                dx: 100.0,
+                dy: 100.0,
+            },
+            ColumnStiffness {
+                pos: [0.0, 6000.0],
+                dx: 100.0,
+                dy: 100.0,
+            },
+            ColumnStiffness {
+                pos: [6000.0, 6000.0],
+                dx: 100.0,
+                dy: 100.0,
+            },
+        ];
+        let cr = center_of_rigidity(&cols);
+        assert!((cr[0] - 3000.0).abs() < 1e-9);
+        assert!((cr[1] - 3000.0).abs() < 1e-9);
+        let ecc = eccentricity(&cols, [3000.0, 3000.0], cr);
+        assert!(ecc.re_x.abs() < 1e-9 && ecc.re_y.abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_eccentricity_hand_calc() {
+        // 手計算照合（X 加力時偏心率）。
+        // 柱4本、すべて Dx=Dy=100 とし x=[0,0,6000,6000], y=[0,6000,0,6000]…ではなく
+        // 剛心をずらすため右側を強くする: Dy=[100,100,300,300] @ x=[0,0,6000,6000]
+        let cols = vec![
+            ColumnStiffness {
+                pos: [0.0, 0.0],
+                dx: 100.0,
+                dy: 100.0,
+            },
+            ColumnStiffness {
+                pos: [0.0, 6000.0],
+                dx: 100.0,
+                dy: 100.0,
+            },
+            ColumnStiffness {
+                pos: [6000.0, 0.0],
+                dx: 100.0,
+                dy: 300.0,
+            },
+            ColumnStiffness {
+                pos: [6000.0, 6000.0],
+                dx: 100.0,
+                dy: 300.0,
+            },
+        ];
+        let cr = center_of_rigidity(&cols);
+        // Xs = (100·0+100·0+300·6000+300·6000)/(100+100+300+300) = 3,600,000/800 = 4500
+        assert!((cr[0] - 4500.0).abs() < 1e-9, "Xs {}", cr[0]);
+        // Ys = (Σ Dx·y)/ΣDx = 100·(0+6000+0+6000)/400 = 3000
+        assert!((cr[1] - 3000.0).abs() < 1e-9, "Ys {}", cr[1]);
+
+        // 重心は幾何中央 (3000, 3000) とする → ex = 1500, ey = 0
+        let ecc = eccentricity(&cols, [3000.0, 3000.0], cr);
+        assert!((ecc.ex - 1500.0).abs() < 1e-9);
+        assert!(ecc.ey.abs() < 1e-9);
+
+        // KR = Σ Dx·ȳ² + Σ Dy·x̄²
+        //   x̄ = x-4500 = [-4500,-4500,1500,1500], ȳ = y-3000 = [-3000,3000,-3000,3000]
+        //   Σ Dx·ȳ² = 100·(3000²·4) = 100·4·9e6 = 3.6e9
+        //   Σ Dy·x̄² = 100·4500² + 100·4500² + 300·1500² + 300·1500²
+        //           = 2·100·2.025e7 + 2·300·2.25e6 = 4.05e9 + 1.35e9 = 5.4e9
+        //   KR = 3.6e9 + 5.4e9 = 9.0e9
+        assert!((ecc.kr - 9.0e9).abs() / 9.0e9 < 1e-12, "KR {}", ecc.kr);
+        // ΣDx = 400 → rex = √(9.0e9/400) = √2.25e7 = 4743.416...
+        let rex = (9.0e9_f64 / 400.0).sqrt();
+        assert!((ecc.rex - rex).abs() < 1e-6);
+        // Rex = ey/rex = 0（ey=0）, Rey = ex/rey
+        assert!(ecc.re_x.abs() < 1e-12);
+        let sum_dy = 800.0;
+        let rey = (9.0e9_f64 / sum_dy).sqrt();
+        assert!((ecc.re_y - 1500.0 / rey).abs() < 1e-9, "Rey {}", ecc.re_y);
+    }
+
+    // ===== モデル自動算定テスト =====
 
     /// テスト1: 対称フレーム → 偏心率 ≈ 0、剛心 ≈ [3000, 3000]。
     #[test]
@@ -1042,123 +875,6 @@ mod tests {
         assert!(cols.is_empty(), "S1 に柱が無いはず、got {} 本", cols.len());
         let cor = center_of_rigidity(&cols);
         assert_eq!(cor, [0.0, 0.0], "空時の剛心は [0,0]");
-    }
-
-    // ===== 精算ルート（応力解析結果ベース）のテスト =====
-
-    use squid_n_element::beam::MemberForces;
-
-    /// 柱 4 本（ElemId 0..4、節点 i(底)→i+4(頂)）へ、指定の局所内力
-    /// [n, qy, qz] を持つ member_forces と頂部一様変位 disp を合成する。
-    /// 柱の ref_vector=[0,1,0] より ex=[0,0,1], ey=[0,1,0], ez=[1,0,0]。
-    /// → 全体 X 方向せん断 = qz、全体 Y 方向せん断 = qy。
-    fn fabricate_static(top_disp: [f64; 2], col_local_forces: [[f64; 3]; 4]) -> StaticOnce {
-        let mut disp = vec![[0.0; 6]; 8];
-        for d in disp.iter_mut().skip(4) {
-            d[0] = top_disp[0];
-            d[1] = top_disp[1];
-        }
-        let member_forces = col_local_forces
-            .iter()
-            .enumerate()
-            .map(|(i, &[n, qy, qz])| {
-                (
-                    ElemId(i as u32),
-                    MemberForces {
-                        at: vec![(0.0, [n, qy, qz, 0.0, 0.0, 0.0])],
-                    },
-                )
-            })
-            .collect();
-        StaticOnce {
-            disp,
-            member_forces,
-        }
-    }
-
-    /// ki = Qi/δi の精算: X 加力（δ=10, Qx=qz=1000 → kX=100）、
-    /// Y 加力（δ=10, 左 qy=1000/右 qy=3000 → kY=100/300）→ 剛心 Xs=4500, Ys=3000。
-    #[test]
-    fn test_column_stiffnesses_from_analysis() {
-        let (model, s0) = build_symmetric_frame(None);
-        // xy = [(0,0), (6000,0), (0,6000), (6000,6000)]
-        let res_x = fabricate_static([10.0, 0.0], [[0.0, 0.0, 1000.0]; 4]);
-        let res_y = fabricate_static(
-            [0.0, 10.0],
-            [
-                [0.0, 1000.0, 0.0],
-                [0.0, 3000.0, 0.0],
-                [0.0, 1000.0, 0.0],
-                [0.0, 3000.0, 0.0],
-            ],
-        );
-        let cols = column_stiffnesses_from_analysis(&model, s0, &res_x, &res_y);
-        assert_eq!(cols.len(), 4);
-        for c in &cols {
-            assert!((c.dx - 100.0).abs() < 1e-9, "kX={}", c.dx);
-        }
-        let cor = center_of_rigidity(&cols);
-        assert!((cor[0] - 4500.0).abs() < 1e-9, "Xs={}", cor[0]);
-        assert!((cor[1] - 3000.0).abs() < 1e-9, "Ys={}", cor[1]);
-    }
-
-    /// 長期軸力による重心: 全柱等圧縮 → 幾何中央 (3000, 3000)。
-    /// 右側 2 本を 3 倍圧縮 → gx = 4500。引張柱は重み 0。
-    #[test]
-    fn test_center_of_gravity_from_axial() {
-        let (model, s0) = build_symmetric_frame(None);
-        // 圧縮は n 負（引張正の符号規約）
-        let uniform = fabricate_static([0.0, 0.0], [[-200.0, 0.0, 0.0]; 4]);
-        let g = center_of_gravity_from_axial(&model, s0, &uniform).unwrap();
-        assert!((g[0] - 3000.0).abs() < 1e-9 && (g[1] - 3000.0).abs() < 1e-9);
-
-        let biased = fabricate_static(
-            [0.0, 0.0],
-            [
-                [-100.0, 0.0, 0.0],
-                [-300.0, 0.0, 0.0],
-                [-100.0, 0.0, 0.0],
-                [-300.0, 0.0, 0.0],
-            ],
-        );
-        let g = center_of_gravity_from_axial(&model, s0, &biased).unwrap();
-        assert!((g[0] - 4500.0).abs() < 1e-9, "gx={}", g[0]);
-
-        // 全柱引張 → None（質量重心へフォールバックさせる）
-        let tension = fabricate_static([0.0, 0.0], [[200.0, 0.0, 0.0]; 4]);
-        assert!(center_of_gravity_from_axial(&model, s0, &tension).is_none());
-    }
-
-    /// 精算ルートの統合: 剛心 Xs=4500・重心 gx=3000 → ex=1500, Rey=ex/rey。
-    #[test]
-    fn test_story_eccentricity_from_analysis() {
-        let (model, s0) = build_symmetric_frame(None);
-        let res_x = fabricate_static([10.0, 0.0], [[0.0, 0.0, 1000.0]; 4]);
-        let res_y = fabricate_static(
-            [0.0, 10.0],
-            [
-                [0.0, 1000.0, 0.0],
-                [0.0, 3000.0, 0.0],
-                [0.0, 1000.0, 0.0],
-                [0.0, 3000.0, 0.0],
-            ],
-        );
-        let long_term = fabricate_static([0.0, 0.0], [[-200.0, 0.0, 0.0]; 4]);
-        let ecc = story_eccentricity_from_analysis(&model, s0, &res_x, &res_y, Some(&long_term));
-        assert!((ecc.ex - 1500.0).abs() < 1e-9, "ex={}", ecc.ex);
-        assert!(ecc.ey.abs() < 1e-9, "ey={}", ecc.ey);
-        // KR = ΣkX·ȳ² + ΣkY·x̄²
-        //   ȳ = ±3000（kX=100×4）→ 100·9e6·4 = 3.6e9
-        //   x̄ = x−4500 = [-4500,1500,-4500,1500] → 100·4500²+300·1500²（×2組）
-        //     = 2·(100·2.025e7 + 300·2.25e6) = 2·(2.025e9+0.675e9) = 5.4e9
-        let kr_expect = 3.6e9 + 5.4e9;
-        assert!(
-            (ecc.kr - kr_expect).abs() / kr_expect < 1e-12,
-            "KR={}",
-            ecc.kr
-        );
-        let rey = (kr_expect / 800.0_f64).sqrt();
-        assert!((ecc.re_y - 1500.0 / rey).abs() < 1e-9, "Rey={}", ecc.re_y);
     }
 
     // ===== 雑壁の n 倍法 =====

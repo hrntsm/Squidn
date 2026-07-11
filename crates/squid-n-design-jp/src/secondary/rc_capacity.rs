@@ -4,7 +4,7 @@
 //! （`rc_qsu_simple` 等）を使うが、squid-n-solver（Layer 4）は squid-n-design-jp
 //! （Layer 5）に依存できない（循環依存になる）ため、実装本体は Layer 0 の
 //! `squid_n_core::rc_capacity` へ移設した。本モジュールは既存呼び出し
-//! （`squid_n_design_jp::rc_capacity::{rc_qsu_simple, RcCapacityInput}` 等、
+//! （`squid_n_design_jp::secondary::rc_capacity::{rc_qsu_simple, RcCapacityInput}` 等、
 //! 例: `squid-n-app::app::rc_capacity_input_from_rect`）を無修正で維持するための
 //! 再エクスポートのみを行う。
 pub use squid_n_core::rc_capacity::*;

@@ -1,7 +1,9 @@
 //! 節点単位の断面検定（柱梁接合部・パネルゾーン・冷間成形耐力比・耐震壁）の
 //! 入力組み立て（RESP-D マニュアル 04 断面検定）。
 //!
-//! [`crate::joint`] の純関数群に対し、`Model` と部材内力から入力を組み立てて
+//! [`crate::rc::joint`]・[`crate::rc::wall`]・[`crate::steel::panel_zone`]・
+//! [`crate::steel::cold_formed`]・[`crate::srrc::panel_zone`] の純関数群に対し、
+//! `Model` と部材内力から入力を組み立てて
 //! 一括実行する。squid-n-app（GUI）と squid-n-mcp（ヘッドレス）の両方から
 //! 呼ばれる共通経路。
 //!
@@ -42,7 +44,7 @@
 //!     [`crate::wall_opening::equivalent_opening`] で等価開口を復元する
 //!     （後方互換）。
 //!   - いずれの経路で得た `(l0′,h0′)` も壁寸法 `(l,h)` を超える場合は
-//!     安全側にクランプしたうえで、[`crate::joint::rc_wall_shear_check`] の
+//!     安全側にクランプしたうえで、[`crate::rc::wall::rc_wall_shear_check`] の
 //!     `RcWallInput.opening` へ供給する（RC規準18条のせん断耐力検定用の
 //!     低減係数 `r=min(γ1,γ2,γ3)`）。開口周比 r0（耐震壁判定用、下記）も
 //!     このモード適用後の `(l0′,h0′)` から算定するため、判定・検定の双方が
@@ -64,7 +66,7 @@
 //!   から `steel_shear = sfs・As` を算定し、[`WallSideColumn::steel_shear`]
 //!   へ供給する（RC 側柱は 0）。F 値の板厚区分にはフランジ厚とウェブ厚の
 //!   大きい方を用いる（他のフォールバック箇所と同じ近似）。
-//! - SRC 造柱梁接合部（パネルゾーン、[`crate::joint::src_panel_zone_check`]）:
+//! - SRC 造柱梁接合部（パネルゾーン、[`crate::srrc::panel_zone::src_panel_zone_check`]）:
 //!   柱断面形状が `SrcRect` の節点で検定する。梁の上下主筋間距離 mBd・柱の
 //!   左右主筋間距離 mCd は、既存の RC 接合部配線（`beam_j` に
 //!   `d − rc_dt(rebar)` を用いる近似）に合わせ、「梁せい／柱幅 −
@@ -76,11 +78,13 @@
 //!   `steel_web_thick`、ヤング係数比 n は [`crate::rc::young_ratio_n`]。
 //!   内法階高/階高比 h′/h は情報が無いため 1.0 固定とする（暫定）。
 
-use crate::joint::{
-    box_zp, cold_formed_column_ratio_check, panel_mpp, rc_joint_shear_check, rc_wall_shear_check,
-    s_panel_zone_check, src_panel_zone_check, ColdFormedInput, JointShape, PanelSection,
-    RcJointInput, RcWallInput, SrcPanelInput, WallSideColumn,
+use crate::rc::joint::{rc_joint_shear_check, JointShape, RcJointInput};
+use crate::rc::wall::{rc_wall_shear_check, RcWallInput, WallSideColumn};
+use crate::srrc::panel_zone::{src_panel_zone_check, SrcPanelInput};
+use crate::steel::cold_formed::{
+    box_zp, cold_formed_column_ratio_check, panel_mpp, ColdFormedInput,
 };
+use crate::steel::panel_zone::{s_panel_zone_check, PanelSection, SPanelInput};
 use crate::wall_opening::{equivalent_opening, is_seismic_wall, opening_ratio_r0, WallJudgeInput};
 use crate::{CheckResult, LoadTerm};
 use squid_n_core::ids::{ElemId, NodeId};
@@ -559,7 +563,7 @@ pub fn collect_joint_checks_with_long(
                     .map(|f| f[1].abs().max(f[2].abs()))
                     .collect();
                 col_qs.resize(2, 0.0);
-                let inp = crate::joint::SPanelInput {
+                let inp = SPanelInput {
                     section: panel,
                     db,
                     fy,

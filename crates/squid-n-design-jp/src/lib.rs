@@ -1,16 +1,21 @@
 //! 断面算定（許容応力度検定）と二次設計の日本基準実装。
 //!
 //! 一次設計（許容応力度検定）は RESP-D マニュアル「計算編 04 断面検定
-//! （許容応力度検定）」の計算方法に準拠する:
-//! - 鋼構造: `steel`（S梁・S柱・鉄骨ブレース、鋼構造設計規準 1973）
-//! - RC 造: `rc`（RC梁・RC柱、RC規準 1999/2010・構造規定）
+//! （許容応力度検定）」に準拠し、マニュアルの節に対応するモジュールへ分割する
+//! （材種ごとに `rc`/`steel`/`cft`/`srrc`、材料強度・許容応力度は
+//! `material_strength`、節点単位の検定の入力組み立ては `joint_wiring`）。
+//!
+//! 二次設計（保有水平耐力計算）は `p7` フィーチャ配下の [`secondary`] モジュール
+//! （部材ランク・層 Ds・保有水平耐力・剛性率・偏心率・主軸）に分離する。
 pub mod brb;
-pub mod buckling;
-pub mod joint;
+pub mod cft;
 pub mod joint_wiring;
-pub mod pca;
+/// 材料強度・許容応力度（RESP-D「材料強度・許容応力度」節）。材種横断の
+/// 許容応力度・材料定数を集約する。構成則モデルの `squid-n-material`
+/// クレートとは別物（本モジュールは設計規準の許容応力度）。
+pub mod material_strength;
 pub mod rc;
-pub mod src_cft;
+pub mod srrc;
 pub mod steel;
 pub mod wall_opening;
 
@@ -18,23 +23,13 @@ pub mod wall_opening;
 #[cfg(feature = "p12")]
 pub mod capacity_spectrum;
 #[cfg(feature = "p7")]
-pub mod ds;
-#[cfg(feature = "p7")]
-pub mod eccentricity;
-#[cfg(feature = "p7")]
-pub mod holding_capacity;
-#[cfg(feature = "p7")]
-pub mod panel_shear;
-#[cfg(feature = "p7")]
-pub mod principal_axis;
-#[cfg(feature = "p7")]
-pub mod rc_capacity;
-#[cfg(feature = "p7")]
-pub mod story_metrics;
+pub mod secondary;
 
+pub use cft::CftDesign;
+pub use material_strength::{steel_f_value, steel_f_value_prefix};
 pub use rc::RcDesign;
-pub use src_cft::{CftDesign, SrcDesign};
-pub use steel::{steel_f_value, steel_f_value_prefix, SteelDesign};
+pub use srrc::SrcDesign;
+pub use steel::SteelDesign;
 
 use squid_n_core::model::{Material, Section, SteelDesignAttr};
 

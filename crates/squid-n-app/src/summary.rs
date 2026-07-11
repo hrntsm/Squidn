@@ -1,9 +1,10 @@
 //! 層指標（二次設計チェック）とレポート文字列の生成。GUI 非依存。
 
 use squid_n_core::model::Model;
-use squid_n_design_jp::eccentricity::{story_eccentricity, story_eccentricity_from_analysis};
-use squid_n_design_jp::holding_capacity::{eccentricity_ratio, fes, stiffness_ratios};
-use squid_n_design_jp::story_metrics::{cog_story_drifts, max_column_drift};
+use squid_n_design_jp::secondary::eccentricity::story_eccentricity;
+use squid_n_design_jp::secondary::eccentricity_analysis::story_eccentricity_from_analysis;
+use squid_n_design_jp::secondary::holding_capacity::{eccentricity_ratio, fes, stiffness_ratios};
+use squid_n_design_jp::secondary::stiffness_ratio::{cog_story_drifts, max_column_drift};
 use squid_n_solver::analysis::SeismicDir;
 use squid_n_solver::linear::StaticOnce;
 
@@ -318,9 +319,10 @@ pub fn build_report_csv(app: &App) -> String {
             };
             if let Ok(analysis) = squid_n_solver::analysis::Analysis::prepare(model) {
                 if let Ok(p) = analysis.seismic_nodal_force_magnitudes(cfg) {
-                    let theta = squid_n_design_jp::principal_axis::principal_axis_from_results(
-                        model, &p, rx, ry,
-                    );
+                    let theta =
+                        squid_n_design_jp::secondary::principal_axis::principal_axis_from_results(
+                            model, &p, rx, ry,
+                        );
                     out.push_str(&format!(
                         "\n[主軸の計算]\n主軸角Θ[deg],{:.3}\n",
                         theta.to_degrees()
