@@ -6,6 +6,7 @@
 //! - RC 造: `rc`（RC梁・RC柱、RC規準 1999/2010・構造規定）
 pub mod brb;
 pub mod buckling;
+pub mod cft;
 pub mod joint;
 pub mod joint_wiring;
 /// 材料強度・許容応力度（RESP-D「材料強度・許容応力度」節）。材種横断の
@@ -13,7 +14,7 @@ pub mod joint_wiring;
 pub mod material;
 pub mod pca;
 pub mod rc;
-pub mod src_cft;
+pub mod srrc;
 pub mod steel;
 pub mod wall_opening;
 
@@ -35,9 +36,10 @@ pub mod rc_capacity;
 #[cfg(feature = "p7")]
 pub mod story_metrics;
 
+pub use cft::CftDesign;
 pub use material::{steel_f_value, steel_f_value_prefix};
 pub use rc::RcDesign;
-pub use src_cft::{CftDesign, SrcDesign};
+pub use srrc::SrcDesign;
 pub use steel::SteelDesign;
 
 use squid_n_core::model::{Material, Section, SteelDesignAttr};
