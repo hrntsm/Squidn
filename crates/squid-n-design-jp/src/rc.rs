@@ -20,147 +20,18 @@ use squid_n_core::model::{Material, Section};
 use squid_n_core::section_shape::{BarSet, RcRebar, SectionShape, ShearBar};
 use squid_n_core::units::ConcreteClass;
 
-// ============================================================================
-// 1. 許容応力度（2010年版 RC 規準・構造規定）
-// ============================================================================
-
-/// コンクリートの許容圧縮応力度 fc [N/mm²]。長期 = Fc/3、短期 = 長期 × 2。
-pub fn concrete_allowable_compression(fc: f64, long_term: bool) -> f64 {
-    let long = fc / 3.0;
-    if long_term {
-        long
-    } else {
-        long * 2.0
-    }
-}
-
-/// コンクリートの許容せん断応力度 fs [N/mm²]。
-/// 長期 = min(Fc/30, 0.49+Fc/100)、短期 = 長期 × 1.5
-/// （圧縮の ×2 と異なり、せん断は ×1.5 である点に注意）。
-pub fn concrete_allowable_shear(fc: f64, long_term: bool) -> f64 {
-    let long = (fc / 30.0).min(0.49 + fc / 100.0);
-    if long_term {
-        long
-    } else {
-        long * 1.5
-    }
-}
-
-/// コンクリート種類による許容応力度の低減係数。
-/// 軽量コンクリート1種・2種の許容応力度（圧縮・せん断）は普通コンクリートの
-/// 0.9 倍（RESP-D マニュアル「04 断面検定」）。
-fn concrete_class_factor(class: ConcreteClass) -> f64 {
-    match class {
-        ConcreteClass::Normal => 1.0,
-        ConcreteClass::Lightweight1 | ConcreteClass::Lightweight2 => 0.9,
-    }
-}
-
-/// コンクリートの許容圧縮応力度 fc [N/mm²]（コンクリート種類対応版）。
-/// `concrete_allowable_compression` に軽量コンクリートの 0.9 倍低減
-/// （`concrete_class_factor`）を適用する。`class=Normal` のときは
-/// `concrete_allowable_compression` と完全に一致する。
-pub fn concrete_allowable_compression_class(fc: f64, class: ConcreteClass, long_term: bool) -> f64 {
-    concrete_allowable_compression(fc, long_term) * concrete_class_factor(class)
-}
-
-/// コンクリートの許容せん断応力度 fs [N/mm²]（コンクリート種類対応版）。
-/// `concrete_allowable_shear` に軽量コンクリートの 0.9 倍低減を適用する。
-pub fn concrete_allowable_shear_class(fc: f64, class: ConcreteClass, long_term: bool) -> f64 {
-    concrete_allowable_shear(fc, long_term) * concrete_class_factor(class)
-}
-
-/// 断面算定用のヤング係数比 n（Fc に応じた区分値）。
-pub fn young_ratio_n(fc: f64) -> f64 {
-    if fc <= 27.0 {
-        15.0
-    } else if fc <= 36.0 {
-        13.0
-    } else if fc <= 48.0 {
-        11.0
-    } else if fc <= 60.0 {
-        9.0
-    } else {
-        // 60 < Fc <= 120 の区分値をそれ以上にも代表値として適用する。
-        7.0
-    }
-}
-
-/// コンクリートのヤング係数 Ec [N/mm²]（参考実装）。
-/// `Ec = 3.35e4・(γ/24)²・(Fc/60)^(1/3)`、γ は単位容積重量 [kN/m³]（既定 23）。
-pub fn concrete_young_modulus(fc: f64, gamma_kn_m3: Option<f64>) -> f64 {
-    let gamma = gamma_kn_m3.unwrap_or(23.0);
-    3.35e4 * (gamma / 24.0).powi(2) * (fc / 60.0).powf(1.0 / 3.0)
-}
-
-/// 異形鉄筋の許容引張・圧縮応力度 ft [N/mm²]。
-/// SD345/SD390/SD490 は径 D29 以上（`dia >= 29.0`）で長期値が低減される。
-/// USD685（高強度せん断補強筋兼用ではなく主筋として使う場合の異形棒鋼）は
-/// マニュアル記載値どおり長期 215（径によらず、D29 以上の低減対象外）・
-/// 短期 685 とする。
-pub fn rebar_allowable_tension(grade: &str, dia: f64, long_term: bool) -> f64 {
-    let g = grade.trim();
-    if g == "USD685" {
-        return if long_term { 215.0 } else { 685.0 };
-    }
-    if long_term {
-        if g == "SR235" || g == "SR295" {
-            155.0
-        } else if g.starts_with("SD295") {
-            195.0
-        } else if g == "SD345" || g == "SD390" || g == "SD490" {
-            if dia >= 29.0 {
-                195.0
-            } else {
-                215.0
-            }
-        } else {
-            195.0
-        }
-    } else if g == "SR235" {
-        235.0
-    } else if g == "SR295" || g.starts_with("SD295") {
-        295.0
-    } else if g == "SD345" {
-        345.0
-    } else if g == "SD390" {
-        390.0
-    } else if g == "SD490" {
-        490.0
-    } else {
-        295.0
-    }
-}
-
-/// せん断補強筋の許容引張応力度 w_ft [N/mm²]。
-/// USD685 はマニュアル記載値どおり長期 195・短期 590 とする。
-pub fn rebar_allowable_shear(grade: &str, long_term: bool) -> f64 {
-    let g = grade.trim();
-    if g == "USD685" {
-        return if long_term { 195.0 } else { 590.0 };
-    }
-    if long_term {
-        if g == "SR235" {
-            155.0
-        } else {
-            195.0
-        }
-    } else if g.starts_with("SD295") {
-        295.0
-    } else if g == "SD345" {
-        345.0
-    } else if g == "SD390" {
-        390.0
-    } else if g == "SD490" {
-        // F 値スケーリング: SD490 短期はせん断のみ F=390 に頭打ち。
-        390.0
-    } else {
-        295.0
-    }
-}
+// 材料強度・許容応力度は `crate::material`（RESP-D「材料強度・許容応力度」節）へ
+// 集約した。RC 造の検定で用いるものを再エクスポートし、従来の
+// `crate::rc::concrete_allowable_shear` 等のパスも維持する。
+pub use crate::material::{
+    concrete_allowable_bond, concrete_allowable_compression, concrete_allowable_compression_class,
+    concrete_allowable_shear, concrete_allowable_shear_class, concrete_young_modulus,
+    high_strength_group, high_strength_pw_cap, high_strength_w_ft, rebar_allowable_shear,
+    rebar_allowable_tension, rebar_sigma_y, young_ratio_n, HighStrengthGroup,
+};
 
 // ============================================================================
-// 2. 断面諸元の抽出
+// 1. 断面諸元の抽出
 // ============================================================================
 
 /// 検討方向 1 軸分の断面諸元。
@@ -434,116 +305,6 @@ fn shear_capacity_generic(
 //   表とし、グループ判別ができない（未知の高強度品名の）場合は安全側の
 //   0.8% を用いる。
 
-/// 高強度せん断補強筋の製品グループ（pw 上限値の判定用）。
-///
-/// マニュアルの製品別 pw 上限表（短期。2026-07-11 原典図で照合済み）:
-/// - ウルボン系（ウルボン785=UB785, ウルボン1275=SBPD1275）・SPR785:
-///   1.2%（損傷制御）/1.0%（安全確保）、Fc 非依存。
-/// - リバーボン785(KW785)・スミフープ等(KSS785)・HDC685: 0.8%、Fc 非依存。
-/// - スーパーフープ KH785: `min(1.2%, 1.0%・Fc/27)`。
-/// - スーパーフープ KH685・パワーリング SPR685: `min(1.2%, 1.2%・Fc/27)`。
-/// - UHYフープ SHD685・エムケーフープ MK785: 1.2%（損傷制御・安全確保とも）、Fc 非依存。
-/// - 上記以外（判別不能な高強度品）: 安全側に 0.8%。
-///
-/// 長期は全製品 0.6% で共通（`high_strength_pw_cap` 側で分岐）。
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum HighStrengthGroup {
-    /// ウルボン系（ウルボン785=UB785, ウルボン1275=SBPD1275）・SPR785。
-    /// 短期上限 1.2%（損傷制御）/1.0%（安全確保）、Fc 非依存。
-    UlbonSeries,
-    /// リバーボン785(KW785)・スミフープ等(KSS785)・HDC685。
-    /// 短期上限 0.8%（損傷制御・安全確保とも）、Fc 非依存。
-    Kw785Series,
-    /// スーパーフープ KH785。短期上限 `min(1.2%, 1.0%・Fc/27)`。
-    Kh785,
-    /// スーパーフープ KH685・パワーリング SPR685。
-    /// 短期上限 `min(1.2%, 1.2%・Fc/27)`。
-    Kh685Series,
-    /// UHYフープ SHD685・エムケーフープ MK785。短期上限 1.2%（損傷制御・
-    /// 安全確保とも）、Fc 非依存。
-    Shd685OrMk785,
-    /// 上記以外（判別不能な高強度品）。安全側に短期上限 0.8% とする。
-    Other,
-}
-
-/// grade 文字列（大文字化・前方一致）から高強度せん断補強筋の製品グループ
-/// を判定する。
-fn high_strength_group(grade: &str) -> HighStrengthGroup {
-    let g = grade.trim().to_uppercase();
-    let matches_any = |candidates: &[&str]| {
-        candidates
-            .iter()
-            .any(|c| g.starts_with(c.to_uppercase().as_str()))
-    };
-
-    if matches_any(&[
-        "UB785",
-        "SBPD1275",
-        "ｳﾙﾎﾞﾝ785",
-        "ｳﾙﾎﾞﾝ1275",
-        "ウルボン785",
-        "ウルボン1275",
-        "SPR785",
-    ]) {
-        HighStrengthGroup::UlbonSeries
-    } else if matches_any(&["KW785", "KSS785", "HDC685"]) {
-        HighStrengthGroup::Kw785Series
-    } else if matches_any(&["KH785"]) {
-        HighStrengthGroup::Kh785
-    } else if matches_any(&["KH685", "SPR685"]) {
-        HighStrengthGroup::Kh685Series
-    } else if matches_any(&["SHD685", "MK785"]) {
-        HighStrengthGroup::Shd685OrMk785
-    } else {
-        HighStrengthGroup::Other
-    }
-}
-
-/// 高強度せん断補強筋の許容せん断応力度 w_ft [N/mm²]（製品表）。
-/// 長期は全製品 195。短期は SBPD1275（ウルボン1275）のみ 585、他は全て
-/// 590（未知の高強度品名を含む「その他」も 590 とする）。
-fn high_strength_w_ft(grade: &str, long_term: bool) -> f64 {
-    if long_term {
-        return 195.0;
-    }
-    let g = grade.trim().to_uppercase();
-    let is_sbpd1275 = g.starts_with("SBPD1275")
-        || g.starts_with("ｳﾙﾎﾞﾝ1275".to_uppercase().as_str())
-        || g.starts_with("ウルボン1275");
-    if is_sbpd1275 {
-        585.0
-    } else {
-        590.0
-    }
-}
-
-/// 高強度せん断補強筋使用時の pw 上限値（製品グループ・長短期・
-/// 損傷制御/安全確保・Fc に応じた表）。長期は全製品 0.6%（Fc 非依存）。
-/// `fc` は Fc(raw) [N/mm²]。スーパーフープ KH785/KH685・パワーリング
-/// SPR685 は短期上限が Fc に依存する（`HighStrengthGroup` の doc 参照）。
-fn high_strength_pw_cap(grade: &str, term: LoadTerm, damage_control: bool, fc: f64) -> f64 {
-    if term == LoadTerm::Long {
-        return 0.006;
-    }
-    match high_strength_group(grade) {
-        HighStrengthGroup::UlbonSeries => {
-            if damage_control {
-                0.012
-            } else {
-                0.010
-            }
-        }
-        HighStrengthGroup::Kw785Series => 0.008,
-        // スーパーフープ KH785: min(1.2%, 1.0%・Fc/27)。
-        HighStrengthGroup::Kh785 => (0.012_f64).min(0.010 * fc / 27.0),
-        // スーパーフープ KH685・パワーリング SPR685: min(1.2%, 1.2%・Fc/27)。
-        HighStrengthGroup::Kh685Series => (0.012_f64).min(0.012 * fc / 27.0),
-        // UHYフープ SHD685・エムケーフープ MK785: Fc に依存せず一律 1.2%。
-        HighStrengthGroup::Shd685OrMk785 => 0.012,
-        HighStrengthGroup::Other => 0.008,
-    }
-}
-
 /// 高強度せん断補強筋使用時の許容せん断力 QA（マニュアル「上記以外の
 /// 高強度せん断補強筋の場合」の暫定対応式、全高強度製品に適用）。
 ///
@@ -612,23 +373,6 @@ fn shear_capacity_for(
 // 4.2 地震時短期の設計用せん断力 QD = min(QD1, QD2)
 // （RESP-D マニュアル 04 断面検定「梁/柱の設計用せん断力」）
 // ============================================================================
-
-/// 主筋の降伏点 σy [N/mm²]（終局曲げ ΣMy 算定用）。
-/// `Material.fy` があればそれを、無ければ材料名（鉄筋グレード名）の数値部
-/// （例 "SD345"→345）を、どちらも無ければ 345（SD345 相当）を用いる。
-fn rebar_sigma_y(mat: &Material) -> f64 {
-    if let Some(fy) = mat.fy {
-        if fy > 0.0 {
-            return fy;
-        }
-    }
-    let digits: String = mat.name.chars().filter(|c| c.is_ascii_digit()).collect();
-    digits
-        .parse::<f64>()
-        .ok()
-        .filter(|v| *v > 0.0)
-        .unwrap_or(345.0)
-}
 
 /// 地震時短期の設計用せん断力 QD [N]。
 ///
@@ -906,28 +650,6 @@ fn interp_ma(points: &[(f64, f64)], n_design: f64) -> f64 {
 // 6.5 RC 梁付着の断面検定（RC 規準 1991 方式、RESP-D マニュアル
 //     「検討方法（鉄筋コンクリート構造計算規準・解説 1991）」）
 // ============================================================================
-
-/// コンクリートの付着許容応力度 fa [N/mm²]（異形鉄筋。RESP-D マニュアル
-/// 「コンクリートの付着許容応力度」表、RC 規準 1991 方式の τa 検定用）。
-///
-/// - 長期・上端筋: `min(Fc/15, 0.9 + 2/75・Fc)`
-/// - 長期・その他: `min(Fc/10, 1.35 + Fc/25)`
-/// - 短期: 長期の 1.5 倍
-///
-/// 丸鋼（4/100・Fc かつ 0.9 以下等）はモデルに丸鋼の区分が無いため未対応
-/// （異形鉄筋のみ）。
-pub fn concrete_allowable_bond(fc: f64, top_bar: bool, long_term: bool) -> f64 {
-    let long = if top_bar {
-        (fc / 15.0).min(0.9 + 2.0 / 75.0 * fc)
-    } else {
-        (fc / 10.0).min(1.35 + fc / 25.0)
-    };
-    if long_term {
-        long
-    } else {
-        long * 1.5
-    }
-}
 
 /// RC 規準 1991 方式の付着検定結果。
 pub struct Bond1991Result {
