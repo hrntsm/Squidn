@@ -20,22 +20,38 @@
 //!   実運用では鋼種名を確認すること）。
 //!
 //! # マニュアルからの主な簡略化（doc 内に個別関数でも記載）
-//! 1. SRC 梁・柱の短期設計用せん断力（ヒンジ発生を考慮した
-//!    `rQD1 = rQL + (rM1+rM2)/l'` 等）は、部材端の許容/終局モーメントの
-//!    組み合わせを要するため実装せず、弾性分担に基づく一般化した
-//!    せん断力・せん断耐力の比較で代替する。
-//! 2. CFT 柱の鋼管部分の許容圧縮応力度 `s_fc` は座屈を考慮する
+//! 1. SRC 梁・柱の地震時短期の設計用せん断力（構造規定方式）は実装済み
+//!    （[`src_seismic_qd`] 参照。`ctx.seismic_qd` が Some で当該評価位置の
+//!    長期内力が見つかる場合のみ有効。それ以外（長期・積雪時・暴風時、
+//!    または長期内力が未提供）は従来どおり弾性分担のみで比較する）。
+//!    ただし以下はなお簡略化している:
+//!    - SRC 規準 1987 が定める「構造規定方式」と「SRC 規準方式」のうち
+//!      構造規定方式のみを実装し、選択機能は設けない。
+//!    - `sM1+sM2 = 2・sZ・sft` は部材両端が同一鉄骨・sft（短期許容引張
+//!      応力度）に達するとみなす近似（本来は許容"曲げモーメント"
+//!      `sMA` を用いるべきだが、SRC 柱の `sMA(N)` は軸力依存の複雑な
+//!      3 分岐式であり、部材端ごとに軸力が異なりうるため、鉄骨単体の
+//!      全塑性相当値 `sZ・sft` で代替する安全側とは限らない近似とする）。
+//!    - `rMu1+rMu2 = 2・rMu` も同様に部材両端同一断面・同一設計軸力の
+//!      仮定（[`squid_n_core::rc_capacity::rc_mu_simple`]/
+//!      [`squid_n_core::rc_capacity::rc_column_mu_simple`] を使用）。
+//! 2. CFT 柱の設計用せん断力は `QD2 = |QL| + n・|Q−QL|` のみ実装し、
+//!    `QD1`（複合断面の終局曲げによる算定、`ΣcMy/h′`）は実装しない
+//!    （CFT の終局曲げは鋼管・充填コンクリートの複合断面として別途
+//!    定式化が必要なため）。`ctx.seismic_qd` が Some の場合は常に QD2 を
+//!    用いる（[`cft_q_design`] 参照）。
+//! 3. CFT 柱の鋼管部分の許容圧縮応力度 `s_fc` は座屈を考慮する
 //!    （λ = lk/i を**鋼管単体**の断面二次半径で評価。充填コンクリートの
 //!    剛性寄与を無視するため安全側。[`cft_common_steel`] 参照）。
 //!    SRC 柱の内蔵鉄骨の `s_fc` は、被覆コンクリートによる拘束で単材座屈が
 //!    生じにくいことから `s_fc = s_ft` のままとする（SRC 規準の座屈検討は
 //!    別途必要になり得る）。
-//! 3. SRC 柱の RC 部分の中立軸圧縮側鉄骨面積 `s_ac`（fc′ 低減用）は
+//! 4. SRC 柱の RC 部分の中立軸圧縮側鉄骨面積 `s_ac`（fc′ 低減用）は
 //!    軸に依らず `steel_width・steel_flange_thick` の一つの値を用いる
 //!    （本来は曲げ軸ごとに異なりうる）。
-//! 4. SRC 柱・CFT 柱のせん断は強軸・弱軸を対称的に扱うため、RC 柱検定
+//! 5. SRC 柱・CFT 柱のせん断は強軸・弱軸を対称的に扱うため、RC 柱検定
 //!    （`rc.rs`）と同様に「b/D 入れ替え」の近似を用いる。
-//! 5. CFT 円形柱の (N,M) 相関は閉形式を用いず、縁応力一定の弾性三角形
+//! 6. CFT 円形柱の (N,M) 相関は閉形式を用いず、縁応力一定の弾性三角形
 //!    分布を断面内で数値積分して求める（矩形の閉形式と同じ弾性仮定）。
 
 use crate::rc::{
@@ -43,8 +59,9 @@ use crate::rc::{
     rebar_allowable_tension, young_ratio_n,
 };
 use crate::steel::{steel_f_value_prefix, steel_fs, steel_ft};
-use crate::{CheckResult, DesignCheck, DesignCtx, LoadTerm, MemberForcesAt, MemberKind};
+use crate::{CheckResult, DesignCheck, DesignCtx, LoadTerm, MemberForcesAt, MemberKind, QdMethod};
 use squid_n_core::model::{Material, Section};
+use squid_n_core::rc_capacity::{rc_column_mu_simple, rc_mu_simple, RcCapacityInput};
 use squid_n_core::section_shape::{BarSet, RcRebar, SectionShape, ShearBar};
 
 // ============================================================================
@@ -60,6 +77,25 @@ fn one_bar_area(dia: f64) -> f64 {
 /// 主筋セットの総断面積 [mm²]。
 fn bar_set_area(bar: &BarSet) -> f64 {
     bar.count as f64 * one_bar_area(bar.dia)
+}
+
+/// 主筋の降伏点 σy [N/mm²]（終局曲げ算定用。`rc.rs` の private 関数
+/// `rebar_sigma_y` と同ロジック）。
+///
+/// `Material.fy` があればそれを、無ければ材料名（鉄筋グレード名）の数値部
+/// （例 "SD345"→345）を、どちらも無ければ 345（SD345 相当）を用いる。
+fn rebar_sigma_y(mat: &Material) -> f64 {
+    if let Some(fy) = mat.fy {
+        if fy > 0.0 {
+            return fy;
+        }
+    }
+    let digits: String = mat.name.chars().filter(|c| c.is_ascii_digit()).collect();
+    digits
+        .parse::<f64>()
+        .ok()
+        .filter(|v| *v > 0.0)
+        .unwrap_or(345.0)
 }
 
 /// 引張縁 → 引張筋重心までの距離 dt [mm]（`rc.rs` の `tension_dt` と同じ

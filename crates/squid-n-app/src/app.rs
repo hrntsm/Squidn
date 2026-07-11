@@ -176,6 +176,17 @@ pub struct AnalysisSettings {
     pub th_integrator: ThIntegrator,
     /// 荷重組合せ自動生成（種別ベース）の多雪区域フラグ（施行令86条・82条）。
     pub heavy_snow_zone: bool,
+    /// 多雪区域の積雪荷重低減係数 δ1（長期 G+P+δ1・S。既定 0.7）。
+    pub snow_delta1: f64,
+    /// 同 δ2（暴風時 G+P+δ2・S±W。既定 0.35）。
+    pub snow_delta2: f64,
+    /// 同 δ3（地震時 G+P+δ3・S±K。既定 0.35）。
+    pub snow_delta3: f64,
+    /// RC 短期許容せん断力の「損傷制御のための検討」（false=安全確保のための検討）。
+    /// RESP-D マニュアル 04「断面算定条件 RC造」に対応。
+    pub rc_damage_control: bool,
+    /// 地震時短期の設計用せん断力 QD の決定方法（QD1/QD2/min）。
+    pub qd_method: squid_n_design_jp::QdMethod,
     /// 風荷重静的解析の基準風速 V0 [m/s]。
     pub v0: f64,
     /// 風荷重静的解析の地表面粗度区分。
@@ -230,6 +241,11 @@ impl Default for AnalysisSettings {
             th_h2: 0.02,
             th_integrator: ThIntegrator::NewmarkBeta,
             heavy_snow_zone: false,
+            snow_delta1: 0.7,
+            snow_delta2: 0.35,
+            snow_delta3: 0.35,
+            rc_damage_control: true,
+            qd_method: squid_n_design_jp::QdMethod::Min,
             v0: 34.0,
             roughness: squid_n_load::wind::TerrainRoughness::III,
             parapet_mm: 0.0,
@@ -1157,8 +1173,11 @@ impl App {
             wind_y: None,
             snow,
             heavy_snow_zone: self.analysis_cfg.heavy_snow_zone,
-            // δ1/δ2/δ3 は現状 UI 未対応のため既定値（0.7/0.35/0.35）。
-            snow_factors: None,
+            snow_factors: Some(squid_n_load::combo::SnowFactors {
+                delta1: self.analysis_cfg.snow_delta1,
+                delta2: self.analysis_cfg.snow_delta2,
+                delta3: self.analysis_cfg.snow_delta3,
+            }),
         };
         let combos = squid_n_load::combo::standard_combinations(&input);
         for combo in combos {
@@ -1600,7 +1619,7 @@ impl App {
                         // 割増係数 n（マニュアル: 柱は 1.5 以上）。梁・柱とも 1.5。
                         n_factor: 1.5,
                         clear_length,
-                        method: squid_n_design_jp::QdMethod::Min,
+                        method: self.analysis_cfg.qd_method,
                     }
                 });
             // S 造部材の断面検定属性（欠損率・横座屈長さ）。
@@ -1617,7 +1636,7 @@ impl App {
                 lb: None,
                 lk,
                 shear_span,
-                rc_damage_control: true,
+                rc_damage_control: self.analysis_cfg.rc_damage_control,
                 end_moments_z,
                 mid_moment_z: m_at(0.5),
                 seismic_qd,

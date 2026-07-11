@@ -740,6 +740,20 @@ pub struct BrbAttr {
     pub length_reduction: f64,
 }
 
+/// PCa（プレキャスト）梁の水平接合面検定用属性（RESP-D マニュアル 04）。
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct PcaBeamAttr {
+    pub elem: ElemId,
+    /// 水平接合面の摩擦係数 μ
+    pub mu: f64,
+    /// 接合面を横切る補強筋の体積比合計 p′w（あばら筋+接合面補強筋）
+    pub pw_joint: f64,
+    /// 補強筋の降伏強度 σy [N/mm²]
+    pub sigma_y_joint: f64,
+    /// 接合面の位置: 断面上端からの距離 [mm]（例: 後打ちスラブ厚）
+    pub joint_depth_from_top: f64,
+}
+
 /// フレーム外雑壁の荷重伝達タイプ（RESP-D マニュアル「フレーム外雑壁」）。
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum MiscWallTransfer {
@@ -856,6 +870,9 @@ pub struct Model {
     /// RESP-D マニュアル 04 断面検定）。
     #[serde(default)]
     pub brb_attrs: Vec<BrbAttr>,
+    /// PCa（プレキャスト）梁の水平接合面検定用属性（RESP-D マニュアル 04 断面検定）。
+    #[serde(default)]
+    pub pca_attrs: Vec<PcaBeamAttr>,
     #[serde(skip)]
     pub dof_map: crate::dof::DofMap,
 }
@@ -1034,6 +1051,7 @@ impl Model {
             && self.stress_cfg == other.stress_cfg
             && self.steel_design_attrs == other.steel_design_attrs
             && self.brb_attrs == other.brb_attrs
+            && self.pca_attrs == other.pca_attrs
     }
 }
 
