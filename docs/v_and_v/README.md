@@ -105,9 +105,10 @@
 > **CFT 柱の軸終局耐力**（CFT 指針の短柱/中柱/長柱＋座屈耐力、Ncu/Ntu）、**柱 Mu の ACI 規準**
 > （平面保持・等価応力度ブロック法）を新規実装。部材別のせん断/付着/軸余裕度（Qsu/Qmu 等）を
 > 算定するドライバ `collect_rc_ultimate_checks`・`collect_cft_ultimate_checks` と設計タブ
-> 「終局検定」ビュー（`ultimate_view.rs`、柱 Mu の at 式/ACI 切替つき）、接合部終局は
-> `joint_wiring` 経由で既存の接合部検定表・MCP へ配線した。
-> 詳細・未実装項目（靭性指針式 Vu・CFT の N-M 相互作用・二軸せん断余裕度）は
+> 「終局検定」ビュー（`ultimate_view.rs`、柱 Mu の at 式/ACI 切替・2 軸せん断切替つき）、
+> 接合部終局は `joint_wiring` 経由で既存の接合部検定表・MCP へ配線した。柱の **2 軸せん断
+> 余裕度**（採用応力 `1/((Qmx/Qux)²+(Qmy/Quy)²)^(1/2)`）も実装。
+> 詳細・未実装項目（靭性指針式 Vu・CFT の N-M 相互作用・二軸曲げ余裕度）は
 > `docs/v_and_v/終局検定_RESP-D照合.md`。
 
 ## 1 次参照: 手計算／理論解

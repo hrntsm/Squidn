@@ -325,6 +325,8 @@ pub struct App {
     pub ultimate_upper_factor: f64,
     /// 終局検定で柱の Mu を ACI 規準（平面保持）で算定するか（false は at 式）。
     pub ultimate_mu_aci: bool,
+    /// 終局検定で柱のせん断を 2 軸せん断として検定するか（RC 柱の 2 軸せん断余裕度）。
+    pub ultimate_biaxial_shear: bool,
     /// 左ペインの幅（px）。ドラッグで調整可能（180–520 にクランプ）。
     #[cfg(feature = "gui")]
     pub left_panel_width: f32,
@@ -451,6 +453,7 @@ impl Default for App {
             ultimate_include_bond: true,
             ultimate_upper_factor: 1.0,
             ultimate_mu_aci: false,
+            ultimate_biaxial_shear: false,
             #[cfg(feature = "gui")]
             left_panel_width: 280.0,
             #[cfg(feature = "gui")]

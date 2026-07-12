@@ -69,6 +69,12 @@ pub fn ultimate_table(ui: &mut egui::Ui, app: &mut App) {
         ui.selectable_value(&mut app.ultimate_mu_aci, false, "構造規定式(at式)");
         ui.selectable_value(&mut app.ultimate_mu_aci, true, "ACI規準(平面保持)")
             .on_hover_text("ACI318 等価応力度ブロック法による平面保持解析で柱の Mu を算定します。");
+        ui.separator();
+        ui.checkbox(&mut app.ultimate_biaxial_shear, "柱を2軸せん断で検定")
+            .on_hover_text(
+                "RC 柱のせん断余裕度を 2 軸せん断 1/((Qmx/Qux)²+(Qmy/Quy)²)^(1/2) として\
+                 検定します（採用応力）。Qsu/Qmu 列は 2 軸合成値を表示します。",
+            );
     });
     ui.separator();
 
@@ -142,10 +148,9 @@ pub fn ultimate_table(ui: &mut egui::Ui, app: &mut App) {
                             ui.label(format!("{:.1}", c.qsu / 1000.0));
                         });
                         row.col(|ui| {
-                            ui.colored_label(
-                                margin_color(c.shear_margin),
-                                format!("{:.2}", c.shear_margin),
-                            );
+                            // 2 軸せん断指定時は合成余裕度を表示（柱のみ Some）。
+                            let m = c.biaxial_shear_margin.unwrap_or(c.shear_margin);
+                            ui.colored_label(margin_color(m), format!("{m:.2}"));
                         });
                         row.col(|ui| {
                             if bond {

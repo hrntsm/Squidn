@@ -475,6 +475,7 @@ impl App {
             } else {
                 squid_n_design_jp::ultimate::MuMethod::AtFormula
             },
+            biaxial_shear: self.ultimate_biaxial_shear,
         };
         let checks =
             squid_n_design_jp::ultimate::collect_rc_ultimate_checks(&self.model, &axial, &opts);

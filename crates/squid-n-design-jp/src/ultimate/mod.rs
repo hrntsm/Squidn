@@ -21,8 +21,8 @@
 //! - RC 部材の検定対象は `SectionShape::RcRect`（矩形 RC 断面）のみ。円形柱・SRC・鋼は
 //!   別途（本モジュールの RC 経路の対象外）。CFT 柱の軸終局耐力は [`cft`]、柱梁接合部の
 //!   終局耐力は [`joint`] を参照。
-//! - 強軸（せい方向主筋 main_x）まわりのせん断・付着を検定する（二軸せん断余裕度・
-//!   靭性指針式 Vu は今後の課題）。
+//! - せん断・付着は強軸（せい方向主筋 main_x）を基本とし、柱は指定により 2 軸せん断
+//!   （[`biaxial_margin`]）も検定できる。靭性指針式 Vu は今後の課題。
 //! - 主筋は上下対称配筋を仮定し、引張側主筋量は main_x の総断面積の半分とする。
 
 use crate::MemberKind;
@@ -78,6 +78,10 @@ pub struct UltimateShearOptions {
     pub include_bond: bool,
     /// 柱の曲げ終局強度 Mu の算定方法（既定 at 式）。
     pub mu_method: MuMethod,
+    /// 柱のせん断を 2 軸せん断として検定する場合 true（RESP-D「06 終局検定」
+    /// 採用応力：RC のみ指定により 2 軸せん断）。両軸の Qmu/Qsu を相互作用式
+    /// `1/((Qmx/Qux)^αx+(Qmy/Quy)^αy)^(1/α)`（RC は α=2.0）で合成する。
+    pub biaxial_shear: bool,
 }
 
 impl Default for UltimateShearOptions {
@@ -89,7 +93,27 @@ impl Default for UltimateShearOptions {
             sigma_wy: 295.0,
             include_bond: true,
             mu_method: MuMethod::default(),
+            biaxial_shear: false,
         }
+    }
+}
+
+/// 2 軸相互作用の余裕度 `1/((rx)^α + (ry)^α)^(1/α)`（RESP-D「06 終局検定」採用応力）。
+///
+/// `rx`,`ry` は各軸の「需要/耐力」比（例: `Qmx/Qux`, `Qmy/Quy`）、`alpha` は相互作用の
+/// 指数（RC 柱は 2.0）。ここでは αx=αy=α と等しく扱う。両比が 0 のとき（需要ゼロ）は
+/// `f64::INFINITY` を返す。`alpha ≤ 0` の不正入力も `f64::INFINITY`。
+pub fn biaxial_margin(rx: f64, ry: f64, alpha: f64) -> f64 {
+    if alpha <= 0.0 {
+        return f64::INFINITY;
+    }
+    let rx = rx.max(0.0);
+    let ry = ry.max(0.0);
+    let s = rx.powf(alpha) + ry.powf(alpha);
+    if s <= 0.0 {
+        f64::INFINITY
+    } else {
+        1.0 / s.powf(1.0 / alpha)
     }
 }
 
@@ -108,8 +132,11 @@ pub struct UltimateCheck {
     pub qsu: f64,
     /// 付着割裂による終局せん断耐力 Qbu [N]（`include_bond=false` なら 0）。
     pub qbu: f64,
-    /// せん断余裕度 Qsu/Qmu。
+    /// せん断余裕度 Qsu/Qmu（強軸）。
     pub shear_margin: f64,
+    /// 2 軸せん断余裕度（柱かつ `biaxial_shear=true` のとき Some）。
+    /// `1/((Qmx/Qsux)^2+(Qmy/Qsuy)^2)^(1/2)`。
+    pub biaxial_shear_margin: Option<f64>,
     /// 付着余裕度 Qbu/Qmu（`include_bond=false` なら `f64::INFINITY`）。
     pub bond_margin: f64,
     /// 軸終局耐力（柱のみ Some）。
@@ -190,6 +217,61 @@ fn clear_span(elem: &ElementData, model: &Model) -> f64 {
     } else {
         geom
     }
+}
+
+/// 指定方向（`b_dir`=幅, `d_dir`=せい, `main`=当該方向主筋）の柱の終局せん断強度
+/// `Qsu`（塑性理論式）と両端ヒンジ時せん断力 `Qmu` を算定する（2 軸せん断用）。
+#[allow(clippy::too_many_arguments)]
+fn column_axis_shear(
+    b_dir: f64,
+    d_dir: f64,
+    main: &BarSet,
+    rebar: &RcRebar,
+    fc: f64,
+    sigma_y: f64,
+    ag: f64,
+    n_axial: f64,
+    l_clear: f64,
+    opts: &UltimateShearOptions,
+) -> (f64, f64) {
+    let dt = rebar.cover + rebar.shear.dia + main.dia / 2.0;
+    let d_eff = d_dir - dt;
+    if d_eff <= 0.0 {
+        return (0.0, 0.0);
+    }
+    let jt = 7.0 * d_eff / 8.0;
+    let at = bar_set_area(main) / 2.0;
+    let pw = hoop_pw(rebar, b_dir);
+    let qsu = rc_shear_qsu_plastic(&RcPlasticShearInput {
+        b: b_dir,
+        d_full: d_dir,
+        jt,
+        pw,
+        sigma_wy: opts.sigma_wy,
+        l_clear,
+        fc,
+        rp: opts.rp,
+        lightweight: opts.lightweight,
+    });
+    let cap = RcCapacityInput {
+        b: b_dir,
+        d: d_dir,
+        at,
+        d_eff,
+        sigma_y,
+        fc,
+        pw,
+        sigma_wy: opts.sigma_wy,
+        clear_span: l_clear.max(1.0),
+        sigma_0: 0.0,
+    };
+    let mu = rc_column_mu_simple(&cap, ag, n_axial);
+    let qmu = if l_clear > 0.0 {
+        opts.upper_strength_factor * 2.0 * mu / l_clear
+    } else {
+        0.0
+    };
+    (qsu, qmu)
 }
 
 /// 1 部材の終局検定を実行する（`RcRect` 以外・Fc 未設定は `None`）。
@@ -323,22 +405,57 @@ fn check_member(
         f64::INFINITY
     };
 
+    // 2 軸せん断余裕度（柱のみ、指定時）。弱軸（main_y、b↔D 入替）の Qsu/Qmu を
+    // 算定し、相互作用式 1/((Qmx/Qsux)^2+(Qmy/Qsuy)^2)^(1/2)（RC は α=2.0）で合成する。
+    let biaxial_shear_margin = if kind == MemberKind::Column && opts.biaxial_shear {
+        let (qsu_y, qmu_y) = column_axis_shear(
+            d,
+            b,
+            &rebar.main_y,
+            rebar,
+            fc,
+            sigma_y,
+            ag,
+            n_axial,
+            l_clear,
+            opts,
+        );
+        let rx = if qsu > 0.0 { qmu / qsu } else { f64::INFINITY };
+        let ry = if qsu_y > 0.0 {
+            qmu_y / qsu_y
+        } else {
+            f64::INFINITY
+        };
+        Some(biaxial_margin(rx, ry, 2.0))
+    } else {
+        None
+    };
+
     let axial = if kind == MemberKind::Column {
         Some(rc_column_axial_ultimate(b, d, fc, ag, sigma_y))
     } else {
         None
     };
 
-    let ok = shear_margin >= 1.0 && bond_margin >= 1.0;
+    // せん断判定は 2 軸指定時は 2 軸余裕度、そうでなければ強軸せん断余裕度を用いる。
+    let effective_shear_ok = match biaxial_shear_margin {
+        Some(m) => m >= 1.0,
+        None => shear_margin >= 1.0,
+    };
+    let ok = effective_shear_ok && bond_margin >= 1.0;
 
     let basis = match kind {
         MemberKind::Column => "RC柱 終局検定（塑性理論式 Qsu/Qbu）".to_string(),
         _ => "RC梁 終局検定（塑性理論式 Qsu/Qbu）".to_string(),
     };
+    let biaxial_str = match biaxial_shear_margin {
+        Some(m) => format!(", 2軸せん断余裕度={m:.3}"),
+        None => String::new(),
+    };
     let detail = format!(
         "Mu={:.0} N·mm, Qmu={:.0} N, Qsu={:.0} N, Qbu={:.0} N, τbu={:.3} N/mm², \
-         Qsu/Qmu={:.3}, Qbu/Qmu={:.3}, pw={:.5}, jt={:.1} mm, L={:.0} mm, Rp={:.4}",
-        mu, qmu, qsu, qbu, tau_bu, shear_margin, bond_margin, pw, jt, l_clear, opts.rp
+         Qsu/Qmu={:.3}, Qbu/Qmu={:.3}{}, pw={:.5}, jt={:.1} mm, L={:.0} mm, Rp={:.4}",
+        mu, qmu, qsu, qbu, tau_bu, shear_margin, bond_margin, biaxial_str, pw, jt, l_clear, opts.rp
     );
 
     Some(UltimateCheck {
@@ -349,6 +466,7 @@ fn check_member(
         qsu,
         qbu,
         shear_margin,
+        biaxial_shear_margin,
         bond_margin,
         axial,
         ok,

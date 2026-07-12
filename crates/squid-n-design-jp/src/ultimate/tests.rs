@@ -192,6 +192,49 @@ fn test_ultimate_check_include_bond_false() {
     }
 }
 
+#[test]
+fn test_biaxial_margin_handcalc() {
+    // rx=ry=0.5, α=2 → 1/√(0.25+0.25)=1/√0.5=√2。
+    let m = biaxial_margin(0.5, 0.5, 2.0);
+    assert!((m - 2.0_f64.sqrt()).abs() < 1e-9, "m={m}");
+    // 片軸のみ需要（ry=0）→ rx=0.5 の逆数=2.0。
+    assert!((biaxial_margin(0.5, 0.0, 2.0) - 2.0).abs() < 1e-9);
+    // 需要ゼロ → 無限大。
+    assert!(biaxial_margin(0.0, 0.0, 2.0).is_infinite());
+    // 相互作用が単位に達する（rx²+ry²=1）と余裕度=1.0。
+    assert!((biaxial_margin(0.6, 0.8, 2.0) - 1.0).abs() < 1e-9);
+}
+
+/// 柱の 2 軸せん断余裕度オプションが機能し、強軸単独より小さい（不利側）になる。
+#[test]
+fn test_ultimate_check_biaxial_shear() {
+    let model = column_and_beam_model();
+    let axial = vec![(ElemId(0), 2_000_000.0)];
+    let uni = collect_rc_ultimate_checks(&model, &axial, &UltimateShearOptions::default());
+    let bi = collect_rc_ultimate_checks(
+        &model,
+        &axial,
+        &UltimateShearOptions {
+            biaxial_shear: true,
+            ..Default::default()
+        },
+    );
+    let col_uni = uni.iter().find(|c| c.elem == ElemId(0)).unwrap();
+    let col_bi = bi.iter().find(|c| c.elem == ElemId(0)).unwrap();
+    // 既定では 2 軸余裕度は None。
+    assert!(col_uni.biaxial_shear_margin.is_none());
+    // 2 軸指定で Some。両軸の需要を合成するため強軸単独の余裕度以下になる。
+    let bm = col_bi.biaxial_shear_margin.expect("2軸指定で Some");
+    assert!(
+        bm > 0.0 && bm <= col_bi.shear_margin + 1e-9,
+        "bm={bm} uni={}",
+        col_bi.shear_margin
+    );
+    // 梁は 2 軸せん断の対象外（None のまま）。
+    let beam_bi = bi.iter().find(|c| c.elem == ElemId(1)).unwrap();
+    assert!(beam_bi.biaxial_shear_margin.is_none());
+}
+
 /// 柱の Mu を ACI 規準（平面保持）で算定するオプションが機能する。
 #[test]
 fn test_ultimate_check_mu_method_aci() {
