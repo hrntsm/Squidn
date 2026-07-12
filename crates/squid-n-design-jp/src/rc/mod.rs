@@ -37,8 +37,15 @@ mod column;
 pub mod horizontal_joint;
 pub mod joint;
 pub mod wall;
+/// 鉄筋コンクリート造耐震壁のせん断非線形特性（トリリニア Qc/βu/Qu）。
+/// 非線形解析のせん断ばね骨格に用いる（RESP-D「05 非線形モデル」）。
+pub mod wall_nonlinear;
 
 pub use bond::{rc_beam_bond_check, rc_beam_bond_check_1991, Bond1991Result, BondCheckResult};
+pub use wall_nonlinear::{
+    wall_shear_beta_u, wall_shear_crack, wall_shear_trilinear, wall_shear_ultimate,
+    WallShearTrilinear, WallShearTrilinearInput,
+};
 
 // 材料強度・許容応力度は `crate::material_strength`（RESP-D「材料強度・許容応力度」節）へ
 // 集約した。RC 造の検定で用いるものを再エクスポートし、従来の

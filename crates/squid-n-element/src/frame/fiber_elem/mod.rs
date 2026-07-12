@@ -1,4 +1,6 @@
-use crate::behavior::{Ctx, ElemState, ElementBehavior, LocalMat, LocalVec, MassOption};
+use crate::behavior::{
+    Ctx, DuctilityProbe, ElemState, ElementBehavior, LocalMat, LocalVec, MassOption,
+};
 use smallvec::SmallVec;
 use squid_n_core::dof::DofMap;
 use squid_n_core::ids::NodeId;
@@ -617,6 +619,58 @@ impl ElementBehavior for FiberBeam {
                 }
             }
         }
+    }
+
+    /// 塑性率評価用の危険断面プローブ（RESP-D「05 非線形モデル」）。
+    /// 現在の `trial_disp`（ローカル系）から各ガウス点の曲率を復元し、曲率が
+    /// 最大のガウス点（危険断面）についてファイバーひずみを集約する。
+    fn ductility_probe(&self) -> Option<DuctilityProbe> {
+        let l = self.length;
+        if l <= 0.0 || self.gauss_points.is_empty() {
+            return None;
+        }
+        let td = &self.trial_disp;
+        // 曲率が最大のガウス点（危険断面）を選ぶ。
+        let mut best: Option<(f64, usize, f64, f64, f64)> = None; // (|κ|, idx, eps0, ky, kz)
+        for (gi, gp) in self.gauss_points.iter().enumerate() {
+            let b = Self::compute_b_matrix(gp.xi, l);
+            let eps0 = b[0][0] * td[0] + b[0][6] * td[6];
+            let ky = b[1][2] * td[2] + b[1][4] * td[4] + b[1][8] * td[8] + b[1][10] * td[10];
+            let kz = b[2][1] * td[1] + b[2][5] * td[5] + b[2][7] * td[7] + b[2][11] * td[11];
+            let kappa = (ky * ky + kz * kz).sqrt();
+            if best.is_none_or(|(bk, ..)| kappa > bk) {
+                best = Some((kappa, gi, eps0, ky, kz));
+            }
+        }
+        let (kappa, gi, eps0, ky, kz) = best?;
+        let gp = &self.gauss_points[gi];
+        let mut max_t = 0.0_f64;
+        let mut max_c = 0.0_f64;
+        let mut max_yr = 0.0_f64;
+        let mut jm_num = 0.0_f64;
+        let mut jm_den = 0.0_f64;
+        for (i, fiber) in gp.section.fibers.iter().enumerate() {
+            let eps = eps0 - kz * fiber.y + ky * fiber.z;
+            max_t = max_t.max(eps);
+            max_c = max_c.max(-eps);
+            let sref = gp.mats[i].reference_stress();
+            let eref = gp.mats[i].reference_strain();
+            if sref > 0.0 && eref > 0.0 {
+                let mu_i = eps.abs() / eref;
+                max_yr = max_yr.max(mu_i);
+                let w = sref * fiber.area * eps.abs();
+                jm_num += w * mu_i;
+                jm_den += w;
+            }
+        }
+        let jm = if jm_den > 0.0 { jm_num / jm_den } else { 0.0 };
+        Some(DuctilityProbe {
+            curvature: kappa,
+            max_tension_strain: max_t,
+            max_compression_strain: max_c,
+            max_yield_ratio: max_yr,
+            jm,
+        })
     }
 }
 

@@ -123,6 +123,10 @@ impl ElementBehavior for MsElement {
     fn deserialize_checkpoint(&mut self, data: &[u8]) {
         self.inner.deserialize_checkpoint(data);
     }
+
+    fn ductility_probe(&self) -> Option<crate::behavior::DuctilityProbe> {
+        self.inner.ductility_probe()
+    }
 }
 
 #[cfg(test)]
