@@ -97,10 +97,13 @@ impl Default for StrengthParams {
     }
 }
 
-/// コンクリートの弾性係数 [N/mm²]（RC規準式、気乾単位体積重量 γ=24 kN/m³ 仮定）:
-/// Ec = 3.35×10⁴ × (γ/24)² × (Fc/60)^(1/3)
+/// コンクリートの弾性係数 [N/mm²]（RC規準式 Ec = 3.35×10⁴ × (γ/24)² × (Fc/60)^(1/3)）。
+///
+/// 単一の実装（[`squid_n_core::section_shape::concrete_young_modulus`]、γ=23 固定）に委譲し、
+/// 断面剛性と M-N 相関で Ec が食い違わないようにする。`fc<=0` では 0 を返すため、
+/// 数値積分では呼出側で下限を保証すること。
 pub fn concrete_young(fc: f64) -> f64 {
-    3.35e4 * (fc.max(1.0) / 60.0).powf(1.0 / 3.0)
+    squid_n_core::section_shape::concrete_young_modulus(fc.max(1.0))
 }
 
 /// M-N 相関曲面。`grid[i][j]` は経線方向 i（引張極 α=0 → 圧縮極 α=π）、

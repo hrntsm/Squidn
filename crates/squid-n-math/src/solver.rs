@@ -31,6 +31,21 @@ pub enum SolverBackend {
     IterativePcg { tol: f64, max_iter: usize },
 }
 
+/// 因子分解済みソルバに単一 RHS 列を与えて解く共通処理。
+/// `CholeskySolver`／`LuSolver` の `solve` 実装が共有する（次元検査→RHS 構築→解→収集）。
+pub(crate) fn solve_dense_column<S: faer::linalg::solvers::Solve<f64>>(
+    factor: &S,
+    rhs: &[f64],
+    n: usize,
+) -> Result<Vec<f64>, SolveError> {
+    if rhs.len() != n {
+        return Err(SolveError::DimMismatch { k: n, rhs: rhs.len() });
+    }
+    let b = faer::Mat::from_fn(n, 1, |i, _| rhs[i]);
+    let x = factor.solve(b.as_ref());
+    Ok((0..n).map(|i| x[(i, 0)]).collect())
+}
+
 pub fn make_solver(backend: SolverBackend) -> Box<dyn LinearSolver> {
     match backend {
         SolverBackend::DirectSparseCholesky => Box::new(crate::cholesky::CholeskySolver::default()),

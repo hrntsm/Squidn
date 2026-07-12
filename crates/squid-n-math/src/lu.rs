@@ -1,8 +1,6 @@
 use crate::solver::{LinearSolver, SolveError};
-use faer::linalg::solvers::Solve;
 use faer::sparse::linalg::solvers::{Lu, SymbolicLu};
 use faer::sparse::SparseColMat;
-use faer::Mat;
 
 /// 疎 LU 直接法ソルバ。対称正定値でない系（非対称化した剛性、ラグランジュ
 /// 乗数付き拘束など）にも使えるフォールバック。
@@ -25,15 +23,7 @@ impl LinearSolver for LuSolver {
 
     fn solve(&self, rhs: &[f64]) -> Result<Vec<f64>, SolveError> {
         let lu = self.factor.as_ref().ok_or(SolveError::NotFactorized)?;
-        if rhs.len() != self.n {
-            return Err(SolveError::DimMismatch {
-                k: self.n,
-                rhs: rhs.len(),
-            });
-        }
-        let b = Mat::from_fn(self.n, 1, |i, _| rhs[i]);
-        let x = lu.solve(b.as_ref());
-        Ok((0..self.n).map(|i| x[(i, 0)]).collect())
+        crate::solver::solve_dense_column(lu, rhs, self.n)
     }
 }
 

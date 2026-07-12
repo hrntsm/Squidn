@@ -540,25 +540,38 @@ pub struct Model {
     pub dof_map: crate::dof::DofMap,
 }
 
+/// コレクション内の id が「配列添字 == id.index()」かつ重複しないことを検証する。
+/// `coll` は配列名（例 "nodes"）、`id_name` は id 型名（例 "NodeId"）。
+fn check_id_consistency<T>(
+    items: &[T],
+    coll: &str,
+    id_name: &str,
+    index_of: impl Fn(&T) -> usize,
+    raw_of: impl Fn(&T) -> u32,
+) -> Result<(), crate::error::CoreError> {
+    use crate::error::CoreError;
+    for (i, item) in items.iter().enumerate() {
+        if index_of(item) != i {
+            return Err(CoreError::IndexMismatch(format!(
+                "{coll}[{i}] has {id_name}({})",
+                raw_of(item)
+            )));
+        }
+    }
+    let mut seen = std::collections::HashSet::new();
+    for item in items {
+        if !seen.insert(index_of(item)) {
+            return Err(CoreError::DuplicateId(format!("{id_name}({})", raw_of(item))));
+        }
+    }
+    Ok(())
+}
+
 impl Model {
     pub fn validate(&self) -> Result<(), crate::error::CoreError> {
         use crate::error::CoreError;
 
-        for (i, node) in self.nodes.iter().enumerate() {
-            if node.id.index() != i {
-                return Err(CoreError::IndexMismatch(format!(
-                    "nodes[{}] has NodeId({})",
-                    i, node.id.0
-                )));
-            }
-        }
-
-        let mut seen_nodes = std::collections::HashSet::new();
-        for node in &self.nodes {
-            if !seen_nodes.insert(node.id) {
-                return Err(CoreError::DuplicateId(format!("NodeId({})", node.id.0)));
-            }
-        }
+        check_id_consistency(&self.nodes, "nodes", "NodeId", |n| n.id.index(), |n| n.id.0)?;
 
         for (i, elem) in self.elements.iter().enumerate() {
             if elem.id.index() != i {
@@ -600,69 +613,28 @@ impl Model {
             }
         }
 
-        for (i, story) in self.stories.iter().enumerate() {
-            if story.id.index() != i {
-                return Err(CoreError::IndexMismatch(format!(
-                    "stories[{}] has StoryId({})",
-                    i, story.id.0
-                )));
-            }
-        }
-
-        let mut seen_stories = std::collections::HashSet::new();
-        for story in &self.stories {
-            if !seen_stories.insert(story.id) {
-                return Err(CoreError::DuplicateId(format!("StoryId({})", story.id.0)));
-            }
-        }
-
-        for (i, slab) in self.slabs.iter().enumerate() {
-            if slab.id.index() != i {
-                return Err(CoreError::IndexMismatch(format!(
-                    "slabs[{}] has SlabId({})",
-                    i, slab.id.0
-                )));
-            }
-        }
-
-        let mut seen_slabs = std::collections::HashSet::new();
-        for slab in &self.slabs {
-            if !seen_slabs.insert(slab.id) {
-                return Err(CoreError::DuplicateId(format!("SlabId({})", slab.id.0)));
-            }
-        }
-
-        for (i, sec) in self.sections.iter().enumerate() {
-            if sec.id.index() != i {
-                return Err(CoreError::IndexMismatch(format!(
-                    "sections[{}] has SectionId({})",
-                    i, sec.id.0
-                )));
-            }
-        }
-
-        let mut seen_sections = std::collections::HashSet::new();
-        for sec in &self.sections {
-            if !seen_sections.insert(sec.id) {
-                return Err(CoreError::DuplicateId(format!("SectionId({})", sec.id.0)));
-            }
-        }
-
-        for (i, mat) in self.materials.iter().enumerate() {
-            if mat.id.index() != i {
-                return Err(CoreError::IndexMismatch(format!(
-                    "materials[{}] has MaterialId({})",
-                    i, mat.id.0
-                )));
-            }
-        }
-
-        let mut seen_materials = std::collections::HashSet::new();
-        for mat in &self.materials {
-            if !seen_materials.insert(mat.id) {
-                return Err(CoreError::DuplicateId(format!("MaterialId({})", mat.id.0)));
-            }
-        }
+        check_id_consistency(
+            &self.stories,
+            "stories",
+            "StoryId",
+            |s| s.id.index(),
+            |s| s.id.0,
+        )?;
+        check_id_consistency(&self.slabs, "slabs", "SlabId", |s| s.id.index(), |s| s.id.0)?;
+        check_id_consistency(
+            &self.sections,
+            "sections",
+            "SectionId",
+            |s| s.id.index(),
+            |s| s.id.0,
+        )?;
+        check_id_consistency(
+            &self.materials,
+            "materials",
+            "MaterialId",
+            |m| m.id.index(),
+            |m| m.id.0,
+        )?;
 
         Ok(())
     }

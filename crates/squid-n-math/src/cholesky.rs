@@ -1,8 +1,7 @@
 use crate::solver::{LinearSolver, SolveError};
-use faer::linalg::solvers::Solve;
 use faer::sparse::linalg::solvers::{Llt, SymbolicLlt};
 use faer::sparse::SparseColMat;
-use faer::{Mat, Side};
+use faer::Side;
 
 #[derive(Default)]
 pub struct CholeskySolver {
@@ -23,15 +22,7 @@ impl LinearSolver for CholeskySolver {
 
     fn solve(&self, rhs: &[f64]) -> Result<Vec<f64>, SolveError> {
         let llt = self.factor.as_ref().ok_or(SolveError::NotFactorized)?;
-        if rhs.len() != self.n {
-            return Err(SolveError::DimMismatch {
-                k: self.n,
-                rhs: rhs.len(),
-            });
-        }
-        let b = Mat::from_fn(self.n, 1, |i, _| rhs[i]);
-        let x = llt.solve(b.as_ref());
-        Ok((0..self.n).map(|i| x[(i, 0)]).collect())
+        crate::solver::solve_dense_column(llt, rhs, self.n)
     }
 }
 

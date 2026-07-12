@@ -434,11 +434,10 @@ impl SectionShape {
                 } else {
                     0.0
                 };
+                // 上下フランジは同一寄与（左右対称）。2 枚分をまとめて計上する。
                 let i_f = flange_thick * width.powi(3) / 12.0 + a_f * (width / 2.0 - z_bar).powi(2);
-                let i_f2 =
-                    flange_thick * width.powi(3) / 12.0 + a_f * (width / 2.0 - z_bar).powi(2);
                 let i_w = hw * web_thick.powi(3) / 12.0 + a_w * (web_thick / 2.0 - z_bar).powi(2);
-                i_f + i_f2 + i_w
+                2.0 * i_f + i_w
             }
             SectionShape::SteelTee {
                 height,
