@@ -8,6 +8,7 @@ license = "MIT"
 bincode = { workspace = true }
 serde = { workspace = true }
 approx = { workspace = true }
+thiserror = { workspace = true }
 
 [dev-dependencies]
 insta = { workspace = true }

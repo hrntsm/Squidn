@@ -53,7 +53,7 @@ fn make_yield_element() -> ConcentratedSpringBeam {
 /// Box<dyn UniaxialMaterial> から Bilinear の降伏値を読み出す（テスト用）。
 fn spring_fy(spring: &dyn UniaxialMaterial) -> f64 {
     let mut b = Bilinear::new(1.0, 1.0, 0.0);
-    b.deserialize_state(&spring.serialize_state());
+    b.deserialize_state(&spring.serialize_state()).unwrap();
     b.fy
 }
 
@@ -295,7 +295,7 @@ fn test_concentrated_spring_checkpoint_roundtrip() {
     let checkpoint = elem.serialize_checkpoint();
 
     let mut restored = make_test_element();
-    restored.deserialize_checkpoint(&checkpoint);
+    restored.deserialize_checkpoint(&checkpoint).unwrap();
     let snap_after = restored.snapshot_state();
 
     // スナップショットの型で比較（Vec<Box<dyn UniaxialMaterial>>, f64, f64, f64, f64）

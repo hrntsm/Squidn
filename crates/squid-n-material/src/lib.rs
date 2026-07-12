@@ -1,5 +1,6 @@
 pub mod hysteresis;
 pub mod newrc;
+mod state_serde;
 pub mod uniaxial;
 pub use hysteresis::{
     lateral_buckling_mu_ratio, HysteresisMaterial, HysteresisRule, SteelBuckling, TsujiYamada,

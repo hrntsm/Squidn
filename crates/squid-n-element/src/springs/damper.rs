@@ -367,7 +367,10 @@ impl ElementBehavior for HystereticDamperElement {
         if let Some((ce, te, ms)) = state.downcast_ref::<(f64, f64, Vec<u8>)>() {
             self.committed_elong = *ce;
             self.trial_elong = *te;
-            self.mat.deserialize_state(ms);
+            // 同一プロセス内で serialize_state した信頼済みバイト列のため、
+            // 復元失敗は起こらない想定。トランザクション巻き戻しでの panic を
+            // 避けるため失敗時は状態を据え置く。
+            let _ = self.mat.deserialize_state(ms);
         }
     }
 }

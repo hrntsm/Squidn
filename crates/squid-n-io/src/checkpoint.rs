@@ -125,7 +125,8 @@ pub fn load_nonlinear_checkpoint(
     verify_model_hash(&cp, &expected_hash)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
     for (b, state_bytes) in behaviors.iter_mut().zip(&cp.state.element_states) {
-        b.deserialize_checkpoint(state_bytes);
+        b.deserialize_checkpoint(state_bytes)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
     }
     Ok(cp)
 }

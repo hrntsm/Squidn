@@ -356,16 +356,20 @@ impl ElementBehavior for TrussElement {
         bincode::serialize(&cp).expect("serialize checkpoint")
     }
 
-    fn deserialize_checkpoint(&mut self, data: &[u8]) {
+    fn deserialize_checkpoint(
+        &mut self,
+        data: &[u8],
+    ) -> Result<(), crate::behavior::CheckpointError> {
         #[derive(serde::Serialize, serde::Deserialize)]
         struct TrussCheckpoint {
             committed_elongation: f64,
             trial_elongation: f64,
         }
-        if let Ok(cp) = bincode::deserialize::<TrussCheckpoint>(data) {
-            self.committed_elongation = cp.committed_elongation;
-            self.trial_elongation = cp.trial_elongation;
-        }
+        let cp: TrussCheckpoint = bincode::deserialize(data)
+            .map_err(|e| crate::behavior::CheckpointError::Decode(e.to_string()))?;
+        self.committed_elongation = cp.committed_elongation;
+        self.trial_elongation = cp.trial_elongation;
+        Ok(())
     }
 }
 
@@ -658,7 +662,7 @@ mod tests {
         let checkpoint = truss.serialize_checkpoint();
 
         let mut restored = TrussElement::new_tension_only_nonlinear(&data, &model);
-        restored.deserialize_checkpoint(&checkpoint);
+        restored.deserialize_checkpoint(&checkpoint).unwrap();
         assert!((restored.committed_elongation - 2.0).abs() < 1e-12);
         assert!((restored.trial_elongation - (-3.0)).abs() < 1e-12);
     }

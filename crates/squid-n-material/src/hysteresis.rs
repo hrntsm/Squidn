@@ -1,3 +1,4 @@
+use crate::state_serde::impl_material_serde;
 use crate::uniaxial::UniaxialMaterial;
 
 /// 部材レベルの履歴則パラメータ（設計書 §7 / 仕様書 §5）。
@@ -710,19 +711,7 @@ impl UniaxialMaterial for HysteresisMaterial {
     fn revert(&mut self) {
         self.trial = self.committed.clone();
     }
-    fn clone_box(&self) -> Box<dyn UniaxialMaterial> {
-        Box::new(self.clone())
-    }
-
-    fn serialize_state(&self) -> Vec<u8> {
-        bincode::serialize(self).expect("material serialize")
-    }
-
-    fn deserialize_state(&mut self, data: &[u8]) {
-        if let Ok(de) = bincode::deserialize::<Self>(data) {
-            *self = de;
-        }
-    }
+    impl_material_serde!();
 }
 
 // ──────────────────────────── 辻・山田モデル ────────────────────────────
@@ -851,19 +840,7 @@ impl UniaxialMaterial for TsujiYamada {
         self.trial = self.committed;
     }
 
-    fn clone_box(&self) -> Box<dyn UniaxialMaterial> {
-        Box::new(self.clone())
-    }
-
-    fn serialize_state(&self) -> Vec<u8> {
-        bincode::serialize(self).expect("material serialize")
-    }
-
-    fn deserialize_state(&mut self, data: &[u8]) {
-        if let Ok(de) = bincode::deserialize::<Self>(data) {
-            *self = de;
-        }
-    }
+    impl_material_serde!();
 }
 
 // ──────────────────────────── 鉄骨大梁の座屈考慮履歴 ────────────────────────────
@@ -1139,19 +1116,7 @@ impl UniaxialMaterial for SteelBuckling {
         self.trial = self.committed;
     }
 
-    fn clone_box(&self) -> Box<dyn UniaxialMaterial> {
-        Box::new(self.clone())
-    }
-
-    fn serialize_state(&self) -> Vec<u8> {
-        bincode::serialize(self).expect("material serialize")
-    }
-
-    fn deserialize_state(&mut self, data: &[u8]) {
-        if let Ok(de) = bincode::deserialize::<Self>(data) {
-            *self = de;
-        }
-    }
+    impl_material_serde!();
 }
 
 #[cfg(test)]

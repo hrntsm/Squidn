@@ -19,6 +19,7 @@
 //! 履歴の影響は小さい）。RESP-D の Fc60 超・ユーザー定義は Bilinear 骨格へ切替える
 //! 規定のため、本モデルは適用範囲（Fc≤60）でのみ用いること（呼び出し側で判定）。
 
+use crate::state_serde::impl_material_serde;
 use crate::uniaxial::UniaxialMaterial;
 
 /// N/mm² → kgf/cm²（1 kgf/cm² = 0.0980665 N/mm²）。
@@ -194,19 +195,7 @@ impl UniaxialMaterial for ConcreteNewRc {
         self.trial = self.committed.clone();
     }
 
-    fn clone_box(&self) -> Box<dyn UniaxialMaterial> {
-        Box::new(self.clone())
-    }
-
-    fn serialize_state(&self) -> Vec<u8> {
-        bincode::serialize(self).expect("material serialize")
-    }
-
-    fn deserialize_state(&mut self, data: &[u8]) {
-        if let Ok(de) = bincode::deserialize::<Self>(data) {
-            *self = de;
-        }
-    }
+    impl_material_serde!();
 
     fn reference_stress(&self) -> f64 {
         self.fc

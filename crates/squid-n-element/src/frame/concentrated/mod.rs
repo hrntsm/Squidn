@@ -364,7 +364,10 @@ impl ElementBehavior for ConcentratedSpringBeam {
         bincode::serialize(&cp).expect("serialize checkpoint")
     }
 
-    fn deserialize_checkpoint(&mut self, data: &[u8]) {
+    fn deserialize_checkpoint(
+        &mut self,
+        data: &[u8],
+    ) -> Result<(), crate::behavior::CheckpointError> {
         #[derive(serde::Serialize, serde::Deserialize)]
         struct ConcentratedSpringCheckpoint {
             rot_i: f64,
@@ -374,14 +377,15 @@ impl ElementBehavior for ConcentratedSpringBeam {
             spring_i: Vec<u8>,
             spring_j: Vec<u8>,
         }
-        if let Ok(cp) = bincode::deserialize::<ConcentratedSpringCheckpoint>(data) {
-            self.rot_i = cp.rot_i;
-            self.rot_j = cp.rot_j;
-            self.trial_rot_i = cp.trial_rot_i;
-            self.trial_rot_j = cp.trial_rot_j;
-            self.spring_i.deserialize_state(&cp.spring_i);
-            self.spring_j.deserialize_state(&cp.spring_j);
-        }
+        let cp: ConcentratedSpringCheckpoint = bincode::deserialize(data)
+            .map_err(|e| crate::behavior::CheckpointError::Decode(e.to_string()))?;
+        self.rot_i = cp.rot_i;
+        self.rot_j = cp.rot_j;
+        self.trial_rot_i = cp.trial_rot_i;
+        self.trial_rot_j = cp.trial_rot_j;
+        self.spring_i.deserialize_state(&cp.spring_i)?;
+        self.spring_j.deserialize_state(&cp.spring_j)?;
+        Ok(())
     }
 }
 

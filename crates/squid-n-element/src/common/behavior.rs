@@ -3,6 +3,17 @@ use squid_n_core::dof::DofMap;
 use squid_n_core::model::Model;
 use std::any::Any;
 
+/// チェックポイントからの要素状態復元に関するエラー。
+#[derive(Debug, thiserror::Error)]
+pub enum CheckpointError {
+    /// 要素チェックポイント本体（bincode）の復号に失敗した。
+    #[error("チェックポイントの復号に失敗しました: {0}")]
+    Decode(String),
+    /// 内包する材料状態の復元に失敗した。
+    #[error(transparent)]
+    MaterialState(#[from] squid_n_material::MaterialStateError),
+}
+
 pub struct LocalMat {
     pub n: usize,
     pub data: Vec<f64>,
@@ -113,8 +124,11 @@ pub trait ElementBehavior {
     fn serialize_checkpoint(&self) -> Vec<u8> {
         vec![]
     }
-    /// チェックポイント用: バイト列から要素状態を復元
-    fn deserialize_checkpoint(&mut self, _data: &[u8]) {}
+    /// チェックポイント用: バイト列から要素状態を復元。
+    /// 復号や内包材料の復元に失敗した場合は [`CheckpointError`] を返す。
+    fn deserialize_checkpoint(&mut self, _data: &[u8]) -> Result<(), CheckpointError> {
+        Ok(())
+    }
     /// 塑性率評価用の危険断面プローブ（ファイバー要素のみ実装。既定は None）。
     /// RESP-D「05 非線形モデル」ファイバーモデルの塑性率算定に用いる。
     fn ductility_probe(&self) -> Option<DuctilityProbe> {

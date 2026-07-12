@@ -1,4 +1,20 @@
+use crate::state_serde::impl_material_serde;
 use std::fmt::Debug;
+
+/// 材料状態の直列化・復元に関するエラー。
+#[derive(Debug, thiserror::Error)]
+pub enum MaterialStateError {
+    /// バイト列からの復元に失敗した（バージョン不整合・破損など）。
+    #[error("材料状態の復元に失敗しました: {0}")]
+    Decode(String),
+}
+
+impl MaterialStateError {
+    /// 任意の表示可能なエラーを [`MaterialStateError::Decode`] へ変換する。
+    pub(crate) fn decode(e: impl std::fmt::Display) -> Self {
+        MaterialStateError::Decode(e.to_string())
+    }
+}
 
 /// 一軸応力–ひずみ履歴則を示すトレイト（設計書 §7）。
 /// trial/commit/revert パターンで非線形解析の試行収束に対応する。
@@ -18,8 +34,9 @@ pub trait UniaxialMaterial: Send + Sync + Debug {
     fn clone_box(&self) -> Box<dyn UniaxialMaterial>;
     /// チェックポイント用: 材料の全状態をバイト列へ直列化
     fn serialize_state(&self) -> Vec<u8>;
-    /// チェックポイント用: バイト列から材料状態を復元
-    fn deserialize_state(&mut self, data: &[u8]);
+    /// チェックポイント用: バイト列から材料状態を復元。
+    /// 失敗時は状態を変えずに [`MaterialStateError`] を返す。
+    fn deserialize_state(&mut self, data: &[u8]) -> Result<(), MaterialStateError>;
     /// 降伏値（応力またはモーメント）を外部から更新するフック。
     /// N-M 相関により降伏面の大きさを解析中に変える要素（材端集中バネ等）が
     /// 用いる。対応しない材料は何もしない（既定実装）。
@@ -162,19 +179,7 @@ impl UniaxialMaterial for Bilinear {
         self.trial = self.committed.clone();
     }
 
-    fn clone_box(&self) -> Box<dyn UniaxialMaterial> {
-        Box::new(self.clone())
-    }
-
-    fn serialize_state(&self) -> Vec<u8> {
-        bincode::serialize(self).expect("material serialize")
-    }
-
-    fn deserialize_state(&mut self, data: &[u8]) {
-        if let Ok(de) = bincode::deserialize::<Self>(data) {
-            *self = de;
-        }
-    }
+    impl_material_serde!();
 }
 
 // ──────────────────────────── Menegotto–Pinto 鉄筋 ────────────────────────────
@@ -333,19 +338,7 @@ impl UniaxialMaterial for MenegottoPinto {
         self.trial = self.committed.clone();
     }
 
-    fn clone_box(&self) -> Box<dyn UniaxialMaterial> {
-        Box::new(self.clone())
-    }
-
-    fn serialize_state(&self) -> Vec<u8> {
-        bincode::serialize(self).expect("material serialize")
-    }
-
-    fn deserialize_state(&mut self, data: &[u8]) {
-        if let Ok(de) = bincode::deserialize::<Self>(data) {
-            *self = de;
-        }
-    }
+    impl_material_serde!();
 }
 
 // ──────────────────────────── コンクリートモデル ────────────────────────────
@@ -543,19 +536,7 @@ impl UniaxialMaterial for Concrete {
         self.trial = self.committed.clone();
     }
 
-    fn clone_box(&self) -> Box<dyn UniaxialMaterial> {
-        Box::new(self.clone())
-    }
-
-    fn serialize_state(&self) -> Vec<u8> {
-        bincode::serialize(self).expect("material serialize")
-    }
-
-    fn deserialize_state(&mut self, data: &[u8]) {
-        if let Ok(de) = bincode::deserialize::<Self>(data) {
-            *self = de;
-        }
-    }
+    impl_material_serde!();
 }
 
 // ──────────────────────────── 既存別名（後方互換） ────────────────────────────
@@ -722,5 +703,27 @@ mod tests {
         c.revert();
         let (stress, _) = c.trial(-0.0005);
         assert!(stress < 0.0);
+    }
+
+    #[test]
+    fn test_serialize_state_roundtrip() {
+        let mut a = Bilinear::new(205000.0, 235.0, 0.01);
+        a.trial(235.0 / 205000.0 * 3.0);
+        a.commit();
+        let bytes = a.serialize_state();
+        let mut b = Bilinear::new(1.0, 1.0, 0.0);
+        b.deserialize_state(&bytes).expect("valid state restores");
+        assert_eq!(a.serialize_state(), b.serialize_state());
+    }
+
+    #[test]
+    fn test_deserialize_state_rejects_corrupt_bytes() {
+        // 従来は復元失敗を黙って握り潰していた。現在は Err を返し、
+        // 状態は据え置かれる（破損チェックポイントを検出できる）。
+        let mut m = Bilinear::new(205000.0, 235.0, 0.01);
+        let before = m.serialize_state();
+        let err = m.deserialize_state(&[0xff, 0x00, 0x01]);
+        assert!(matches!(err, Err(MaterialStateError::Decode(_))));
+        assert_eq!(m.serialize_state(), before, "失敗時は状態を変えない");
     }
 }

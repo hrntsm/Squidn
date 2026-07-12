@@ -716,22 +716,26 @@ impl ElementBehavior for FiberBeam {
         bincode::serialize(&cp).expect("serialize checkpoint")
     }
 
-    fn deserialize_checkpoint(&mut self, data: &[u8]) {
+    fn deserialize_checkpoint(
+        &mut self,
+        data: &[u8],
+    ) -> Result<(), crate::behavior::CheckpointError> {
         #[derive(serde::Serialize, serde::Deserialize)]
         struct FiberBeamCheckpoint {
             trial_disp: [f64; 12],
             committed_disp: [f64; 12],
             gauss_points: Vec<Vec<Vec<u8>>>,
         }
-        if let Ok(cp) = bincode::deserialize::<FiberBeamCheckpoint>(data) {
-            self.trial_disp = cp.trial_disp;
-            self.committed_disp = cp.committed_disp;
-            for (gp, gp_mats) in self.gauss_points.iter_mut().zip(cp.gauss_points) {
-                for (mat, mat_bytes) in gp.mats.iter_mut().zip(gp_mats) {
-                    mat.deserialize_state(&mat_bytes);
-                }
+        let cp: FiberBeamCheckpoint = bincode::deserialize(data)
+            .map_err(|e| crate::behavior::CheckpointError::Decode(e.to_string()))?;
+        self.trial_disp = cp.trial_disp;
+        self.committed_disp = cp.committed_disp;
+        for (gp, gp_mats) in self.gauss_points.iter_mut().zip(cp.gauss_points) {
+            for (mat, mat_bytes) in gp.mats.iter_mut().zip(gp_mats) {
+                mat.deserialize_state(&mat_bytes)?;
             }
         }
+        Ok(())
     }
 
     /// 塑性率評価用の危険断面プローブ（RESP-D「05 非線形モデル」）。

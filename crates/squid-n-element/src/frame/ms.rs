@@ -120,8 +120,11 @@ impl ElementBehavior for MsElement {
         self.inner.serialize_checkpoint()
     }
 
-    fn deserialize_checkpoint(&mut self, data: &[u8]) {
-        self.inner.deserialize_checkpoint(data);
+    fn deserialize_checkpoint(
+        &mut self,
+        data: &[u8],
+    ) -> Result<(), crate::behavior::CheckpointError> {
+        self.inner.deserialize_checkpoint(data)
     }
 
     fn ductility_probe(&self) -> Option<crate::behavior::DuctilityProbe> {
@@ -312,7 +315,7 @@ mod tests {
         let cp = elem.serialize_checkpoint();
 
         let mut elem2 = MsElement::new(&model.elements[0], &model);
-        elem2.deserialize_checkpoint(&cp);
+        elem2.deserialize_checkpoint(&cp).unwrap();
         // 復元後、同じ増分に対する応答が一致する
         let du2 = LocalVec {
             data: smallvec::smallvec![0.0, 0.0, 0.0, 0.0, 0.01, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],

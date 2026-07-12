@@ -943,7 +943,7 @@ fn test_fiber_beam_checkpoint_roundtrip() {
     let checkpoint = fiber.serialize_checkpoint();
 
     let mut restored = make_test_fiber_beam(Some(0.0));
-    restored.deserialize_checkpoint(&checkpoint);
+    restored.deserialize_checkpoint(&checkpoint).unwrap();
     let snap_after = restored.snapshot_state();
 
     let before = snap_before
@@ -1030,7 +1030,7 @@ fn test_plastic_zone_checkpoint_roundtrip() {
     let cp = fb.serialize_checkpoint();
 
     let mut fb2 = make_plastic_zone_fiber(300.0, Some(235.0));
-    fb2.deserialize_checkpoint(&cp);
+    fb2.deserialize_checkpoint(&cp).unwrap();
     let du2 = LocalVec {
         data: SmallVec::from_slice(&[0.0, 0.0, 0.0, 0.0, 0.01, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
     };
