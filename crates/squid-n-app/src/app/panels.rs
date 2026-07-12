@@ -1308,6 +1308,91 @@ impl App {
                  等包絡面積則でトリリニア縮約したもの。",
             );
         });
+
+        // ── 質点系（せん断型）時刻歴応答解析 ──────────────────────────
+        ui.separator();
+        let mut run_stick = false;
+        let mut clear_stick = false;
+        ui.horizontal(|ui| {
+            if ui
+                .button("▶ 質点系時刻歴を実行")
+                .on_hover_text(
+                    "サンプル波（解析設定の dt/継続/周期/振幅・減衰比）で串団子モデルの\
+                     非線形時刻歴（Newmark-β、各層トリリニア）を実行します",
+                )
+                .clicked()
+            {
+                run_stick = true;
+            }
+            if self.stick_response.is_some() && ui.button("結果クリア").clicked() {
+                clear_stick = true;
+            }
+        });
+        if run_stick {
+            let accel = Self::sample_wave(&self.analysis_cfg).accel_x;
+            let res = squid_n_solver::lumped_mass::lumped_mass_time_history(
+                &lm,
+                &accel,
+                self.analysis_cfg.th_dt,
+                self.analysis_cfg.th_damping,
+            );
+            self.stick_response = Some(res);
+        }
+        if clear_stick {
+            self.stick_response = None;
+        }
+        if let Some(res) = &self.stick_response {
+            let roof_peak = res
+                .roof_disp
+                .iter()
+                .cloned()
+                .fold(0.0f64, |m, v| m.max(v.abs()));
+            let mu_max = res.story_ductility.iter().cloned().fold(0.0f64, f64::max);
+            ui.horizontal(|ui| {
+                ui.label(format!("頂部最大変位: {:.2} mm", roof_peak));
+                ui.separator();
+                ui.label(format!("最大層塑性率 μ: {:.2}", mu_max));
+            });
+            egui::Grid::new("stick_th_result")
+                .striped(true)
+                .num_columns(4)
+                .show(ui, |ui| {
+                    ui.strong("階");
+                    ui.strong("最大層間変形[mm]");
+                    ui.strong("最大層せん断[kN]");
+                    ui.strong("塑性率μ");
+                    ui.end_row();
+                    for i in (0..res.story_peak_drift.len()).rev() {
+                        let name = self
+                            .model
+                            .stories
+                            .get(i)
+                            .map(|s| s.name.as_str())
+                            .unwrap_or("-");
+                        ui.label(name);
+                        ui.label(format!("{:.2}", res.story_peak_drift[i]));
+                        ui.label(format!("{:.0}", res.story_peak_shear[i] / 1000.0));
+                        ui.label(format!("{:.2}", res.story_ductility[i]));
+                        ui.end_row();
+                    }
+                });
+            let pts: Vec<[f64; 2]> = res
+                .time
+                .iter()
+                .zip(res.roof_disp.iter())
+                .map(|(&t, &d)| [t, d])
+                .collect();
+            egui_plot::Plot::new("stick_roof_plot")
+                .height(160.0)
+                .x_axis_label("時間[s]")
+                .y_axis_label("頂部変位[mm]")
+                .show(ui, |pu| {
+                    pu.line(
+                        egui_plot::Line::new("roof", egui_plot::PlotPoints::from(pts))
+                            .color(crate::theme::DATA_BLUE),
+                    );
+                });
+        }
     }
 
     /// レポートタブ：CSV レポートのプレビューとエクスポート。

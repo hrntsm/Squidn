@@ -376,6 +376,8 @@ pub struct App {
     /// 時刻歴グラフの表示項目選択
     #[cfg(feature = "gui")]
     pub time_history_source: crate::time_history_view::TimeHistorySource,
+    /// 質点系（串団子）時刻歴応答の結果（結果タブ「質点系モデル」で実行・表示）。
+    pub stick_response: Option<squid_n_solver::lumped_mass::StickResponse>,
     /// 断面作成UI のドラフト（UI-3）
     #[cfg(feature = "gui")]
     pub section_draft: crate::section_editor::SectionEditorDraft,
@@ -486,6 +488,7 @@ impl Default for App {
             time_history_data: crate::time_history_view::TimeHistoryData::default(),
             #[cfg(feature = "gui")]
             time_history_source: crate::time_history_view::TimeHistorySource::default(),
+            stick_response: None,
             #[cfg(feature = "gui")]
             section_draft: crate::section_editor::SectionEditorDraft::default(),
             #[cfg(feature = "gui")]
