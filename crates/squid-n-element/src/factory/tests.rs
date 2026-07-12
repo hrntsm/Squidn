@@ -711,3 +711,68 @@ fn test_rc_beam_flexural_spring_exhibits_takeda_degradation() {
     );
     assert!(ku > 0.0, "unloading stiffness must stay positive");
 }
+
+#[test]
+fn test_steel_beam_flexural_spring_buckling_degrades() {
+    // 鉄骨梁に座屈考慮型を個別指定 → 材端バネが最大耐力後に耐力劣化することを、
+    // 返却された復元力材料を直接駆動して確認する。
+    use squid_n_core::model::HysteresisModel;
+    use squid_n_core::section_shape::SectionShape;
+
+    let mut model = make_diaphragm_model();
+    let beam = ElementData {
+        id: ElemId(0),
+        kind: ElementKind::Beam,
+        nodes: smallvec::smallvec![NodeId(0), NodeId(1)],
+        section: Some(SectionId(0)),
+        material: Some(MaterialId(0)),
+        local_axis: LocalAxis {
+            ref_vector: [0.0, 1.0, 0.0],
+        },
+        end_cond: [EndCondition::Fixed, EndCondition::Fixed],
+        force_regime: ForceRegime::Auto,
+        rigid_zone: Default::default(),
+        plastic_zone: None,
+        spring: None,
+    };
+    model.elements.push(beam.clone());
+    model.sections[0].shape = Some(SectionShape::SteelH {
+        height: 400.0,
+        width: 200.0,
+        web_thick: 8.0,
+        flange_thick: 13.0,
+    });
+    model.sections[0].depth = 400.0;
+    model.sections[0].width = 200.0;
+    model.sections[0].iz = 200.0 * 400.0f64.powi(3) / 12.0;
+    model.materials[0].fy = Some(325.0);
+    model.set_member_hysteresis(ElemId(0), HysteresisModel::SteelBuckling);
+
+    let rule = resolve_member_hysteresis(&beam, &model);
+    assert_eq!(rule, HysteresisModel::SteelBuckling);
+    let (mut si, _sj, use_mn) = build_flexural_springs(&beam, &model, rule);
+    assert!(use_mn, "座屈考慮型は set_yield 対応で N-M 相関適用可");
+
+    let (_m0, k0) = si.trial(1e-9);
+    si.commit();
+    assert!(k0 > 0.0);
+    // 単調載荷でピーク → さらに大変形で耐力劣化。
+    let theta_y = {
+        // My は spring 内部だが、θy≈small。大きめの回転で骨格の各域を通過させる。
+        1e-3
+    };
+    let mut m_max = 0.0_f64;
+    let mut m_last = 0.0_f64;
+    for i in 1..=200 {
+        let th = theta_y * i as f64 * 0.5;
+        let (m, _) = si.trial(th);
+        si.commit();
+        m_max = m_max.max(m);
+        m_last = m;
+    }
+    assert!(m_max > 0.0);
+    assert!(
+        m_last < m_max * 0.999,
+        "buckling degradation: last M ({m_last}) must fall below peak ({m_max})"
+    );
+}

@@ -80,6 +80,8 @@ pub enum HysteresisModel {
     Takeda,
     /// 辻・山田型（バイリニア＋β 混合硬化。座屈補剛ブレース等）。
     TsujiYamada,
+    /// 鉄骨大梁の座屈考慮履歴（耐力劣化型＋RO 除荷。局部/横/連成座屈）。
+    SteelBuckling,
 }
 
 impl HysteresisModel {
@@ -93,11 +95,12 @@ impl HysteresisModel {
             HysteresisModel::MaxPointOriented => "最大点指向型",
             HysteresisModel::Takeda => "武田型",
             HysteresisModel::TsujiYamada => "辻・山田型",
+            HysteresisModel::SteelBuckling => "座屈考慮型",
         }
     }
 
     /// UI・列挙用の全候補。
-    pub const ALL: [HysteresisModel; 7] = [
+    pub const ALL: [HysteresisModel; 8] = [
         HysteresisModel::Auto,
         HysteresisModel::Retrograde,
         HysteresisModel::Standard,
@@ -105,6 +108,7 @@ impl HysteresisModel {
         HysteresisModel::MaxPointOriented,
         HysteresisModel::Takeda,
         HysteresisModel::TsujiYamada,
+        HysteresisModel::SteelBuckling,
     ];
 }
 

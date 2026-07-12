@@ -3,7 +3,7 @@ use squid_n_core::model::{
     default_member_hysteresis, ElementData, ElementKind, ForceRegime, HysteresisModel, Model,
 };
 use squid_n_material::uniaxial::{Bilinear, UniaxialMaterial};
-use squid_n_material::{HysteresisMaterial, HysteresisRule, TsujiYamada};
+use squid_n_material::{HysteresisMaterial, HysteresisRule, SteelBuckling, TsujiYamada};
 
 /// ForceRegime の自動選択結果（P5 §5）
 pub enum ResolvedRegime {
@@ -477,6 +477,14 @@ fn build_flexural_springs(
     if rule == HysteresisModel::TsujiYamada {
         let k2 = 0.01 * k_rot;
         let mk = || Box::new(TsujiYamada::new(k_rot, my, k2, 0.5)) as Box<dyn UniaxialMaterial>;
+        return (mk(), mk(), true);
+    }
+    // 座屈考慮型（耐力劣化型＋RO 除荷）。既定 Mu=1.1·My（座屈細長比の精算は今後の課題。
+    // 断面の λb・κ・WF が得られる場合は lateral_buckling_mu_ratio で Mu/Mp を算定可）。
+    // set_yield 対応（Mu も比率を保持）のため N-M 相関を適用可能。
+    if rule == HysteresisModel::SteelBuckling {
+        let mk =
+            || Box::new(SteelBuckling::with_defaults(k_rot, my, 1.1)) as Box<dyn UniaxialMaterial>;
         return (mk(), mk(), true);
     }
     // トリリニア折れ点: ひび割れ Mc/θc（初期勾配 k_rot）、降伏 My/θy（降伏時剛性
