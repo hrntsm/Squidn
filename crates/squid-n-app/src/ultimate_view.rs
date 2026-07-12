@@ -177,4 +177,101 @@ pub fn ultimate_table(ui: &mut egui::Ui, app: &mut App) {
             );
         }
     }
+
+    // ── CFT 柱の軸終局耐力（RESP-D「06 終局検定」CFT）─────────────
+    ui.add_space(12.0);
+    ui.strong("CFT柱の軸終局耐力（RESP-D 06：CFT指針）");
+    ui.add_space(4.0);
+    match app.compute_cft_ultimate_checks() {
+        Err(msg) => {
+            ui.colored_label(crate::theme::GRAY_600, &msg);
+        }
+        Ok(checks) => {
+            let ng = checks.iter().filter(|c| !c.ok).count();
+            ui.horizontal(|ui| {
+                ui.label(format!("対象 CFT 柱 {} 本", checks.len()));
+                if ng > 0 {
+                    ui.colored_label(crate::theme::ERROR_RED, format!("NG {} 本", ng));
+                } else {
+                    ui.colored_label(crate::theme::GOOD_GREEN, "全柱 OK");
+                }
+            });
+            ui.add_space(4.0);
+            TableBuilder::new(ui)
+                .id_salt("cft_ultimate_checks")
+                .striped(true)
+                .column(Column::auto())
+                .column(Column::initial(48.0))
+                .column(Column::initial(90.0))
+                .column(Column::initial(90.0))
+                .column(Column::initial(90.0))
+                .column(Column::initial(72.0))
+                .column(Column::initial(50.0))
+                .header(20.0, |mut h| {
+                    for t in &[
+                        "部材",
+                        "分類",
+                        "Ncu[kN]",
+                        "Ntu[kN]",
+                        "N[kN]",
+                        "軸余裕度",
+                        "判定",
+                    ] {
+                        h.col(|ui| {
+                            ui.strong(*t);
+                        });
+                    }
+                })
+                .body(|body| {
+                    body.rows(18.0, checks.len(), |mut row| {
+                        let i = row.index();
+                        let c = &checks[i];
+                        row.col(|ui| {
+                            ui.label(format!("{}", c.elem.0)).on_hover_text(&c.detail);
+                        });
+                        row.col(|ui| {
+                            ui.label(cft_class_label(c.class));
+                        });
+                        row.col(|ui| {
+                            ui.label(format!("{:.0}", c.ncu / 1000.0));
+                        });
+                        row.col(|ui| {
+                            ui.label(format!("{:.0}", c.ntu / 1000.0));
+                        });
+                        row.col(|ui| {
+                            ui.label(format!("{:.0}", c.n_design / 1000.0));
+                        });
+                        row.col(|ui| {
+                            ui.colored_label(
+                                margin_color(c.axial_margin),
+                                format!("{:.2}", c.axial_margin),
+                            );
+                        });
+                        row.col(|ui| {
+                            if c.ok {
+                                ui.colored_label(crate::theme::GOOD_GREEN, "OK");
+                            } else {
+                                ui.colored_label(crate::theme::ERROR_RED, "NG");
+                            }
+                        });
+                    });
+                });
+            ui.add_space(4.0);
+            ui.colored_label(
+                crate::theme::GRAY_600,
+                "Ncu=軸圧縮終局耐力（短柱=cNc+(1+ξ)sNc、長柱=座屈耐力、中柱=線形補間）、\
+                 Ntu=軸引張終局耐力（sA·Fy）。N は長期軸力（圧縮正）。座屈長さは幾何長（K=1）。",
+            );
+        }
+    }
+}
+
+/// CFT 柱分類のラベル。
+fn cft_class_label(class: squid_n_design_jp::ultimate::CftColumnClass) -> &'static str {
+    use squid_n_design_jp::ultimate::CftColumnClass;
+    match class {
+        CftColumnClass::Short => "短柱",
+        CftColumnClass::Medium => "中柱",
+        CftColumnClass::Long => "長柱",
+    }
 }

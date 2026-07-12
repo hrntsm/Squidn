@@ -191,3 +191,55 @@ fn test_ultimate_check_include_bond_false() {
         assert!(c.bond_margin.is_infinite());
     }
 }
+
+/// CFT 角形柱 1 本のモデルで軸終局検定ドライバが Ncu/Ntu・軸余裕度を算定する。
+#[test]
+fn test_collect_cft_ultimate_checks() {
+    let cft_shape = SectionShape::CftBox {
+        height: 400.0,
+        width: 400.0,
+        thick: 12.0,
+    };
+    let sec = Section {
+        id: SectionId(0),
+        name: "CFT400".into(),
+        area: cft_shape.calc_area(),
+        iy: cft_shape.calc_iy(),
+        iz: cft_shape.calc_iz(),
+        j: 1.0,
+        depth: 400.0,
+        width: 400.0,
+        as_y: 0.0,
+        as_z: 0.0,
+        panel_thickness: None,
+        thickness: None,
+        shape: Some(cft_shape),
+    };
+    let mat = Material {
+        concrete_class: Default::default(),
+        id: MaterialId(0),
+        name: "BCR295".to_string(),
+        young: 205000.0,
+        poisson: 0.3,
+        density: 7.85e-9,
+        shear: None,
+        fc: Some(30.0),
+        fy: None,
+    };
+    let model = Model {
+        nodes: vec![node(0, [0.0, 0.0, 0.0]), node(1, [0.0, 0.0, 3000.0])],
+        sections: vec![sec],
+        materials: vec![mat],
+        elements: vec![frame_element(0, 0, 0, 1)],
+        ..Default::default()
+    };
+    // 圧縮軸力 3000kN。
+    let axial = vec![(ElemId(0), 3_000_000.0)];
+    let checks = collect_cft_ultimate_checks(&model, &axial);
+    assert_eq!(checks.len(), 1);
+    let c = &checks[0];
+    assert!(c.ncu > 0.0 && c.ntu > 0.0);
+    assert!((c.axial_margin - c.ncu / 3_000_000.0).abs() < 1e-6);
+    // lk=3000, D=400 → lk/D=7.5 → 中柱。
+    assert_eq!(c.class, CftColumnClass::Medium);
+}

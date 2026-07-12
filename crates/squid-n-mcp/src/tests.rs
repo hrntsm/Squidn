@@ -193,6 +193,9 @@ fn test_compute_ultimate_check_job() {
             assert_eq!(members.len(), 1);
             assert!(members[0]["qsu"].as_f64().unwrap() > 0.0);
             assert!(members[0]["shear_margin"].as_f64().unwrap() > 0.0);
+            // CFT 集計キーが存在する（本モデルは CFT 柱なしなので 0）。
+            assert_eq!(summary["n_cft_checks"], 0);
+            assert!(summary["cft_members"].is_array());
         }
         _ => panic!("expected UltimateCheck outcome"),
     }

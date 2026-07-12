@@ -68,7 +68,7 @@
 | 23 | MCP サーバ（rmcp） | squid-n-mcp | lib.rs | — | P8 | ❌ |
 | 24 | ST-Bridge 入出力 | squid-n-io | stbridge.rs | `test_roundtrip_*` | P8 | 🔶 |
 | 25 | 編集トランザクション（EditCommand/Undo） | squid-n-edit | lib.rs | `test_*` | P3/P8 | ✅ |
-| 26 | 終局検定（塑性理論式 Qsu・付着 Qbu・軸 Nuc/Nut） | squid-n-design-jp | ultimate/rc_shear.rs, ultimate/rc_axial.rs, ultimate/mod.rs | `test_rc_shear_qsu_plastic_*`/`test_rc_shear_qbu_bond_*`/`test_rc_column_axial_ultimate_*`/`test_collect_rc_ultimate_checks_*` | P7 | 🔶 |
+| 26 | 終局検定（塑性理論式 Qsu・付着 Qbu・軸 Nuc/Nut・接合部 Vju/Qdu・CFT 軸終局） | squid-n-design-jp | ultimate/{rc_shear,rc_axial,joint,cft,mod}.rs | `test_rc_shear_qsu_plastic_*`/`test_rc_shear_qbu_bond_*`/`test_rc_joint_ultimate_*`/`test_cft_*`/`test_collect_*_ultimate_checks_*` | P7 | 🔶 |
 
 凡例: ✅ 実装済み・🔶 一部実装（要拡張）・❌ 未実装
 
@@ -101,11 +101,12 @@
 > #26: RESP-D「06 終局検定」照合で、これまで荒川mean式（`rc_qsu_simple`）しか無かった
 > RC 部材の終局せん断強度に、「終局強度型設計指針」の**塑性理論式**
 > （`Qsu = b·jt·pw·σwy·cotφ + k1·(1−k2)·b·D·ν·Fc`、トラス＋アーチ機構）と**付着割裂耐力 Qbu**、
-> 柱の**軸終局耐力 Nuc/Nut**、**RC 柱梁接合部の終局耐力 Vju/Qdu**（`Vju=κ·φ·Fj·bj·Dj`）を
-> 新規実装。部材別のせん断/付着/軸余裕度（Qsu/Qmu 等）を算定するドライバ
-> `collect_rc_ultimate_checks` と設計タブ「終局検定」ビュー（`ultimate_view.rs`）、接合部終局は
+> 柱の**軸終局耐力 Nuc/Nut**、**RC 柱梁接合部の終局耐力 Vju/Qdu**（`Vju=κ·φ·Fj·bj·Dj`）、
+> **CFT 柱の軸終局耐力**（CFT 指針の短柱/中柱/長柱＋座屈耐力、Ncu/Ntu）を新規実装。
+> 部材別のせん断/付着/軸余裕度（Qsu/Qmu 等）を算定するドライバ `collect_rc_ultimate_checks`・
+> `collect_cft_ultimate_checks` と設計タブ「終局検定」ビュー（`ultimate_view.rs`）、接合部終局は
 > `joint_wiring` 経由で既存の接合部検定表・MCP へ配線した。
-> 詳細・未実装項目（靭性指針式 Vu・柱 Mu の ACI 規準・CFT 終局・二軸せん断余裕度）は
+> 詳細・未実装項目（靭性指針式 Vu・柱 Mu の ACI 規準・CFT の N-M 相互作用・二軸せん断余裕度）は
 > `docs/v_and_v/終局検定_RESP-D照合.md`。
 
 ## 1 次参照: 手計算／理論解

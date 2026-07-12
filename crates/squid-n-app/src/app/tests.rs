@@ -2358,3 +2358,74 @@ fn test_compute_ultimate_checks_rc_frame() {
     // 付着検定 ON（既定）なので Qbu も算定される。
     assert!(col.qbu > 0.0 && col.bond_margin.is_finite());
 }
+
+/// CFT 柱の軸終局検定を App 経由で算定する。
+#[test]
+fn test_compute_cft_ultimate_checks() {
+    use squid_n_core::dof::Dof6Mask;
+    use squid_n_core::ids::MaterialId;
+    use squid_n_core::model::{
+        ElementData, ElementKind, EndCondition, ForceRegime, LocalAxis, Material, Model, Node,
+    };
+    use squid_n_core::section_shape::SectionShape;
+
+    let cft_shape = SectionShape::CftBox {
+        height: 400.0,
+        width: 400.0,
+        thick: 12.0,
+    };
+    let mut model = Model {
+        nodes: vec![
+            Node {
+                id: NodeId(0),
+                coord: [0.0, 0.0, 0.0],
+                restraint: Dof6Mask::FIXED,
+                mass: None,
+                story: None,
+            },
+            Node {
+                id: NodeId(1),
+                coord: [0.0, 0.0, 3000.0],
+                restraint: Dof6Mask::FREE,
+                mass: None,
+                story: None,
+            },
+        ],
+        sections: vec![cft_shape.to_section(SectionId(0), "CFT400".into())],
+        materials: vec![Material {
+            concrete_class: Default::default(),
+            id: MaterialId(0),
+            name: "BCR295".into(),
+            young: 205000.0,
+            poisson: 0.3,
+            density: 7.85e-9,
+            shear: None,
+            fc: Some(30.0),
+            fy: None,
+        }],
+        ..Default::default()
+    };
+    model.elements.push(ElementData {
+        id: ElemId(0),
+        kind: ElementKind::Beam,
+        nodes: [NodeId(0), NodeId(1)].into_iter().collect(),
+        section: Some(SectionId(0)),
+        material: Some(MaterialId(0)),
+        local_axis: LocalAxis {
+            ref_vector: [1.0, 0.0, 0.0],
+        },
+        end_cond: [EndCondition::Fixed, EndCondition::Fixed],
+        force_regime: ForceRegime::Auto,
+        rigid_zone: Default::default(),
+        plastic_zone: None,
+        spring: None,
+    });
+
+    let mut app = App::default();
+    app.load_model(model);
+    let checks = app
+        .compute_cft_ultimate_checks()
+        .expect("CFT 柱があれば Ok のはず");
+    assert_eq!(checks.len(), 1);
+    assert!(checks[0].ncu > 0.0 && checks[0].ntu > 0.0);
+}

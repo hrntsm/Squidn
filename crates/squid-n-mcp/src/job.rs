@@ -659,6 +659,8 @@ fn compute_ultimate_check_job(model: &Model, load_case: Option<u32>) -> Result<J
 
     let opts = squid_n_design_jp::ultimate::UltimateShearOptions::default();
     let checks = squid_n_design_jp::ultimate::collect_rc_ultimate_checks(model, &axial, &opts);
+    // CFT 柱の軸終局検定も同時に算定する。
+    let cft_checks = squid_n_design_jp::ultimate::collect_cft_ultimate_checks(model, &axial);
 
     let n_checks = checks.len();
     let n_ng = checks.iter().filter(|c| !c.ok).count();
@@ -684,6 +686,21 @@ fn compute_ultimate_check_job(model: &Model, load_case: Option<u32>) -> Result<J
         })
         .collect();
 
+    let cft_members: Vec<serde_json::Value> = cft_checks
+        .iter()
+        .map(|c| {
+            serde_json::json!({
+                "elem": c.elem.0,
+                "class": format!("{:?}", c.class),
+                "ncu": c.ncu,
+                "ntu": c.ntu,
+                "n_design": c.n_design,
+                "axial_margin": c.axial_margin,
+                "ok": c.ok,
+            })
+        })
+        .collect();
+
     let summary = serde_json::json!({
         "kind": "UltimateCheck",
         "case": lc_id,
@@ -691,6 +708,9 @@ fn compute_ultimate_check_job(model: &Model, load_case: Option<u32>) -> Result<J
         "n_ng": n_ng,
         "min_shear_margin": if min_shear_margin.is_finite() { serde_json::json!(min_shear_margin) } else { serde_json::Value::Null },
         "members": members,
+        "n_cft_checks": cft_checks.len(),
+        "n_cft_ng": cft_checks.iter().filter(|c| !c.ok).count(),
+        "cft_members": cft_members,
     });
     Ok(JobOutcome::UltimateCheck { summary })
 }

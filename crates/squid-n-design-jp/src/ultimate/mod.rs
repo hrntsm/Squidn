@@ -30,10 +30,15 @@ use squid_n_core::model::{ElementData, Material, Model, Section};
 use squid_n_core::rc_capacity::{rc_column_mu_simple, rc_mu_simple, RcCapacityInput};
 use squid_n_core::section_shape::{BarSet, RcRebar, SectionShape};
 
+pub mod cft;
 pub mod joint;
 pub mod rc_axial;
 pub mod rc_shear;
 
+pub use cft::{
+    cft_axial_ultimate, cft_column_class, cft_concrete_buckling_stress, CftAxialInput,
+    CftAxialUltimate, CftColumnClass,
+};
 pub use joint::{
     joint_fj, joint_kappa, rc_joint_ultimate, RcJointUltimateInput, RcJointUltimateResult,
 };
@@ -350,6 +355,160 @@ pub fn collect_rc_ultimate_checks(
         if let Some(check) = check_member(elem, sec, mat, model, n_axial, opts) {
             out.push(check);
         }
+    }
+    out
+}
+
+// ============================================================================
+// CFT 柱の軸終局耐力（RESP-D「06 終局検定」CFT）
+// ============================================================================
+
+/// 1 CFT 柱の軸終局検定結果。
+#[derive(Clone, Debug)]
+pub struct CftUltimateCheck {
+    /// 部材 ID。
+    pub elem: ElemId,
+    /// 柱分類（短柱/中柱/長柱）。
+    pub class: CftColumnClass,
+    /// 軸圧縮終局耐力 Ncu [N]。
+    pub ncu: f64,
+    /// 軸引張終局耐力 Ntu [N]。
+    pub ntu: f64,
+    /// 設計軸力 [N]（圧縮正）。
+    pub n_design: f64,
+    /// 軸余裕度（圧縮 Ncu/N、引張 Ntu/|N|。N=0 は `f64::INFINITY`）。
+    pub axial_margin: f64,
+    /// 判定（軸余裕度 ≥ 1.0 で true）。
+    pub ok: bool,
+    /// 詳細（表示用）。
+    pub detail: String,
+}
+
+/// CFT 断面（角型/円形）の (円形か, 断面せい D, cA, sA, cI(弱軸), sI(弱軸)) を返す。
+fn cft_section_props(shape: &SectionShape) -> Option<(bool, f64, f64, f64, f64, f64)> {
+    match *shape {
+        SectionShape::CftBox {
+            height,
+            width,
+            thick,
+        } => {
+            let ch = (height - 2.0 * thick).max(0.0);
+            let cw = (width - 2.0 * thick).max(0.0);
+            let s_area = shape.calc_area();
+            let c_area = ch * cw;
+            // 弱軸（せい/幅の小さい方まわり）の断面二次モーメントを座屈用に採用。
+            let s_inertia = shape.calc_iy().min(shape.calc_iz());
+            let c_iy = cw * ch.powi(3) / 12.0;
+            let c_iz = ch * cw.powi(3) / 12.0;
+            let c_inertia = c_iy.min(c_iz);
+            let d = height.min(width); // 弱軸方向のせい
+            Some((false, d, c_area, s_area, c_inertia, s_inertia))
+        }
+        SectionShape::CftPipe { outer_dia, thick } => {
+            let di = (outer_dia - 2.0 * thick).max(0.0);
+            let s_area = shape.calc_area();
+            let c_area = std::f64::consts::PI * di * di / 4.0;
+            let s_inertia = shape.calc_iy();
+            let c_inertia = std::f64::consts::PI * di.powi(4) / 64.0;
+            Some((true, outer_dia, c_area, s_area, c_inertia, s_inertia))
+        }
+        _ => None,
+    }
+}
+
+/// モデルの CFT 柱（`CftBox`/`CftPipe`）について軸終局検定を一括実行する
+/// （RESP-D「06 終局検定」CFT）。
+///
+/// - `axial_by_elem`: 設計軸力 [N]（**圧縮正**）。無ければ軸力 0（安全側）。
+/// - 座屈長さ lk は部材の幾何長（K=1 相当）を用いる。鋼管の降伏強さ Fy は
+///   材料名の板厚区分から解決した F 値（解決できなければ 235）、ヤング係数は
+///   205000 N/mm²（鋼）を用いる。Fc は材料の `fc`（未設定はスキップ）。
+pub fn collect_cft_ultimate_checks(
+    model: &Model,
+    axial_by_elem: &[(ElemId, f64)],
+) -> Vec<CftUltimateCheck> {
+    let mut out = Vec::new();
+    for elem in &model.elements {
+        let Some(sec) = elem.section.and_then(|sid| model.sections.get(sid.index())) else {
+            continue;
+        };
+        let Some(mat) = elem
+            .material
+            .and_then(|mid| model.materials.get(mid.index()))
+        else {
+            continue;
+        };
+        let Some(shape) = sec.shape.as_ref() else {
+            continue;
+        };
+        let Some((circular, d_section, c_area, s_area, c_inertia, s_inertia)) =
+            cft_section_props(shape)
+        else {
+            continue;
+        };
+        let Some(fc) = mat.fc.filter(|v| *v > 0.0) else {
+            continue;
+        };
+        let thick = match *shape {
+            SectionShape::CftBox { thick, .. } | SectionShape::CftPipe { thick, .. } => thick,
+            _ => 0.0,
+        };
+        let fy = crate::material_strength::steel_f_value_prefix(&mat.name, thick).unwrap_or(235.0);
+        let lk = geometric_length(elem, model);
+
+        let inp = cft::CftAxialInput {
+            circular,
+            d_section,
+            c_area,
+            s_area,
+            c_inertia,
+            s_inertia,
+            fc,
+            fy,
+            s_young: 205000.0,
+            lk,
+        };
+        let r = cft_axial_ultimate(&inp);
+        let n_design = axial_by_elem
+            .iter()
+            .find(|(id, _)| *id == elem.id)
+            .map(|(_, n)| *n)
+            .unwrap_or(0.0);
+        let axial_margin = if n_design > 0.0 {
+            if r.ncu > 0.0 {
+                r.ncu / n_design
+            } else {
+                0.0
+            }
+        } else if n_design < 0.0 {
+            if r.ntu > 0.0 {
+                r.ntu / (-n_design)
+            } else {
+                0.0
+            }
+        } else {
+            f64::INFINITY
+        };
+        let class_label = match r.class {
+            CftColumnClass::Short => "短柱",
+            CftColumnClass::Medium => "中柱",
+            CftColumnClass::Long => "長柱",
+        };
+        let detail = format!(
+            "分類={class_label}, Ncu={:.0} N, Ntu={:.0} N, N={:.0} N, lk={:.0} mm, \
+             cA={:.0} mm², sA={:.0} mm², Fc={:.1}, Fy={:.1}, 軸余裕度={:.3}",
+            r.ncu, r.ntu, n_design, lk, c_area, s_area, fc, fy, axial_margin
+        );
+        out.push(CftUltimateCheck {
+            elem: elem.id,
+            class: r.class,
+            ncu: r.ncu,
+            ntu: r.ntu,
+            n_design,
+            axial_margin,
+            ok: axial_margin >= 1.0,
+            detail,
+        });
     }
     out
 }
