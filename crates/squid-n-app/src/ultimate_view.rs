@@ -65,6 +65,18 @@ pub fn ultimate_table(ui: &mut egui::Ui, app: &mut App) {
         ui.checkbox(&mut app.ultimate_include_bond, "付着割裂 Qbu を検定");
     });
     ui.horizontal(|ui| {
+        ui.label("終局せん断強度:");
+        ui.selectable_value(&mut app.ultimate_shear_ductility, false, "塑性理論式(Qsu)")
+            .on_hover_text(
+                "藤井・森田式系の塑性理論式（終局強度型設計指針）で終局せん断強度を算定します。",
+            );
+        ui.selectable_value(&mut app.ultimate_shear_ductility, true, "靭性指針式(Vu)")
+            .on_hover_text(
+                "AIJ「靭性保証型耐震設計指針」6.4 の Vu=min(Vu1,Vu2,Vu3)（トラス＋アーチ機構）\
+                 で終局せん断信頼強度を算定します。Qsu 列に Vu を表示します。",
+            );
+    });
+    ui.horizontal(|ui| {
         ui.label("柱 Mu 算定:");
         ui.selectable_value(&mut app.ultimate_mu_aci, false, "構造規定式(at式)");
         ui.selectable_value(&mut app.ultimate_mu_aci, true, "ACI規準(平面保持)")
@@ -104,6 +116,12 @@ pub fn ultimate_table(ui: &mut egui::Ui, app: &mut App) {
             ui.add_space(4.0);
 
             let bond = app.ultimate_include_bond;
+            // 終局せん断強度の列見出し（靭性指針式は Vu 表記）。
+            let (qsu_hdr, ratio_hdr) = if app.ultimate_shear_ductility {
+                ("Vu[kN]", "Vu/Qmu")
+            } else {
+                ("Qsu[kN]", "Qsu/Qmu")
+            };
             TableBuilder::new(ui)
                 .id_salt("ultimate_checks")
                 .striped(true)
@@ -122,8 +140,8 @@ pub fn ultimate_table(ui: &mut egui::Ui, app: &mut App) {
                         "種別",
                         "Mu[kN·m]",
                         "Qmu[kN]",
-                        "Qsu[kN]",
-                        "Qsu/Qmu",
+                        qsu_hdr,
+                        ratio_hdr,
                         "Qbu[kN]",
                         "Qbu/Qmu",
                         "判定",
@@ -185,11 +203,18 @@ pub fn ultimate_table(ui: &mut egui::Ui, app: &mut App) {
                 });
 
             ui.add_space(4.0);
+            let shear_note = if app.ultimate_shear_ductility {
+                "Vu=靭性指針式の終局せん断信頼強度 min(Vu1,Vu2,Vu3)（トラス＋アーチ機構）"
+            } else {
+                "Qsu=塑性理論式の終局せん断強度"
+            };
             ui.colored_label(
                 crate::theme::GRAY_600,
-                "Qmu=上限強度倍率·2·Mu/内法（両端ヒンジ）、Qsu=塑性理論式の終局せん断強度、\
-                 Qbu=付着割裂耐力。余裕度<1.0（赤）はせん断・付着が曲げ降伏に先行することを示す。\
-                 対象は RcRect の RC 矩形部材（強軸）。柱の Mu は長期軸力を考慮。",
+                format!(
+                    "Qmu=上限強度倍率·2·Mu/内法（両端ヒンジ）、{shear_note}、\
+                     Qbu=付着割裂耐力。余裕度<1.0（赤）はせん断・付着が曲げ降伏に先行することを示す。\
+                     対象は RcRect の RC 矩形部材（強軸）。柱の Mu は長期軸力を考慮。"
+                ),
             );
         }
     }

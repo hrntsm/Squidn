@@ -312,6 +312,37 @@ fn test_ultimate_check_mu_method_aci() {
     assert!(ratio > 0.4 && ratio < 2.5, "Mu(ACI)/Mu(at)={ratio}");
 }
 
+/// 終局せん断強度に靭性指針式 Vu を選択するオプションが機能する。
+#[test]
+fn test_ultimate_check_shear_method_ductility() {
+    let model = column_and_beam_model();
+    let plastic = collect_rc_ultimate_checks(&model, &[], &UltimateShearOptions::default());
+    let ductility = collect_rc_ultimate_checks(
+        &model,
+        &[],
+        &UltimateShearOptions {
+            shear_method: ShearMethod::Ductility,
+            ..Default::default()
+        },
+    );
+    // 両手法とも柱・梁の Qsu/Vu は正値（別定式なので値は一般に異なる）。
+    for c in &plastic {
+        assert!(c.qsu > 0.0, "塑性 Qsu>0: elem={:?}", c.elem);
+    }
+    let col_p = plastic.iter().find(|c| c.elem == ElemId(0)).unwrap();
+    let col_d = ductility.iter().find(|c| c.elem == ElemId(0)).unwrap();
+    assert!(col_d.qsu > 0.0, "靭性 Vu>0");
+    assert!(
+        (col_p.qsu - col_d.qsu).abs() > 1e-3,
+        "塑性 Qsu={} と靭性 Vu={} は一般に異なるはず",
+        col_p.qsu,
+        col_d.qsu
+    );
+    // basis 文字列に選択した式名が反映される。
+    assert!(col_d.basis.contains("靭性指針式"), "basis={}", col_d.basis);
+    assert!(col_p.basis.contains("塑性理論式"), "basis={}", col_p.basis);
+}
+
 /// CFT 角形柱 1 本のモデルで軸終局検定ドライバが Ncu/Ntu・軸余裕度を算定する。
 #[test]
 fn test_collect_cft_ultimate_checks() {

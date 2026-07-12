@@ -22,7 +22,8 @@
 //!   別途（本モジュールの RC 経路の対象外）。CFT 柱の軸終局耐力は [`cft`]、柱梁接合部の
 //!   終局耐力は [`joint`] を参照。
 //! - せん断・付着は強軸（せい方向主筋 main_x）を基本とし、柱は指定により 2 軸せん断
-//!   （[`biaxial_margin`]）も検定できる。靭性指針式 Vu は今後の課題。
+//!   （[`biaxial_margin`]）も検定できる。終局せん断強度は [`ShearMethod`] により
+//!   塑性理論式（[`rc_shear`]）または靭性指針式 Vu（[`rc_shear_ductility`]）を選択できる。
 //! - 主筋は上下対称配筋を仮定し、引張側主筋量は main_x の総断面積の半分とする。
 
 use crate::MemberKind;
@@ -37,6 +38,7 @@ pub mod joint;
 pub mod rc_axial;
 pub mod rc_column_aci;
 pub mod rc_shear;
+pub mod rc_shear_ductility;
 
 pub use cft::{
     cft_axial_ultimate, cft_column_class, cft_concrete_buckling_axial,
@@ -55,6 +57,10 @@ pub use rc_shear::{
     bond_reliable_strength_deformed, bond_split_ratio, plastic_cot_phi, plastic_k1, plastic_k2,
     plastic_nu, plastic_nu0, rc_shear_qbu_bond, rc_shear_qsu_plastic, BondStrengthInput,
     RcBondSplitInput, RcPlasticShearInput,
+};
+pub use rc_shear_ductility::{
+    arch_tan_theta, ductility_mu, ductility_nu, rc_shear_vu_ductility, truss_lambda,
+    RcDuctilityShearInput,
 };
 
 /// 部材の設計用需要（終局検定の入力）。**圧縮を正**とする軸力と、強軸・弱軸まわりの
@@ -90,6 +96,16 @@ pub enum MuMethod {
     Aci,
 }
 
+/// 終局せん断強度の算定方法（RESP-D「06 終局検定」の「終局耐力条件」選択に対応）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum ShearMethod {
+    /// 塑性理論式（藤井・森田式系、「終局強度型設計指針」）。既定。
+    #[default]
+    Plastic,
+    /// 靭性指針式 Vu=min(Vu1,Vu2,Vu3)（AIJ「靭性保証型耐震設計指針」6.4）。
+    Ductility,
+}
+
 /// 終局検定（塑性理論式）の算定オプション。
 #[derive(Clone, Copy, Debug)]
 pub struct UltimateShearOptions {
@@ -106,6 +122,9 @@ pub struct UltimateShearOptions {
     pub include_bond: bool,
     /// 柱の曲げ終局強度 Mu の算定方法（既定 at 式）。
     pub mu_method: MuMethod,
+    /// 終局せん断強度の算定方法（既定 塑性理論式）。靭性指針式を選ぶと Qsu 列に
+    /// Vu=min(Vu1,Vu2,Vu3)（[`rc_shear_ductility`]）を用いる。
+    pub shear_method: ShearMethod,
     /// 柱のせん断を 2 軸せん断として検定する場合 true（RESP-D「06 終局検定」
     /// 採用応力：RC のみ指定により 2 軸せん断）。両軸の Qmu/Qsu を相互作用式
     /// `1/((Qmx/Qux)^αx+(Qmy/Quy)^αy)^(1/α)`（RC は α=2.0）で合成する。
@@ -126,6 +145,7 @@ impl Default for UltimateShearOptions {
             sigma_wy: 295.0,
             include_bond: true,
             mu_method: MuMethod::default(),
+            shear_method: ShearMethod::default(),
             biaxial_shear: false,
             biaxial_bending: false,
         }
@@ -279,17 +299,7 @@ fn column_axis_shear(
     let jt = 7.0 * d_eff / 8.0;
     let at = bar_set_area(main) / 2.0;
     let pw = hoop_pw(rebar, b_dir);
-    let qsu = rc_shear_qsu_plastic(&RcPlasticShearInput {
-        b: b_dir,
-        d_full: d_dir,
-        jt,
-        pw,
-        sigma_wy: opts.sigma_wy,
-        l_clear,
-        fc,
-        rp: opts.rp,
-        lightweight: opts.lightweight,
-    });
+    let qsu = member_shear_strength(b_dir, d_dir, jt, pw, rebar, fc, n_axial, l_clear, opts);
     let cap = RcCapacityInput {
         b: b_dir,
         d: d_dir,
@@ -358,6 +368,81 @@ fn column_mu(
     }
 }
 
+/// 靭性指針式による終局せん断信頼強度 `Vu` [N]（[`rc_shear_ductility`]）を断面諸元から
+/// 算定する。`b_dir`=幅, `d_dir`=せい, `je`=トラス機構有効せい（`jt` を用いる）。
+///
+/// # 簡略化（doc 兼申し送り）
+/// マニュアルの `be`（トラス機構有効幅＝外側横補強筋の芯々間隔）・`Ns`（中子筋本数）は
+/// モデルに直接保持されないため、以下で近似する:
+/// - `be = 幅 − 2·(かぶり + 補強筋径/2)`（せん断補強筋のコア芯々幅）。
+/// - `pwe = aw/(be·s)`（`aw`＝1 組の補強筋断面積、`s`＝ピッチ）。
+/// - `Ns = legs/2 − 1`（2 本脚→Ns=0、4 本脚→Ns=1、…）。
+/// - 引張軸力（`n_axial < 0`）の柱は `tanθ=0`（アーチ機構無効）。
+#[allow(clippy::too_many_arguments)]
+fn member_vu_ductility(
+    b_dir: f64,
+    d_dir: f64,
+    je: f64,
+    rebar: &RcRebar,
+    fc: f64,
+    n_axial: f64,
+    l_clear: f64,
+    opts: &UltimateShearOptions,
+) -> f64 {
+    let s = rebar.shear.pitch;
+    let aw =
+        rebar.shear.legs as f64 * std::f64::consts::PI / 4.0 * rebar.shear.dia * rebar.shear.dia;
+    let be = (b_dir - 2.0 * (rebar.cover + rebar.shear.dia / 2.0)).max(1.0);
+    let pwe = if s > 0.0 { aw / (be * s) } else { 0.0 };
+    let n_s = (rebar.shear.legs / 2).saturating_sub(1);
+    rc_shear_vu_ductility(&RcDuctilityShearInput {
+        b: b_dir,
+        d_full: d_dir,
+        be,
+        je,
+        pwe,
+        sigma_wy: opts.sigma_wy,
+        s,
+        n_s,
+        l_clear,
+        fc,
+        rp: opts.rp,
+        tensile_axial: n_axial < 0.0,
+        lightweight: opts.lightweight,
+    })
+}
+
+/// 選択された [`ShearMethod`] に応じた終局せん断強度 `Qsu`/`Vu` [N]。
+#[allow(clippy::too_many_arguments)]
+fn member_shear_strength(
+    b_dir: f64,
+    d_dir: f64,
+    jt: f64,
+    pw: f64,
+    rebar: &RcRebar,
+    fc: f64,
+    n_axial: f64,
+    l_clear: f64,
+    opts: &UltimateShearOptions,
+) -> f64 {
+    match opts.shear_method {
+        ShearMethod::Plastic => rc_shear_qsu_plastic(&RcPlasticShearInput {
+            b: b_dir,
+            d_full: d_dir,
+            jt,
+            pw,
+            sigma_wy: opts.sigma_wy,
+            l_clear,
+            fc,
+            rp: opts.rp,
+            lightweight: opts.lightweight,
+        }),
+        ShearMethod::Ductility => {
+            member_vu_ductility(b_dir, d_dir, jt, rebar, fc, n_axial, l_clear, opts)
+        }
+    }
+}
+
 /// 1 部材の終局検定を実行する（`RcRect` 以外・Fc 未設定は `None`）。
 fn check_member(
     elem: &ElementData,
@@ -416,18 +501,8 @@ fn check_member(
         0.0
     };
 
-    // 終局せん断強度 Qsu（塑性理論式）。
-    let qsu = rc_shear_qsu_plastic(&RcPlasticShearInput {
-        b,
-        d_full: d,
-        jt,
-        pw,
-        sigma_wy: opts.sigma_wy,
-        l_clear,
-        fc,
-        rp: opts.rp,
-        lightweight: opts.lightweight,
-    });
+    // 終局せん断強度 Qsu（塑性理論式）または Vu（靭性指針式）。
+    let qsu = member_shear_strength(b, d, jt, pw, rebar, fc, n_axial, l_clear, opts);
 
     // 付着割裂耐力 Qbu。
     let (qbu, tau_bu) = if opts.include_bond {
@@ -540,9 +615,13 @@ fn check_member(
     let bending_ok = biaxial_bending_margin.map(|m| m >= 1.0).unwrap_or(true);
     let ok = effective_shear_ok && bond_margin >= 1.0 && bending_ok;
 
+    let shear_label = match opts.shear_method {
+        ShearMethod::Plastic => "塑性理論式 Qsu",
+        ShearMethod::Ductility => "靭性指針式 Vu",
+    };
     let basis = match kind {
-        MemberKind::Column => "RC柱 終局検定（塑性理論式 Qsu/Qbu）".to_string(),
-        _ => "RC梁 終局検定（塑性理論式 Qsu/Qbu）".to_string(),
+        MemberKind::Column => format!("RC柱 終局検定（{shear_label}/Qbu）"),
+        _ => format!("RC梁 終局検定（{shear_label}/Qbu）"),
     };
     let biaxial_str = match biaxial_shear_margin {
         Some(m) => format!(", 2軸せん断余裕度={m:.3}"),

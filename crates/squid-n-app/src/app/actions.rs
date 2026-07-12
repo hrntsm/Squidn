@@ -475,6 +475,11 @@ impl App {
             } else {
                 squid_n_design_jp::ultimate::MuMethod::AtFormula
             },
+            shear_method: if self.ultimate_shear_ductility {
+                squid_n_design_jp::ultimate::ShearMethod::Ductility
+            } else {
+                squid_n_design_jp::ultimate::ShearMethod::Plastic
+            },
             biaxial_shear: self.ultimate_biaxial_shear,
             biaxial_bending: self.ultimate_biaxial_bending,
         };
