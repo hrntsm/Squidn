@@ -572,6 +572,69 @@ pub fn collect_joint_checks_with_long(
                 beam_span,
             };
             out.push((nid, "接合部(RC)".to_string(), rc_joint_shear_check(&inp)));
+
+            // ── RC 柱梁接合部の終局検定（RESP-D「06 終局検定」Vju/Qdu）───────
+            // 接合部有効幅 bj = bb + 2·bai（許容応力度検定と同じ算定、bai=max(bi/2,D/4)）。
+            let bi = (col.sec.width - beam0.sec.width) / 2.0;
+            let bai = (bi / 2.0).max(col.sec.depth / 4.0).max(0.0);
+            let bj = beam0.sec.width + 2.0 * bai;
+            // 上端・下端鉄筋引張力 T・T′。梁の main_x（せい方向主筋）を上下対称配筋
+            // と仮定し、片側（総断面積の半分）が降伏引張力を負担するとみなす。
+            // スラブ筋の寄与は本配線では未加算（モデルに接合部位置のスラブ筋情報が
+            // 無いため。RESP-D は T にスラブ筋を含むため Qdu を安全側に過小評価しうる）。
+            let (t_top, t_bottom) =
+                if let Some(SectionShape::RcRect { rebar, .. }) = &beam0.sec.shape {
+                    let half_area = squid_n_core::section_shape::bar_set_area(&rebar.main_x) / 2.0;
+                    let sigma_y = crate::material_strength::rebar_sigma_y(beam0.mat);
+                    (half_area * sigma_y, half_area * sigma_y)
+                } else {
+                    (0.0, 0.0)
+                };
+            // 上下柱の存在せん断力の平均 Qcu（存在応力の場合）。
+            let col_shears: Vec<f64> = cols
+                .iter()
+                .filter_map(|c| c.end_forces(nid))
+                .map(|f| f[1].abs().max(f[2].abs()))
+                .collect();
+            let qcu = if col_shears.is_empty() {
+                0.0
+            } else {
+                col_shears.iter().sum::<f64>() / col_shears.len() as f64
+            };
+            // 直交梁の有無による補正係数 φ（両側直交梁付き=1.0、上記外=0.85）。
+            // 節点に取り付く水平梁が 4 本以上（2 方向×両側）なら両側直交梁付きと
+            // みなす簡略判定とする。
+            let phi = if beams.len() >= 4 { 1.0 } else { 0.85 };
+            let u = crate::ultimate::rc_joint_ultimate(&crate::ultimate::RcJointUltimateInput {
+                shape,
+                phi,
+                fc: col.mat.fc.unwrap_or(0.0),
+                bj,
+                dj: col.sec.depth,
+                t_top,
+                t_bottom,
+                qcu,
+                alpha: 1.0,
+            });
+            let ratio = if u.vju > 0.0 {
+                u.qdu / u.vju
+            } else {
+                f64::INFINITY
+            };
+            out.push((
+                nid,
+                "接合部終局(RC)".to_string(),
+                CheckResult {
+                    ratio,
+                    ok: ratio <= 1.0,
+                    basis: "RESP-D 06 終局検定 接合部(Vju=κ·φ·Fj·bj·Dj)".to_string(),
+                    detail: format!(
+                        "κ={:.2}, φ={:.2}, Fj={:.3} N/mm², bj={:.1} mm, Dj={:.1} mm, \
+                         Vju={:.1} N, T={:.1} N, T′={:.1} N, Qcu={:.1} N, Qdu={:.1} N, 余裕率={:.3}",
+                        u.kappa, phi, u.fj, bj, col.sec.depth, u.vju, t_top, t_bottom, qcu, u.qdu, u.margin
+                    ),
+                },
+            ));
         }
 
         // ── S 造パネルゾーン ─────────────────────────────────────

@@ -101,9 +101,11 @@
 > #26: RESP-D「06 終局検定」照合で、これまで荒川mean式（`rc_qsu_simple`）しか無かった
 > RC 部材の終局せん断強度に、「終局強度型設計指針」の**塑性理論式**
 > （`Qsu = b·jt·pw·σwy·cotφ + k1·(1−k2)·b·D·ν·Fc`、トラス＋アーチ機構）と**付着割裂耐力 Qbu**、
-> 柱の**軸終局耐力 Nuc/Nut** を新規実装。部材別のせん断/付着/軸余裕度（Qsu/Qmu 等）を算定する
-> ドライバ `collect_rc_ultimate_checks` と、設計タブ「終局検定」ビュー（`ultimate_view.rs`）へ配線した。
-> 詳細・未実装項目（靭性指針式 Vu・柱 Mu の ACI 規準・接合部終局 Vju/Qdu・CFT 終局・二軸せん断余裕度）は
+> 柱の**軸終局耐力 Nuc/Nut**、**RC 柱梁接合部の終局耐力 Vju/Qdu**（`Vju=κ·φ·Fj·bj·Dj`）を
+> 新規実装。部材別のせん断/付着/軸余裕度（Qsu/Qmu 等）を算定するドライバ
+> `collect_rc_ultimate_checks` と設計タブ「終局検定」ビュー（`ultimate_view.rs`）、接合部終局は
+> `joint_wiring` 経由で既存の接合部検定表・MCP へ配線した。
+> 詳細・未実装項目（靭性指針式 Vu・柱 Mu の ACI 規準・CFT 終局・二軸せん断余裕度）は
 > `docs/v_and_v/終局検定_RESP-D照合.md`。
 
 ## 1 次参照: 手計算／理論解

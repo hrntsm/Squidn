@@ -524,3 +524,135 @@ fn wall_with_side_columns_emits_nonlinear_shear_trilinear() {
         "側柱の無い壁はトリリニア対象外"
     );
 }
+
+/// RC 十字形接合部で終局検定（Vju/Qdu）の「接合部終局(RC)」チェックが出力される。
+#[test]
+fn rc_cross_joint_emits_ultimate_check() {
+    use squid_n_core::section_shape::{BarSet, RcRebar, ShearBar};
+
+    let rebar = |count: u32, dia: f64| RcRebar {
+        main_x: BarSet {
+            count,
+            dia,
+            layers: 1,
+        },
+        main_y: BarSet {
+            count,
+            dia,
+            layers: 1,
+        },
+        cover: 40.0,
+        shear: ShearBar {
+            dia: 10.0,
+            pitch: 100.0,
+            legs: 2,
+            grade: None,
+        },
+    };
+    let col_shape = SectionShape::RcRect {
+        b: 600.0,
+        d: 600.0,
+        rebar: rebar(8, 25.0),
+    };
+    let beam_shape = SectionShape::RcRect {
+        b: 400.0,
+        d: 700.0,
+        rebar: rebar(6, 25.0),
+    };
+
+    // 中央節点 0 に上下柱・左右梁が取り付く十字形接合部。
+    let coords = [
+        [0.0, 0.0, 3000.0],     // 0: 中央（接合部）
+        [0.0, 0.0, 0.0],        // 1: 柱下端
+        [0.0, 0.0, 6000.0],     // 2: 柱上端
+        [-6000.0, 0.0, 3000.0], // 3: 梁左端
+        [6000.0, 0.0, 3000.0],  // 4: 梁右端
+    ];
+    let mut nodes = Vec::new();
+    for (i, c) in coords.iter().enumerate() {
+        nodes.push(Node {
+            id: NodeId(i as u32),
+            coord: *c,
+            restraint: if i == 1 {
+                Dof6Mask::FIXED
+            } else {
+                Dof6Mask::FREE
+            },
+            mass: None,
+            story: None,
+        });
+    }
+    let sections = vec![
+        col_shape.to_section(SectionId(0), "C600".into()),
+        beam_shape.to_section(SectionId(1), "B400x700".into()),
+    ];
+    let materials = vec![Material {
+        concrete_class: Default::default(),
+        id: MaterialId(0),
+        name: "SD345".to_string(),
+        young: 23000.0,
+        poisson: 0.2,
+        density: 2.4e-9,
+        shear: None,
+        fc: Some(24.0),
+        fy: Some(345.0),
+    }];
+    let make_elem = |id: u32, sec: u32, n0: u32, n1: u32| ElementData {
+        id: ElemId(id),
+        kind: ElementKind::Beam,
+        nodes: {
+            let mut v: SmallVec<[NodeId; 8]> = SmallVec::new();
+            v.push(NodeId(n0));
+            v.push(NodeId(n1));
+            v
+        },
+        section: Some(SectionId(sec)),
+        material: Some(MaterialId(0)),
+        local_axis: LocalAxis {
+            ref_vector: [1.0, 0.0, 0.0],
+        },
+        end_cond: [EndCondition::Fixed, EndCondition::Fixed],
+        force_regime: ForceRegime::Auto,
+        rigid_zone: RigidZone::default(),
+        plastic_zone: None,
+        spring: None,
+    };
+    let elements = vec![
+        make_elem(0, 0, 1, 0), // 柱下
+        make_elem(1, 0, 0, 2), // 柱上
+        make_elem(2, 1, 3, 0), // 梁左
+        make_elem(3, 1, 0, 4), // 梁右
+    ];
+    let model = Model {
+        nodes,
+        elements,
+        sections,
+        materials,
+        ..Default::default()
+    };
+
+    // 各部材の端部内力（[N,Qy,Qz,Mx,My,Mz]）。柱にせん断、梁にモーメント。
+    let col_f: [(f64, [f64; 6]); 2] = [
+        (0.0, [0.0, 100_000.0, 0.0, 0.0, 0.0, 0.0]),
+        (1.0, [0.0, 100_000.0, 0.0, 0.0, 0.0, 0.0]),
+    ];
+    let beam_f: [(f64, [f64; 6]); 2] = [
+        (0.0, [0.0, 0.0, 0.0, 0.0, 0.0, 2.0e8]),
+        (1.0, [0.0, 0.0, 0.0, 0.0, 0.0, 2.0e8]),
+    ];
+    let member_forces: Vec<(ElemId, ForcesAt)> = vec![
+        (ElemId(0), &col_f),
+        (ElemId(1), &col_f),
+        (ElemId(2), &beam_f),
+        (ElemId(3), &beam_f),
+    ];
+
+    let checks = collect_joint_checks(&model, &member_forces, LoadTerm::Short);
+    let ult = checks
+        .iter()
+        .find(|(_, label, _)| label == "接合部終局(RC)")
+        .expect("十字形 RC 接合部は終局検定が出力されるはず");
+    // Vju/Qdu が有限で、詳細に κ=1.00（十字形）が含まれる。
+    assert!(ult.2.ratio.is_finite());
+    assert!(ult.2.detail.contains("κ=1.00"), "detail={}", ult.2.detail);
+}

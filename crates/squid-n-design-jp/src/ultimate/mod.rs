@@ -30,9 +30,13 @@ use squid_n_core::model::{ElementData, Material, Model, Section};
 use squid_n_core::rc_capacity::{rc_column_mu_simple, rc_mu_simple, RcCapacityInput};
 use squid_n_core::section_shape::{BarSet, RcRebar, SectionShape};
 
+pub mod joint;
 pub mod rc_axial;
 pub mod rc_shear;
 
+pub use joint::{
+    joint_fj, joint_kappa, rc_joint_ultimate, RcJointUltimateInput, RcJointUltimateResult,
+};
 pub use rc_axial::{rc_axial_margin, rc_column_axial_ultimate, RcAxialUltimate};
 pub use rc_shear::{
     bond_reliable_strength_deformed, bond_split_ratio, plastic_cot_phi, plastic_k1, plastic_k2,
