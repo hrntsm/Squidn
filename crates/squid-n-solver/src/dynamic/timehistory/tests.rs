@@ -1259,6 +1259,66 @@ fn test_nonlinear_time_history_sdof_plastic() {
     );
 }
 
+/// 接線剛性比例(α1一定・h1一定)・モード別の減衰が非線形時刻歴で収束し有限応答を返す
+/// ことを確認する（RESP-D「07」減衰マトリクス「剛性変更に伴う減衰項の変更」）。
+#[test]
+fn test_nonlinear_time_history_extended_damping_models_run() {
+    let base = fiber_column_model(100.0);
+    let dofmap0 = DofMap::build(&base);
+    let reducer0 = Reducer::build(&base, &dofmap0);
+    let m_red = reducer0.reduce_k(&assemble_global_m(&base, &dofmap0, MassOption::Consistent));
+    let k_red = reducer0.reduce_k(&assemble_global_k(&base, &dofmap0));
+    let m_val = *m_red.get(0, 0).unwrap_or(&1.0);
+    let omega = (*k_red.get(0, 0).unwrap_or(&0.0) / m_val).sqrt();
+
+    let dt = 0.001;
+    let n_steps = 200;
+    let wave = zero_wave(dt, n_steps);
+    let newmark = NewmarkCfg {
+        beta: 0.25,
+        gamma: 0.5,
+        dt,
+    };
+
+    let dampings = vec![
+        Damping::StiffnessProportional {
+            h: 0.05,
+            omega,
+            basis: StiffnessKind::Tangent,
+        },
+        Damping::TangentStiffnessConstantH {
+            h1: 0.05,
+            omega1e: omega,
+        },
+        Damping::modal(&[vec![1.0 / m_val.sqrt()]], &[omega], &[0.05]),
+    ];
+
+    for damping in &dampings {
+        let mut model = fiber_column_model(100.0);
+        let dofmap = DofMap::build(&model);
+        let reducer = Reducer::build(&model, &dofmap);
+        let result = nonlinear_time_history_analysis(
+            &mut model,
+            &dofmap,
+            &reducer,
+            &wave,
+            &newmark,
+            damping,
+            &[50.0],
+            &[0.0],
+            false,
+            20,
+            1e-6,
+        )
+        .expect("extended damping nonlinear TH should converge");
+        assert!(
+            result.peak_disp[1][0].is_finite() && result.peak_disp[1][0] >= 1.0,
+            "peak={}",
+            result.peak_disp[1][0]
+        );
+    }
+}
+
 /// 不収束時の restore が動作すること（収束失敗時にステップ開始状態に戻る）。
 #[test]
 fn test_nonlinear_time_history_convergence() {

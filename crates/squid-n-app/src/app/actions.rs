@@ -796,6 +796,49 @@ impl App {
                     w2,
                 }
             }
+            ThDampingModel::Modal => {
+                // モード別減衰: 得られる低次モードに一律の減衰比 h を与える。
+                // 要求モード数はモデルの質量ランクに合わせ 6→1 の順に試行する。
+                let mut modal = None;
+                for k in (1..=6).rev() {
+                    if let Ok(m) = analysis.eigen(k) {
+                        if !m.shapes.is_empty() {
+                            modal = Some(m);
+                            break;
+                        }
+                    }
+                }
+                let modal = modal.ok_or("固有値が得られず減衰を設定できません。".to_string())?;
+                let omegas: Vec<f64> = modal
+                    .omega2
+                    .iter()
+                    .map(|&w2| if w2 > 0.0 { w2.sqrt() } else { 0.0 })
+                    .collect();
+                let ratios = vec![cfg.th_damping; modal.shapes.len()];
+                squid_n_solver::damping::Damping::modal(&modal.shapes, &omegas, &ratios)
+            }
+            ThDampingModel::TangentAlpha1 | ThDampingModel::TangentH1 => {
+                // 瞬間（接線）剛性比例。基準は初期剛性の 1 次固有円振動数。
+                let omega1 = match analysis.eigen(1) {
+                    Ok(modal) => match modal.omega2.first() {
+                        Some(&w2) if w2 > 0.0 => w2.sqrt(),
+                        _ => return Err("固有値が得られず減衰を設定できません。".to_string()),
+                    },
+                    Err(e) => return Err(format!("固有値解析エラー: {}", e)),
+                };
+                if cfg.th_damping_model == ThDampingModel::TangentAlpha1 {
+                    squid_n_solver::damping::Damping::StiffnessProportional {
+                        h: cfg.th_damping,
+                        omega: omega1,
+                        basis: squid_n_solver::damping::StiffnessKind::Tangent,
+                    }
+                } else {
+                    squid_n_solver::damping::Damping::TangentStiffnessConstantH {
+                        h1: cfg.th_damping,
+                        omega1e: omega1,
+                    }
+                }
+            }
         };
         let result = match cfg.th_integrator {
             ThIntegrator::NewmarkBeta => {

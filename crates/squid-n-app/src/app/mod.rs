@@ -207,11 +207,19 @@ pub enum ThDir {
     Xy,
 }
 
-/// 時刻歴の減衰モデル選択（UI 用）。
+/// 時刻歴の減衰モデル選択（UI 用）。RESP-D「07 非線形解析（動的解析）」減衰マトリクス。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ThDampingModel {
+    /// 初期剛性比例（C=2h/ω1·Ke）。
     StiffnessProportional,
+    /// Rayleigh 減衰（1次・2次で目標減衰比）。
     Rayleigh,
+    /// モード別減衰（各モードに減衰比 h を与える。非線形では初期剛性モード）。
+    Modal,
+    /// 瞬間（接線）剛性比例・α1 一定（C=2h/ω1e·Kt を毎ステップ再構成）。
+    TangentAlpha1,
+    /// 瞬間（接線）剛性比例・h1 一定（ω1 を毎ステップ更新して減衰比 h1 を保つ）。
+    TangentH1,
 }
 
 /// 時刻歴の積分法選択（UI 用）。

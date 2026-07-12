@@ -892,9 +892,30 @@ impl App {
                     ThDampingModel::Rayleigh,
                     "Rayleigh",
                 );
+                ui.selectable_value(
+                    &mut self.analysis_cfg.th_damping_model,
+                    ThDampingModel::Modal,
+                    "モード別",
+                )
+                .on_hover_text("各モードに減衰比 h を与える（非線形は初期剛性モード）");
+                ui.selectable_value(
+                    &mut self.analysis_cfg.th_damping_model,
+                    ThDampingModel::TangentAlpha1,
+                    "接線(α1一定)",
+                )
+                .on_hover_text("瞬間剛性比例。C=2h/ω1e·Kt を毎ステップ再構成");
+                ui.selectable_value(
+                    &mut self.analysis_cfg.th_damping_model,
+                    ThDampingModel::TangentH1,
+                    "接線(h1一定)",
+                )
+                .on_hover_text("瞬間剛性比例。ω1 を毎ステップ更新し減衰比 h1 を保つ");
                 ui.separator();
                 ui.label(match self.analysis_cfg.th_damping_model {
-                    ThDampingModel::StiffnessProportional => "減衰比 h:",
+                    ThDampingModel::StiffnessProportional
+                    | ThDampingModel::TangentAlpha1
+                    | ThDampingModel::TangentH1 => "減衰比 h:",
+                    ThDampingModel::Modal => "減衰比 h(全モード):",
                     ThDampingModel::Rayleigh => "h1(1次):",
                 });
                 ui.add(

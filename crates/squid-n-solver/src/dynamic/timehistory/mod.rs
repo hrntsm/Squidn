@@ -1308,8 +1308,22 @@ pub fn nonlinear_time_history_analysis(
             let k_t_free = assemble_k(model, dofmap, &behaviors, use_kg, None);
             let k_t_red = reducer.reduce_k(&k_t_free);
 
+            // 接線比例減衰（α1 一定 / h1 一定）は瞬間剛性から C を毎ステップ再構成する
+            // （RESP-D「07」減衰マトリクス「剛性変更に伴う減衰項の変更」）。それ以外は
+            // 初期減衰 c_red を用いる。
+            let c_tan = if damping.is_tangent_based() {
+                let mut u_cur = u.clone();
+                for i in 0..n_indep {
+                    u_cur[i] += du_total[i];
+                }
+                Some(damping.assemble_c_tangent(&m_red, &k_t_red, &k_red, &u_cur))
+            } else {
+                None
+            };
+            let c_cur = c_tan.as_ref().unwrap_or(&c_red);
+
             // 有効剛性
-            let k_eff = weighted_sum_csc(n_indep, &[(1.0, &k_t_red), (c2, &c_red), (c1, &m_red)]);
+            let k_eff = weighted_sum_csc(n_indep, &[(1.0, &k_t_red), (c2, c_cur), (c1, &m_red)]);
 
             let mut solver = make_solver(SolverBackend::DirectSparseCholesky);
             solver
@@ -1321,7 +1335,7 @@ pub fn nonlinear_time_history_analysis(
             let f_int_red = reducer.reduce_f(&f_int_free);
 
             // C·v と M·a（縮約空間）
-            let c_v_red = sparse_matvec(&c_red, &v_trial);
+            let c_v_red = sparse_matvec(c_cur, &v_trial);
             let m_a_red = sparse_matvec(&m_red, &a_trial);
 
             // 残差
