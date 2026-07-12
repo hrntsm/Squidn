@@ -561,7 +561,10 @@ fn check_id_consistency<T>(
     let mut seen = std::collections::HashSet::new();
     for item in items {
         if !seen.insert(index_of(item)) {
-            return Err(CoreError::DuplicateId(format!("{id_name}({})", raw_of(item))));
+            return Err(CoreError::DuplicateId(format!(
+                "{id_name}({})",
+                raw_of(item)
+            )));
         }
     }
     Ok(())

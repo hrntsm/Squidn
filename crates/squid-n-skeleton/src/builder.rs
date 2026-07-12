@@ -78,7 +78,9 @@ pub fn build_rc_member_skeleton(
     );
 
     // イベントから折点を取り出す。検出されなかった場合は推定曲率で補完。
-    let (ky_crack, m_c) = events.crack.unwrap_or((eps_cr / (section.depth / 2.0), 0.0));
+    let (ky_crack, m_c) = events
+        .crack
+        .unwrap_or((eps_cr / (section.depth / 2.0), 0.0));
     let (ky_yield, m_y) = events
         .yield_pt
         .unwrap_or((ky_yield_est, section.iy * e0_conc * ky_yield_est));

@@ -39,7 +39,10 @@ pub(crate) fn solve_dense_column<S: faer::linalg::solvers::Solve<f64>>(
     n: usize,
 ) -> Result<Vec<f64>, SolveError> {
     if rhs.len() != n {
-        return Err(SolveError::DimMismatch { k: n, rhs: rhs.len() });
+        return Err(SolveError::DimMismatch {
+            k: n,
+            rhs: rhs.len(),
+        });
     }
     let b = faer::Mat::from_fn(n, 1, |i, _| rhs[i]);
     let x = factor.solve(b.as_ref());
