@@ -1463,3 +1463,86 @@ fn test_nonlinear_time_history_convergence() {
         "should fail to converge with only 1 iteration"
     );
 }
+
+/// 制振（マクスウェル）ダンパーが自由振動の応答を低減する（RESP-D「07」制振要素）。
+#[test]
+fn test_maxwell_damper_reduces_free_vibration() {
+    use squid_n_core::model::{DamperAttr, DamperKind, DamperProps};
+
+    let run = |with_damper: bool| -> f64 {
+        let mut model = sdof_model(); // node0 固定, node1 自由(UX, m=1), 軸剛性 k=1000
+        if with_damper {
+            let did = ElemId(model.elements.len() as u32);
+            model.elements.push(ElementData {
+                id: did,
+                kind: ElementKind::Damper,
+                nodes: smallvec::smallvec![NodeId(0), NodeId(1)],
+                section: None,
+                material: None,
+                local_axis: LocalAxis {
+                    ref_vector: [0.0, 0.0, 1.0],
+                },
+                end_cond: [EndCondition::Fixed, EndCondition::Fixed],
+                force_regime: ForceRegime::Auto,
+                rigid_zone: Default::default(),
+                plastic_zone: None,
+                spring: None,
+            });
+            model.damper_attrs.push(DamperAttr {
+                elem: did,
+                props: DamperProps {
+                    kind: DamperKind::Maxwell,
+                    kd: 1000.0,
+                    c0: 30.0,
+                    alpha: 1.0,
+                },
+            });
+        }
+        let dofmap = DofMap::build(&model);
+        let reducer = Reducer::build(&model, &dofmap);
+        let omega = (1000.0_f64 / 1.0).sqrt();
+        let damping = Damping::StiffnessProportional {
+            h: 0.001,
+            omega,
+            basis: StiffnessKind::Initial,
+        };
+        let dt = 0.001;
+        let n_steps = 1000;
+        let wave = zero_wave(dt, n_steps);
+        let newmark = NewmarkCfg {
+            beta: 0.25,
+            gamma: 0.5,
+            dt,
+        };
+        let result = nonlinear_time_history_analysis(
+            &mut model,
+            &dofmap,
+            &reducer,
+            &wave,
+            &newmark,
+            &damping,
+            DampingAccumulation::NonCumulative,
+            &[10.0],
+            &[0.0],
+            false,
+            30,
+            1e-8,
+        )
+        .expect("should converge");
+        // 後半区間の応答振幅（自由振動の減衰を測る）。
+        let nd = &result.history.node_disp;
+        let n = nd.len();
+        nd[n * 3 / 4..].iter().fold(0.0f64, |m, &v| m.max(v.abs()))
+    };
+
+    let no_damp = run(false);
+    let with_damp = run(true);
+    assert!(
+        no_damp > 1.0,
+        "undamped late amplitude should be sizeable: {no_damp}"
+    );
+    assert!(
+        with_damp < no_damp * 0.8,
+        "Maxwell damper should reduce late response: no_damp={no_damp}, with_damp={with_damp}"
+    );
+}

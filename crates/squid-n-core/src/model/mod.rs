@@ -45,6 +45,11 @@ pub enum ElementKind {
     /// バイリニア、または摩擦ばね＝弾性すべり支承 Qmax=μN）、鉛直は弾性軸ばね。
     /// 特性は `Model::isolator_attrs` に要素 ID と対で保持する。
     Isolator,
+    /// 制振ダンパー要素（RESP-D「07 非線形解析（動的解析）」制振要素）。
+    /// 2 節点の軸方向要素で、マクスウェル要素（バネ Kd と粘性ダッシュポットの直列）等で
+    /// モデル化する。減衰要素の要素力は節点力として運動方程式へ与えられ、特性は
+    /// `Model::damper_attrs` に要素 ID と対で保持する。
+    Damper,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -503,6 +508,9 @@ pub struct Model {
     /// 未指定の部材は構造種別ごとの既定（[`default_member_hysteresis`]）に従う。
     #[serde(default)]
     pub member_hysteresis_attrs: Vec<MemberHysteresisAttr>,
+    /// 制振ダンパー要素（`ElementKind::Damper`）の特性（RESP-D「07」制振要素）。
+    #[serde(default)]
+    pub damper_attrs: Vec<DamperAttr>,
     /// 一本部材の指定（RESP-D マニュアル 04 断面検定「採用応力 ■一本部材指定時の
     /// 採用応力」）。各エントリは**軸方向に連続する梁要素の ID を並び順**で持ち、
     /// 断面検定の採用応力（端部・中央モーメント、部材長、内法長、せん断スパン比
@@ -692,6 +700,15 @@ impl Model {
             && self.beam_groups == other.beam_groups
             && self.isolator_attrs == other.isolator_attrs
             && self.member_hysteresis_attrs == other.member_hysteresis_attrs
+            && self.damper_attrs == other.damper_attrs
+    }
+
+    /// ダンパー要素の特性を返す（`Model::damper_attrs` から要素 ID で検索）。
+    pub fn damper_props(&self, elem: ElemId) -> Option<DamperProps> {
+        self.damper_attrs
+            .iter()
+            .find(|a| a.elem == elem)
+            .map(|a| a.props)
     }
 
     /// 部材に指定された履歴則を返す（未指定は `None`＝既定に従う）。

@@ -302,6 +302,24 @@ pub fn design_table(ui: &mut egui::Ui, app: &mut App) {
         }
     }
 
+    // ── 制振ダンパーの非線形特性（RESP-D「07 非線形解析（動的解析）」制振要素） ──
+    if !app.model.damper_attrs.is_empty() {
+        ui.add_space(12.0);
+        ui.strong("制振ダンパーの非線形特性");
+        for a in &app.model.damper_attrs {
+            let p = a.props;
+            // 緩和時間 τ=C0/Kd。線形マクスウェルの損失は ωτ≈1 で最大。
+            let tau = if p.kd > 0.0 { p.c0 / p.kd } else { 0.0 };
+            let kind = match p.kind {
+                squid_n_core::model::DamperKind::Maxwell => "マクスウェル",
+            };
+            ui.label(format!(
+                "部材{}: {} Kd={:.0} C0={:.0} α={:.2} ／ 緩和時間 τ={:.3}s（時刻歴で作用）",
+                a.elem.0, kind, p.kd, p.c0, p.alpha, tau
+            ));
+        }
+    }
+
     // ── 非線形解析の材端履歴則（RESP-D 07 非線形解析（動的解析）履歴特性） ──
     ui.add_space(12.0);
     egui::CollapsingHeader::new("非線形解析の材端履歴則（RESP-D 07）")

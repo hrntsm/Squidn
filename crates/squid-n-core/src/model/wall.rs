@@ -306,6 +306,47 @@ pub struct IsolatorAttr {
     pub props: IsolatorProps,
 }
 
+/// 制振ダンパーの種別（RESP-D「07 非線形解析（動的解析）」制振要素）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub enum DamperKind {
+    /// マクスウェル要素（バネ Kd と粘性ダッシュポットの直列）。
+    #[default]
+    Maxwell,
+}
+
+/// 制振ダンパー要素（`ElementKind::Damper`）の特性（RESP-D「07」制振要素）。
+/// マクスウェル要素は、バネ剛性 Kd と粘性ダッシュポット（力 `Fc=C0·sign(V)·|V|^α`）の
+/// 直列でモデル化する。α=1 で線形粘性。
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct DamperProps {
+    /// ダンパー種別。
+    pub kind: DamperKind,
+    /// バネ剛性 Kd [N/mm]。
+    pub kd: f64,
+    /// 粘性係数 C0 [N·(s/mm)^α]。
+    pub c0: f64,
+    /// 速度指数 α（1.0 で線形粘性）。
+    pub alpha: f64,
+}
+
+impl Default for DamperProps {
+    fn default() -> Self {
+        DamperProps {
+            kind: DamperKind::Maxwell,
+            kd: 100_000.0,
+            c0: 1_000.0,
+            alpha: 1.0,
+        }
+    }
+}
+
+/// 制振ダンパーの属性（要素 ID と特性の対、`Model::damper_attrs`）。
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct DamperAttr {
+    pub elem: ElemId,
+    pub props: DamperProps,
+}
+
 /// PCa（プレキャスト）梁の水平接合面検定用属性（RESP-D マニュアル 04）。
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct PcaBeamAttr {

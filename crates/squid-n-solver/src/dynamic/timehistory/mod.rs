@@ -1128,6 +1128,12 @@ pub fn nonlinear_time_history_analysis(
     }
 
     let mut behaviors = build_behaviors(model);
+    // 制振（速度依存）要素へ時間刻みを通知する（RESP-D「07」制振要素）。マクスウェル
+    // 要素はこれで後退 Euler のダッシュポット積分が有効になる。dt<=0 の静的・線形解析
+    // では通知されず不活性のまま。
+    for b in behaviors.iter_mut() {
+        b.set_time_step(dt);
+    }
 
     // 行列組立（縮約空間）
     let m_free = assemble_global_m(model, dofmap, MassOption::Consistent);

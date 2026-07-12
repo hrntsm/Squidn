@@ -224,6 +224,12 @@ pub fn build_behavior(data: &ElementData, model: &Model) -> (Box<dyn ElementBeha
             Box::new(crate::isolator::IsolatorElement::new(data, model)),
             ElemState::default(),
         ),
+        // 制振ダンパー（RESP-D「07」制振要素）。マクスウェル要素。静的・線形解析では
+        // Δt 未設定（=0）のため不活性（力・剛性 0）。時刻歴で set_time_step により活性化。
+        ElementKind::Damper => (
+            Box::new(crate::damper::MaxwellDamperElement::new(data, model)),
+            ElemState::default(),
+        ),
     }
 }
 
