@@ -91,6 +91,116 @@ pub fn src_beam_shear_ultimate_src_standard(inp: &SrcBeamShearInput) -> f64 {
     (rqu + squ).max(0.0)
 }
 
+/// 非充腹 SRC 梁（格子材・ラチス材）のせん断終局強度の算定入力
+/// （荒川mean式系、RESP-D「05 非線形モデル」）。
+#[derive(Clone, Copy, Debug)]
+pub struct SrcNonSolidWebShearInput {
+    /// コンクリート設計基準強度 Fc [N/mm²]。
+    pub fc: f64,
+    /// 梁の有効幅 be [mm]（= ΣAg/D、スラブ断面積を加算した全断面積/全せい）。
+    pub be: f64,
+    /// 全せい D [mm]（応力中心間距離 j = 0.8·D）。
+    pub d_full: f64,
+    /// 有効せい d [mm]（せん断スパン比 M/(Q·d) 用）。
+    pub d_eff: f64,
+    /// 引張鉄筋比 rpt [%]。
+    pub rpt: f64,
+    /// 引張鉄骨比 spt [%]（格子材の pt=rpt+spt に加算。ラチス材は未使用）。
+    pub spt: f64,
+    /// 鉄骨フランジ側面のせん断破壊低減係数 kcs（= 0.5+b'/b、1.0 以下）。
+    pub kcs: f64,
+    /// せん断補強筋比 rpw（小数）。
+    pub rpw: f64,
+    /// せん断補強筋の降伏点強度 rσwy [N/mm²]。
+    pub rw_sigma_y: f64,
+    /// 帯板比 spw（小数。格子材のみ）。
+    pub spw: f64,
+    /// 帯板の降伏点強度 sσwy [N/mm²]（格子材のみ）。
+    pub s_band_sigma_y: f64,
+    /// せん断スパン比 M/(Q·d)（適用範囲 1.0〜3.0 にクランプ）。
+    pub m_over_qd: f64,
+    /// 高強度せん断補強筋を用いる場合 true（κ 0.053→0.068）。
+    pub high_strength_shear_rebar: bool,
+    /// RC 部分の応力中心間距離 rj [mm]（ラチス材のみ）。
+    pub rj: f64,
+    /// ラチス材 1 本の断面積 DA [mm²]（ラチス材のみ）。
+    pub lattice_area: f64,
+    /// ラチス材の降伏点強度 sσy [N/mm²]（ラチス材のみ）。
+    pub lattice_sigma_y: f64,
+    /// ラチス材と材軸のなす角 θ [rad]（ラチス材のみ）。
+    pub lattice_angle: f64,
+    /// 鉄骨部分の全塑性モーメント sM0 [N·mm]（ラチス材の sQu 用）。
+    pub s_m0: f64,
+    /// 内法長さ h0 [mm]（ラチス材の sQu = 2·sM0/h0 用）。
+    pub clear_span: f64,
+}
+
+/// κ（せん断補強筋係数）を返す。
+fn nonweb_kappa(high: bool) -> f64 {
+    if high {
+        0.068
+    } else {
+        0.053
+    }
+}
+
+/// 非充腹 SRC 梁（**格子材**）のせん断終局強度 Qsu [N]（RESP-D 非線形モデル）。
+///
+/// ```text
+/// Qsu = { κ·pt^0.23·kcs·(18+Fc)/(M/(Q·d)+0.12) + 0.85·√(rpw·rσwy)
+///         + (1/2)·√(spw·sσwy) }·be·j
+/// ```
+/// - `pt = rpt + spt` [%]、`j = 0.8·D`、`M/(Q·d)` は 1.0〜3.0 にクランプ、
+///   `kcs ≤ 1.0`、κ=0.053/0.068。
+///
+/// 不正入力（Fc・be・D のいずれかが 0 以下）は 0.0。
+pub fn src_beam_shear_grid(inp: &SrcNonSolidWebShearInput) -> f64 {
+    if inp.fc <= 0.0 || inp.be <= 0.0 || inp.d_full <= 0.0 {
+        return 0.0;
+    }
+    let pt = (inp.rpt + inp.spt).max(0.0);
+    let kcs = inp.kcs.clamp(0.0, 1.0);
+    let ssr = inp.m_over_qd.clamp(1.0, 3.0);
+    let j = 0.8 * inp.d_full;
+    let k = nonweb_kappa(inp.high_strength_shear_rebar);
+    let concrete = k * pt.powf(0.23) * kcs * (18.0 + inp.fc) / (ssr + 0.12);
+    let hoop_r = 0.85 * (inp.rpw * inp.rw_sigma_y).max(0.0).sqrt();
+    let hoop_s = 0.5 * (inp.spw * inp.s_band_sigma_y).max(0.0).sqrt();
+    (concrete + hoop_r + hoop_s) * inp.be * j
+}
+
+/// 非充腹 SRC 梁（**ラチス材**）のせん断終局強度 Qsu [N]（RESP-D 非線形モデル）。
+///
+/// ```text
+/// Qsu = { κ·rpt^0.23·kcs·(18+Fc)/(M/(Q·d)+0.12) + 0.85·√(rpw·rσwy) }·be·rj + sQu
+/// sQu = min( 2·sM0/h0 ,  DA·sσy·sinθ )
+/// ```
+/// - RC 部分は `rpt`（引張鉄筋比 [%]）のみ、`rj`（RC 部応力中心間距離）を用いる。
+/// - `sQu` はラチス鉄骨のせん断寄与（曲げ降伏または引張降伏の小さい方）。
+///
+/// 不正入力（Fc・be・rj のいずれかが 0 以下）は 0.0。
+pub fn src_beam_shear_lattice(inp: &SrcNonSolidWebShearInput) -> f64 {
+    if inp.fc <= 0.0 || inp.be <= 0.0 || inp.rj <= 0.0 {
+        return 0.0;
+    }
+    let kcs = inp.kcs.clamp(0.0, 1.0);
+    let ssr = inp.m_over_qd.clamp(1.0, 3.0);
+    let k = nonweb_kappa(inp.high_strength_shear_rebar);
+    let concrete = k * inp.rpt.max(0.0).powf(0.23) * kcs * (18.0 + inp.fc) / (ssr + 0.12);
+    let hoop_r = 0.85 * (inp.rpw * inp.rw_sigma_y).max(0.0).sqrt();
+    let rc_part = (concrete + hoop_r) * inp.be * inp.rj;
+    // ラチス鉄骨の寄与 sQu。
+    let squ_bending = if inp.clear_span > 0.0 {
+        2.0 * inp.s_m0 / inp.clear_span
+    } else {
+        f64::INFINITY
+    };
+    let squ_tension =
+        inp.lattice_area.max(0.0) * inp.lattice_sigma_y.max(0.0) * inp.lattice_angle.sin().abs();
+    let squ = squ_bending.min(squ_tension).max(0.0);
+    rc_part + squ
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -175,5 +285,85 @@ mod tests {
         bad.fc = 0.0;
         assert_eq!(src_beam_shear_ultimate_tech_standard(&bad), 0.0);
         assert_eq!(src_beam_shear_ultimate_src_standard(&bad), 0.0);
+    }
+
+    fn nonweb_input() -> SrcNonSolidWebShearInput {
+        SrcNonSolidWebShearInput {
+            fc: 24.0,
+            be: 500.0,
+            d_full: 700.0,
+            d_eff: 630.0,
+            rpt: 0.8,
+            spt: 0.5,
+            kcs: 0.8,
+            rpw: 0.004,
+            rw_sigma_y: 295.0,
+            spw: 0.003,
+            s_band_sigma_y: 235.0,
+            m_over_qd: 2.0,
+            high_strength_shear_rebar: false,
+            rj: 560.0,
+            lattice_area: 800.0,
+            lattice_sigma_y: 235.0,
+            lattice_angle: std::f64::consts::FRAC_PI_4,
+            s_m0: 3.0e8,
+            clear_span: 6000.0,
+        }
+    }
+
+    #[test]
+    fn test_src_beam_shear_grid_matches_handcalc() {
+        let inp = nonweb_input();
+        let qu = src_beam_shear_grid(&inp);
+        let pt: f64 = 0.8 + 0.5;
+        let ssr: f64 = 2.0_f64.clamp(1.0, 3.0);
+        let j = 0.8 * 700.0;
+        let concrete = 0.053 * pt.powf(0.23) * 0.8 * (18.0 + 24.0) / (ssr + 0.12);
+        let hoop_r = 0.85 * (0.004_f64 * 295.0).sqrt();
+        let hoop_s = 0.5 * (0.003_f64 * 235.0).sqrt();
+        let hand = (concrete + hoop_r + hoop_s) * 500.0 * j;
+        assert!((qu - hand).abs() < 1e-3, "grid Qu={qu} vs {hand}");
+        assert!(qu > 0.0);
+    }
+
+    #[test]
+    fn test_src_beam_shear_lattice_matches_handcalc() {
+        let inp = nonweb_input();
+        let qu = src_beam_shear_lattice(&inp);
+        let ssr: f64 = 2.0_f64.clamp(1.0, 3.0);
+        let concrete = 0.053 * 0.8_f64.powf(0.23) * 0.8 * (18.0 + 24.0) / (ssr + 0.12);
+        let hoop_r = 0.85 * (0.004_f64 * 295.0).sqrt();
+        let rc_part = (concrete + hoop_r) * 500.0 * 560.0;
+        let squ_bending: f64 = 2.0 * 3.0e8 / 6000.0;
+        let squ_tension: f64 = 800.0 * 235.0 * std::f64::consts::FRAC_PI_4.sin();
+        let squ = squ_bending.min(squ_tension);
+        let hand = rc_part + squ;
+        assert!((qu - hand).abs() < 1e-3, "lattice Qu={qu} vs {hand}");
+        assert!(qu > 0.0);
+    }
+
+    #[test]
+    fn test_src_beam_shear_grid_band_plate_adds() {
+        // 帯板項が正の寄与（spw=0 で Qsu が下がる）。
+        let inp = nonweb_input();
+        let mut no_band = nonweb_input();
+        no_band.spw = 0.0;
+        assert!(src_beam_shear_grid(&inp) > src_beam_shear_grid(&no_band));
+    }
+
+    #[test]
+    fn test_src_beam_shear_nonweb_high_strength_uses_0068() {
+        let mut hi = nonweb_input();
+        hi.high_strength_shear_rebar = true;
+        assert!(src_beam_shear_grid(&hi) > src_beam_shear_grid(&nonweb_input()));
+        assert!(src_beam_shear_lattice(&hi) > src_beam_shear_lattice(&nonweb_input()));
+    }
+
+    #[test]
+    fn test_src_beam_shear_nonweb_invalid_zero() {
+        let mut bad = nonweb_input();
+        bad.fc = 0.0;
+        assert_eq!(src_beam_shear_grid(&bad), 0.0);
+        assert_eq!(src_beam_shear_lattice(&bad), 0.0);
     }
 }

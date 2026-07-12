@@ -322,6 +322,10 @@ pub fn pushover_analysis_recording(
         let (b, _) = build_nonlinear_behavior(elem, model);
         behaviors.push(b);
     }
+    // 静的解析: コンクリート履歴は逆行型（RESP-D「05 非線形モデル」）。
+    for b in behaviors.iter_mut() {
+        b.set_concrete_hysteresis(false);
+    }
 
     // 塑性率（ductility）トラッカー: 各部材の塑性率基点曲率・最大応答曲率を追跡する。
     let ductility_refs = compute_ductility_refs(model);

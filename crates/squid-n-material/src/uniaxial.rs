@@ -37,6 +37,11 @@ pub trait UniaxialMaterial: Send + Sync + Debug {
     fn reference_strain(&self) -> f64 {
         0.0
     }
+
+    /// コンクリート履歴の除荷則を解析種別で切替える（RESP-D「05 非線形モデル」:
+    /// 静的解析は逆行型、動的解析は原点指向型）。`dynamic=true` で原点指向型、
+    /// `false` で逆行型。対応しない材料（鋼材等）は何もしない（既定実装）。
+    fn set_concrete_hysteresis(&mut self, _dynamic: bool) {}
 }
 
 // ──────────────────────────── バイリニア鋼材 ────────────────────────────

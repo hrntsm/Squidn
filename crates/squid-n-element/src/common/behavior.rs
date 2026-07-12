@@ -120,4 +120,8 @@ pub trait ElementBehavior {
     fn ductility_probe(&self) -> Option<DuctilityProbe> {
         None
     }
+    /// コンクリート履歴の除荷則を解析種別で切替える（RESP-D「05 非線形モデル」:
+    /// 静的=逆行型／動的=原点指向型）。`dynamic=true` で原点指向型。
+    /// ファイバー要素がコンクリート材料へ伝播する（既定は何もしない）。
+    fn set_concrete_hysteresis(&mut self, _dynamic: bool) {}
 }

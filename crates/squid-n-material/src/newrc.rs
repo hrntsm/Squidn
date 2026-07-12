@@ -24,6 +24,18 @@ use crate::uniaxial::UniaxialMaterial;
 /// N/mm² → kgf/cm²（1 kgf/cm² = 0.0980665 N/mm²）。
 const NMM2_TO_KGFCM2: f64 = 1.0 / 0.0980665;
 
+/// コンクリート履歴の除荷則（RESP-D「05 非線形モデル」）。
+/// 静的解析は逆行型（包絡線を可逆に辿る）、動的解析は原点指向型（最大経験ひずみ点
+/// から原点への割線で除荷・再載荷）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub enum ConcreteHysteresis {
+    /// 原点指向型（動的解析）。既定。
+    #[default]
+    OriginOriented,
+    /// 逆行型（静的解析）。除荷・再載荷が圧縮包絡線を辿る。
+    Retrace,
+}
+
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 #[allow(dead_code)]
 struct NewRcState {
@@ -50,6 +62,9 @@ pub struct ConcreteNewRc {
     d_coef: f64,
     /// 圧縮強度時ひずみ εc0（正）。
     eps_c0: f64,
+    /// 除荷則（静的=逆行型／動的=原点指向型）。
+    #[serde(default)]
+    hysteresis: ConcreteHysteresis,
     committed: NewRcState,
     trial: NewRcState,
 }
@@ -83,6 +98,7 @@ impl ConcreteNewRc {
             a,
             d_coef,
             eps_c0,
+            hysteresis: ConcreteHysteresis::default(),
             committed: init.clone(),
             trial: init,
         }
@@ -126,11 +142,18 @@ impl UniaxialMaterial for ConcreteNewRc {
         let (stress, tangent, max_comp, max_tens, cracked) = if strain <= 0.0 {
             // 圧縮側
             let mut max_comp = c.max_comp_strain;
-            let (s, t) = if strain < c.max_comp_strain {
+            let (s, t) = if self.hysteresis == ConcreteHysteresis::Retrace {
+                // 逆行型（静的解析）: 除荷・再載荷も圧縮包絡線を可逆に辿る。
+                if strain < max_comp {
+                    max_comp = strain;
+                }
+                self.envelope_compression(strain)
+            } else if strain < c.max_comp_strain {
+                // 原点指向型（動的）: 包絡線上（新最大圧縮ひずみ）。
                 max_comp = strain;
                 self.envelope_compression(strain)
             } else if c.max_comp_strain < 0.0 {
-                // 除荷・再載荷: 最大経験圧縮ひずみ点への原点指向割線。
+                // 原点指向型 除荷・再載荷: 最大経験圧縮ひずみ点への割線。
                 let (sig_m, _) = self.envelope_compression(c.max_comp_strain);
                 let ku = sig_m / c.max_comp_strain;
                 (ku * strain, ku)
@@ -191,6 +214,14 @@ impl UniaxialMaterial for ConcreteNewRc {
 
     fn reference_strain(&self) -> f64 {
         self.eps_c0
+    }
+
+    fn set_concrete_hysteresis(&mut self, dynamic: bool) {
+        self.hysteresis = if dynamic {
+            ConcreteHysteresis::OriginOriented
+        } else {
+            ConcreteHysteresis::Retrace
+        };
     }
 }
 

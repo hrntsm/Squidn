@@ -785,6 +785,14 @@ impl ElementBehavior for FiberBeam {
             jm,
         })
     }
+
+    fn set_concrete_hysteresis(&mut self, dynamic: bool) {
+        for gp in &mut self.gauss_points {
+            for mat in &mut gp.mats {
+                mat.set_concrete_hysteresis(dynamic);
+            }
+        }
+    }
 }
 
 #[cfg(test)]
