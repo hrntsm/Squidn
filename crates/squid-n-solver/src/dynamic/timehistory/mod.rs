@@ -388,7 +388,7 @@ pub fn linear_time_history_with_state(
     let n_init_v = n_indep.min(initial_vel.len());
     v[..n_init_v].copy_from_slice(&initial_vel[..n_init_v]);
 
-    // 初期加速度: M·a_0 = -C·v_0 - K·u_0 - p_red(0)
+    // 初期加速度: M·a_0 = p(0) − C·v_0 − K·u_0（p(0) = −M·r·ẍg(0) は符号込みで構築済み）
     let xg0_x = wave.accel_x.first().copied().unwrap_or(0.0);
     let xg0_y = wave
         .accel_y
@@ -409,7 +409,10 @@ pub fn linear_time_history_with_state(
     let ku0 = sparse_matvec(&k_red, &u);
     let mut rhs_a0 = vec![0.0; n_indep];
     for i in 0..n_indep {
-        rhs_a0[i] = -cv0[i] - ku0[i] - p_red_0[i];
+        // p(0) は −M·r·ẍg として符号込みで構築済みのため、ここでは加算する
+        // （従来は誤って減算しており、外力項の符号が逆＝初期加速度が
+        // +r·ẍg(0) 側に立ち上がっていた。ẍg(0)=0 の波形では影響なし）。
+        rhs_a0[i] = p_red_0[i] - cv0[i] - ku0[i];
     }
     let a = solve_initial_accel(&m_red, &rhs_a0, n_indep)?;
 
@@ -642,7 +645,7 @@ pub fn linear_hht_alpha_analysis(
     let n_init_v = n_indep.min(initial_vel.len());
     v[..n_init_v].copy_from_slice(&initial_vel[..n_init_v]);
 
-    // 初期加速度: Newmark と同じ（M·a_0 = -C·v_0 - K·u_0 - p_0）
+    // 初期加速度: Newmark と同じ（M·a_0 = p(0) − C·v_0 − K·u_0）
     let xg0_x = wave.accel_x.first().copied().unwrap_or(0.0);
     let xg0_y = wave
         .accel_y
@@ -663,7 +666,10 @@ pub fn linear_hht_alpha_analysis(
     let ku0 = sparse_matvec(&k_red, &u);
     let mut rhs_a0 = vec![0.0; n_indep];
     for i in 0..n_indep {
-        rhs_a0[i] = -cv0[i] - ku0[i] - p_red_0[i];
+        // p(0) は −M·r·ẍg として符号込みで構築済みのため、ここでは加算する
+        // （従来は誤って減算しており、外力項の符号が逆＝初期加速度が
+        // +r·ẍg(0) 側に立ち上がっていた。ẍg(0)=0 の波形では影響なし）。
+        rhs_a0[i] = p_red_0[i] - cv0[i] - ku0[i];
     }
     let a = solve_initial_accel(&m_red, &rhs_a0, n_indep)?;
 
@@ -1256,6 +1262,20 @@ pub fn nonlinear_time_history_analysis(
     let mut f_damp = sparse_matvec(&c_red, &v);
     let mut c_v_last = vec![0.0; n_indep];
 
+    // h1 一定減衰の {u} は「初期剛性による1次の固有ベクトル」（時刻歴を通じて固定）。
+    // 現在変位を用いると高次成分・剛体成分が混入し ω1 の推定が乱れる。
+    // 固有値解析が失敗した場合は零ベクトルとし、assemble_c_tangent 側の
+    // フォールバック（ω1 = ω1e）に委ねる。
+    let u_mode1: Vec<f64> = if matches!(damping, Damping::TangentStiffnessConstantH { .. }) {
+        crate::eigen::solve_eigen(model, dofmap, reducer, 1)
+            .ok()
+            .and_then(|modal| modal.shapes.into_iter().next())
+            .filter(|s| s.len() == n_indep)
+            .unwrap_or_else(|| vec![0.0; n_indep])
+    } else {
+        vec![0.0; n_indep]
+    };
+
     // 初期変位を要素状態に反映
     {
         let u_free_init = reducer.expand_u(&u);
@@ -1300,7 +1320,8 @@ pub fn nonlinear_time_history_analysis(
     let cv0 = sparse_matvec(&c_red, &v);
     let mut rhs_a0 = vec![0.0; n_indep];
     for i in 0..n_indep {
-        rhs_a0[i] = -cv0[i] - f_int0_red[i] - p_red_0[i];
+        // p(0) は符号込み（−M·r·ẍg）。線形版と同じく加算が正しい。
+        rhs_a0[i] = p_red_0[i] - cv0[i] - f_int0_red[i];
     }
     let mut a = solve_initial_accel(&m_red, &rhs_a0, n_indep)?;
 
@@ -1397,11 +1418,9 @@ pub fn nonlinear_time_history_analysis(
             // （RESP-D「07」減衰マトリクス「剛性変更に伴う減衰項の変更」）。それ以外は
             // 初期減衰 c_red を用いる。
             let c_tan = if damping.is_tangent_based() {
-                let mut u_cur = u.clone();
-                for i in 0..n_indep {
-                    u_cur[i] += du_total[i];
-                }
-                Some(damping.assemble_c_tangent(&m_red, &k_t_red, &k_red, &u_cur))
+                // h1 一定の {u} は初期剛性の1次固有ベクトル（u_mode1、固定）。
+                // α1 一定は u を参照しない。
+                Some(damping.assemble_c_tangent(&m_red, &k_t_red, &k_red, &u_mode1))
             } else {
                 None
             };

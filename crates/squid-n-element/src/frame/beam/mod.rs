@@ -99,17 +99,17 @@ fn get_material(model: &Model, mid: Option<squid_n_core::ids::MaterialId>) -> Ma
     })
 }
 
-/// スラブ協力幅による強軸曲げ剛性の増大率（RESP-D 計算編 02「RC大梁」。
-/// 協力幅は RC 規準 8 条による）。
+/// スラブ協力幅による強軸曲げ剛性の増大率（協力幅は RC規準 8 条による）。
 ///
 /// 対象は水平な RC 矩形梁のみ。梁の両端節点をともに境界節点に含むスラブを
-/// 「梁に取り付く床」とみなし、梁軸から左右のスラブ奥行き a を求めて
+/// 「梁に取り付く床」とみなし、隣接する平行梁との**内法距離** a
+/// （軸間距離から自梁・相手梁の幅の半分ずつを控除。RC規準8条の図の a）を求めて
 /// ba=(0.5−0.6·a/l)·a（a≥l/2 のとき 0.1·l）で協力幅を算定する。
 /// スラブ（厚さ t=`Model::slab_thickness`、建物一律・上端は梁上端と同面）を
 /// 考慮した中立軸による T 形断面の Ie を元断面 I0=b·D³/12 で除した値を返す。
 /// t≤0・非水平・取り付く床なしでは 1.0（増大なし）。
 /// 連続梁の λ・吹抜け補正・二重スラブ/片持ちスラブの区別は未対応（v1。
-/// docs/v_and_v/剛性計算_RESP-D照合.md 参照）。
+/// docs/v_and_v/剛性計算_参照実装照合.md 参照）。
 fn slab_stiffness_factor(
     model: &Model,
     data: &squid_n_core::model::ElementData,
@@ -135,22 +135,70 @@ fn slab_stiffness_factor(
     }
     let l = (lp * lp + dz * dz).sqrt();
     let (ex, ey) = (dx / lp, dy / lp);
+    // 平面内で梁軸に直交する符号付き距離
+    let signed_dist =
+        |coord: [f64; 3]| -> f64 { -(coord[0] - p0[0]) * ey + (coord[1] - p0[1]) * ex };
 
-    // 梁軸の左右それぞれのスラブ奥行き a（複数スラブは大きい方を採用）
+    // スラブ境界内で自梁と平行な向かい側の梁（距離 target_s）の幅を探す。
+    // 見つからなければ自梁と同幅とみなす（同一符号の梁が並ぶ床組の慣用近似）。
+    let far_beam_width = |slab: &squid_n_core::model::Slab, target_s: f64, sign: f64| -> f64 {
+        const TOL_MM: f64 = 1.0;
+        for e in &model.elements {
+            if !matches!(e.kind, squid_n_core::model::ElementKind::Beam) || e.nodes.len() < 2 {
+                continue;
+            }
+            let (m0, m1) = (e.nodes[0], e.nodes[e.nodes.len() - 1]);
+            if m0 == n0 && m1 == n1 || m0 == n1 && m1 == n0 {
+                continue;
+            }
+            if !(slab.boundary.contains(&m0) && slab.boundary.contains(&m1)) {
+                continue;
+            }
+            let (Some(q0), Some(q1)) = (model.nodes.get(m0.index()), model.nodes.get(m1.index()))
+            else {
+                continue;
+            };
+            let s0 = signed_dist(q0.coord) * sign;
+            let s1 = signed_dist(q1.coord) * sign;
+            if (s0 - target_s).abs() > TOL_MM || (s1 - target_s).abs() > TOL_MM {
+                continue;
+            }
+            if let Some(sec) = e.section.and_then(|sid| model.sections.get(sid.index())) {
+                if sec.width > 0.0 {
+                    return sec.width;
+                }
+            }
+        }
+        b
+    };
+
+    // 梁軸の左右それぞれの隣接平行梁との内法距離 a（複数スラブは大きい方を採用）。
+    // 軸間距離（スラブ境界節点の最大直交距離）から、自梁の幅/2 と相手梁の幅/2 を
+    // 控除して内法にする（RC規準8条の a。従来は軸間距離をそのまま用いており
+    // 協力幅を過大評価していた）。
     let mut a_pos: f64 = 0.0;
     let mut a_neg: f64 = 0.0;
     for slab in &model.slabs {
         if !(slab.boundary.contains(&n0) && slab.boundary.contains(&n1)) {
             continue;
         }
+        let mut s_pos: f64 = 0.0;
+        let mut s_neg: f64 = 0.0;
         for nid in &slab.boundary {
             let Some(q) = model.nodes.get(nid.index()) else {
                 continue;
             };
-            // 平面内で梁軸に直交する符号付き距離
-            let s = -(q.coord[0] - p0[0]) * ey + (q.coord[1] - p0[1]) * ex;
-            a_pos = a_pos.max(s);
-            a_neg = a_neg.max(-s);
+            let s = signed_dist(q.coord);
+            s_pos = s_pos.max(s);
+            s_neg = s_neg.max(-s);
+        }
+        if s_pos > 0.0 {
+            let far_w = far_beam_width(slab, s_pos, 1.0);
+            a_pos = a_pos.max((s_pos - b / 2.0 - far_w / 2.0).max(0.0));
+        }
+        if s_neg > 0.0 {
+            let far_w = far_beam_width(slab, s_neg, -1.0);
+            a_neg = a_neg.max((s_neg - b / 2.0 - far_w / 2.0).max(0.0));
         }
     }
 
@@ -317,10 +365,19 @@ impl BeamElement {
         let mut as_z = as_z * wall_girder_factor;
 
         // フレーム内雑壁（耐震壁不成立）の周辺部材への断面性能算入
-        // （RESP-D 計算編 02「フレーム内雑壁のモデル化」）。柱（鉛直材）には袖壁を、
+        // （フレーム内雑壁のモデル化）。柱（鉛直材）には袖壁を、
         // 梁（水平材）には腰壁/垂壁を、平行軸の定理で剛性用断面性能へ合成する。
         // 対象は不成立壁のみ（成立壁は上下大梁100倍で別途考慮済み・排他）。
-        let misc_walls = crate::misc_wall::collect_misc_walls(model);
+        // 合成は「腰壁・垂壁のヤング係数は母材と同じと仮定」の規定に基づく
+        // 同材累加であり、コンクリート系（RC/SRC、`mat.fc` あり）の部材のみ対象。
+        // S 造部材へ無換算（ヤング係数比なし）で壁断面を合成すると壁寄与を
+        // 1 桁近く過大評価するため適用しない。
+        let is_concrete_member = mat.fc.is_some();
+        let misc_walls = if is_concrete_member {
+            crate::misc_wall::collect_misc_walls(model)
+        } else {
+            Vec::new()
+        };
         if !misc_walls.is_empty() {
             // 不変条件の確認: 壁要素と周辺部材（柱・梁）の ElemId は別空間ではなく
             // モデル全体で一意のはずなので、自部材自身が雑壁として収集される
@@ -713,14 +770,13 @@ impl BeamElement {
     pub fn local_stiffness(&self) -> LocalMat {
         let l_flex = self.length - self.rigid.length_i - self.rigid.length_j;
         let k_raw = if l_flex > 1e-12 {
-            let mut beam = BeamElement {
-                length: l_flex,
-                ..BeamElement {
-                    end_cond: [EndCondition::Fixed, EndCondition::Fixed],
-                    ..self.clone()
-                }
-            };
+            let mut beam = self.clone();
+            beam.length = l_flex;
             beam.end_cond = [EndCondition::Fixed, EndCondition::Fixed];
+            // 軸剛性は剛域で増大させない（軸断面積の l0/l 補正）。可撓長 l0 で
+            // 組み立てるため A·(l0/l) を用いると軸剛性が EA/l（節点間長基準）と
+            // なり、曲げのみ剛域変換で剛とする扱いに揃う。剛域なしでは補正 1。
+            beam.a = self.a * (l_flex / self.length);
             beam.local_stiffness_raw()
         } else {
             LocalMat::zeros(12)

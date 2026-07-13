@@ -35,21 +35,36 @@ pub fn check_story_drift(story_height: f64, interstory_drift: f64) -> bool {
 
 /// 全層の剛性率 Rs_i を計算する。
 /// Ks_i = h_i / δ_i,  Rs_i = Ks_i / mean(Ks)
+///
+/// 層間変位 δ=0 の層（変形しない層）は Ks が定義できない（無限大相当）ため
+/// 平均から除外し、Rs には有限層の最大 Rs 以上（最低 1.0）を与える。
+/// 従来は δ=0 を Ks=0（無限に柔らかい層）として扱っており、最も剛な層ほど
+/// Rs=0 で NG になる逆転があった。
 pub fn stiffness_ratios(story_heights: &[f64], story_drifts: &[f64]) -> Vec<f64> {
-    let ks: Vec<f64> = story_heights
+    let ks: Vec<Option<f64>> = story_heights
         .iter()
         .zip(story_drifts)
-        .map(|(h, d)| if *d == 0.0 { 0.0 } else { h / d })
+        .map(|(h, d)| if *d == 0.0 { None } else { Some(h / d) })
         .collect();
-    let n = ks.len() as f64;
-    if n == 0.0 {
+    if ks.is_empty() {
         return vec![];
     }
-    let mean = ks.iter().sum::<f64>() / n;
+    let finite: Vec<f64> = ks.iter().filter_map(|k| *k).collect();
+    if finite.is_empty() {
+        // 全層 δ=0（無変形）: 剛性の偏りは定義できないため全層 1.0。
+        return vec![1.0; ks.len()];
+    }
+    let mean = finite.iter().sum::<f64>() / finite.len() as f64;
     if mean == 0.0 {
         return vec![1.0; ks.len()];
     }
-    ks.iter().map(|k| k / mean).collect()
+    let rs_rigid = finite.iter().map(|k| k / mean).fold(1.0_f64, f64::max);
+    ks.iter()
+        .map(|k| match k {
+            Some(k) => k / mean,
+            None => rs_rigid,
+        })
+        .collect()
 }
 
 // ===== T2: 偏心率 Re (§5.2) =====
@@ -242,6 +257,17 @@ mod tests {
     fn test_stiffness_ratios_zero_drift() {
         let rs = stiffness_ratios(&[1.0], &[0.0]);
         assert_eq!(rs, vec![1.0]);
+    }
+
+    #[test]
+    fn test_stiffness_ratios_zero_drift_story_is_not_penalized() {
+        // δ=0 の層（剛体的な層）は最も剛であり、Rs=0（最も柔）と逆転してはならない。
+        // Ks = [300, ∞, 150] → 有限層 mean=225、Rs=[4/3, max(4/3,1), 2/3]。
+        let rs = stiffness_ratios(&[3.0, 3.0, 3.0], &[0.01, 0.0, 0.02]);
+        assert!((rs[0] - 300.0 / 225.0).abs() < 1e-9, "rs={:?}", rs);
+        assert!((rs[2] - 150.0 / 225.0).abs() < 1e-9, "rs={:?}", rs);
+        // 剛な層は有限層の最大 Rs 以上（Fs=1.0 側）で、0.6 を下回らない。
+        assert!(rs[1] >= rs[0], "rs={:?}", rs);
     }
 
     #[test]

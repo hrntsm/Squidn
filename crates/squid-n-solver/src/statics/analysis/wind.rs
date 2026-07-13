@@ -10,7 +10,7 @@ use squid_n_core::model::{Model, Story, StoryLevelKind};
 use squid_n_math::solver::SolveError;
 
 use super::config::{SeismicDir, WindStaticCfg};
-use super::seismic::{base_elevation, distribute_pi_over_diaphragms};
+use super::seismic::{distribute_pi_over_diaphragms, ground_elevation};
 use super::Analysis;
 use crate::linear::StaticOnce;
 
@@ -54,19 +54,20 @@ pub(super) fn story_wind_width(
 }
 
 /// 風荷重の建物高さ H・各層の負担区間（`squid_n_load::wind::WindStory`）を
-/// 算定する（RESP-D マニュアル「風荷重の計算」節。`Analysis::wind_static` から
-/// solve 抜きでテストできるよう分離）。
+/// 算定する（令87条・平成12年建設省告示第1454号の運用。`Analysis::wind_static`
+/// から solve 抜きでテストできるよう分離）。
 ///
-/// - `H`（建物高さ）= GLからPH階を除く最上階の床高さ + `parapet_mm`/2
-///   （マニュアル「建築物の高さと軒の高さとの平均」）。
+/// - `H`（建物高さ）= GL（地盤面）からPH階を除く最上階の床高さ + `parapet_mm`/2
+///   （「建築物の高さと軒の高さとの平均」）。
 /// - 最上層の負担区間上端は、`H` とは別に最上階床高さ + `parapet_mm`
 ///   （パラペット天端）まで延長し、見付面積に算入する（実壁はパラペット
-///   天端まで存在するため。`H` にはマニュアルの定義どおり半分のみ算入する）。
+///   天端まで存在するため。`H` には定義どおり半分のみ算入する）。
 /// - 見付け幅は [`story_wind_width`] により階ごとに算定する（フォールバックは
 ///   建物全体の構造節点座標範囲）。
 ///
-/// `normal_stories` は PH階を除いた一般階・地下階を下から上へ並べたもの
-/// （呼び出し側でフィルタ済みであること）。空の場合は呼び出し側で弾く前提。
+/// `normal_stories` は PH階・地下階を除いた地上一般階を下から上へ並べたもの
+/// （呼び出し側でフィルタ済みであること。地下階は地盤内にあり風圧力を受けない）。
+/// 空の場合は呼び出し側で弾く前提。`base` には GL（[`ground_elevation`]）を渡す。
 pub(super) fn wind_story_geometry(
     model: &Model,
     normal_stories: &[&Story],
@@ -137,12 +138,15 @@ pub(super) fn wind_story_geometry(
 }
 
 impl Analysis<'_> {
-    /// 風荷重の静的解析（RESP-D マニュアル「風荷重の計算」節）。
+    /// 風荷重の静的解析（令87条・平成12年建設省告示第1454号の運用）。
     ///
     /// - 建物高さ H・各層の負担区間・見付け幅は [`wind_story_geometry`] を
     ///   参照（パラペット割増し・階別見付け幅の詳細はそちらのドキュメント）。
     /// - PH階は建物高さの算定・風荷重の負担層のいずれからも除外する
     ///   （PH階への風荷重接続は未対応。残課題）。
+    /// - 地下階は地盤内にあり受風面を持たないため負担層から除外し、
+    ///   高さ z は GL（地盤面）基準で測る（従来は最下節点レベル基準で
+    ///   地下階の壁面まで見付面積へ算入していた）。
     /// - 層の水平力は §1.6 と同じ規則で階内の剛床へ重量比按分する。
     pub fn wind_static(&self, cfg: WindStaticCfg) -> Result<StaticOnce, SolveError> {
         let model = self.model;
@@ -155,15 +159,15 @@ impl Analysis<'_> {
         let normal_stories: Vec<&Story> = model
             .stories
             .iter()
-            .filter(|s| !matches!(s.level_kind, StoryLevelKind::Penthouse { .. }))
+            .filter(|s| matches!(s.level_kind, StoryLevelKind::Normal))
             .collect();
         if normal_stories.is_empty() {
             return Err(SolveError::InvalidInput(
-                "風荷重の対象となる階(PH階を除く一般階・地下階)が定義されていません。".into(),
+                "風荷重の対象となる階(PH階・地下階を除く地上一般階)が定義されていません。".into(),
             ));
         }
 
-        let base = base_elevation(model);
+        let base = ground_elevation(model);
         let axis = match cfg.dir {
             SeismicDir::X => 1, // X方向の風 → 見付け幅はY方向の座標範囲
             SeismicDir::Y => 0,

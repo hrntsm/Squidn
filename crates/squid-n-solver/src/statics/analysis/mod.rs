@@ -26,7 +26,7 @@ mod wind;
 
 pub use config::{AiMode, SeismicCfg, SeismicDir, WindStaticCfg};
 pub(crate) use seismic::distribute_pi_over_diaphragms;
-pub use seismic::steel_height_ratio;
+pub use seismic::{building_height_mm, ground_elevation, steel_height_ratio};
 
 pub struct Analysis<'m> {
     model: &'m Model,

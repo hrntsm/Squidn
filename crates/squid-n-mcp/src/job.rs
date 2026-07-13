@@ -487,6 +487,12 @@ fn compute_design_check_job(model: &Model, load_case: Option<u32>) -> Result<Job
             .iter()
             .map(|(_, f)| (f[5].abs(), f[1].abs()))
             .max_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+        // 弱軸方向（|My|max と対応 |Qz|）。柱の qz 方向せん断検定の α 用。
+        let shear_span_y = mf
+            .at
+            .iter()
+            .map(|(_, f)| (f[4].abs(), f[2].abs()))
+            .max_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
         // 端部・中央の強軸曲げ（横座屈 C 係数・たわみ検定用）。
         let m_at = |target: f64| {
             mf.at
@@ -518,6 +524,7 @@ fn compute_design_check_job(model: &Model, load_case: Option<u32>) -> Result<Job
             lb: None,
             lk,
             shear_span,
+            shear_span_y,
             rc_damage_control: true,
             end_moments_z,
             mid_moment_z: m_at(0.5),

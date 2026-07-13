@@ -25,7 +25,8 @@ fn base_params() -> FemaBeamParams {
 
 #[test]
 fn test_fema_is_c_true() {
-    // s=100 <= D/3=166.7、Vs=200k >= 0.75*V=75k → C
+    // s=100 <= d/3=150（有効せい基準。FEMA 356 Table 6-7 脚注）、
+    // Vs=200k >= 0.75*V=75k → C
     let p = base_params();
     assert!(fema_is_c(&p));
 }
@@ -53,9 +54,10 @@ fn test_fema_plastic_rotation_corners_c() {
     p.b = 1.0;
     p.d = 1.0;
     p.fc_prime = 1.0;
+    p.s = 0.1; // <= d/3（有効せい基準の C 判定を維持）
 
     // V/(b*d*sqrt(fc')) <= 0.25 となるよう v_yield を設定。
-    p.v_yield = 0.2; // C: s<=D/3, Vs>=0.75V は base_params の値から保持
+    p.v_yield = 0.2; // C: s<=d/3, Vs>=0.75V
     p.vs = 1.0e9; // 十分大きく C 判定を維持
     assert!((fema_plastic_rotation(&p) - 0.025).abs() < 1e-9);
 
@@ -99,14 +101,13 @@ fn test_fema_plastic_rotation_corners_nc() {
 #[test]
 fn test_fema_plastic_rotation_interpolation_midpoint() {
     let mut p = base_params();
-    p.s = 100.0;
-    p.depth_d = 500.0; // C 判定
     p.vs = 1.0e9;
     p.b = 1.0;
     p.d = 1.0;
     p.fc_prime = 1.0;
-    // ratio の中間 (0.25) と vn の中間 (0.375) は C の4隅 (0.025,0.02,0.02,0.015) の
-    // 双線形補間で中央値 (0.025+0.02+0.02+0.015)/4 = 0.02 となる。
+    p.s = 0.1; // <= d/3（C 判定）
+               // ratio の中間 (0.25) と vn の中間 (0.375) は C の4隅 (0.025,0.02,0.02,0.015) の
+               // 双線形補間で中央値 (0.025+0.02+0.02+0.015)/4 = 0.02 となる。
     p.rho = p.rho_prime + 0.25 * p.rho_bal;
     p.v_yield = 0.375;
     let a = fema_plastic_rotation(&p);

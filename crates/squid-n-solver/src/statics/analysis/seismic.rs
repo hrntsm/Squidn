@@ -6,7 +6,7 @@
 use std::collections::HashSet;
 
 use squid_n_core::ids::{LoadCaseId, NodeId};
-use squid_n_core::model::{DiaphragmDef, Model, Story, StoryStructure};
+use squid_n_core::model::{DiaphragmDef, Model, Story, StoryLevelKind, StoryStructure};
 use squid_n_math::solver::SolveError;
 
 use super::config::{AiMode, SeismicCfg, SeismicDir};
@@ -35,37 +35,90 @@ pub(super) fn base_elevation(model: &Model) -> f64 {
     }
 }
 
-/// 略算周期 T = h(0.02 + 0.01α) の鉄骨造比 α（令88条・平成12年建設省告示第1793号）。
+/// 地盤面（GL）レベル [mm] を求める。
 ///
-/// 「柱及び梁の大部分が鉄骨造である階の高さの合計の建築物の高さに対する比」。
-/// `Story.structure` が `S`（鉄骨造）である階の階高の合計 ÷ 建物全高。
-/// RC・SRC は分子に算入しない（マニュアルの定義がS造階のみを対象とするため）。
+/// 地下階（`StoryLevelKind::Basement`）が定義されているモデルでは、
+/// 各地下階の「床レベル + 地盤面からの深さ depth_m」から GL を復元する
+/// （深さの定義より各地下階で同一値になる想定。数値ずれに備え最大値を採る）。
+/// 地下階が無ければ [`base_elevation`]（最下構造節点レベル）を GL とみなす。
 ///
-/// 階高 h_i = elevation_i − elevation_{i−1}（最下階は `base_elevation` を
-/// elevation_{-1} とみなす）。階が定義されていない、または建物全高が 0 以下の
+/// 建築物の高さ（令2条・令88条の略算周期 T の h）や風荷重の受風範囲
+/// （地上部分のみ）は、基部レベルではなくこの GL を基準に測る。
+pub fn ground_elevation(model: &Model) -> f64 {
+    let gl = model
+        .stories
+        .iter()
+        .filter_map(|s| match s.level_kind {
+            StoryLevelKind::Basement { depth_m } => Some(s.elevation + depth_m * 1000.0),
+            _ => None,
+        })
+        .fold(f64::NEG_INFINITY, f64::max);
+    if gl.is_finite() {
+        gl
+    } else {
+        base_elevation(model)
+    }
+}
+
+/// 建築物の高さ h [mm]（略算周期 T = h(0.02+0.01α) の h。令88条・
+/// 昭和55年建設省告示第1793号）。
+///
+/// GL（[`ground_elevation`]）から、PH（塔屋）階を除く最上の一般階の
+/// 床レベルまでの高さとする。地下階の深さ・塔屋の高さは h に算入しない。
+/// 一般階が無い場合は最上階レベルで代用し、負値は 0 にクランプする。
+pub fn building_height_mm(model: &Model) -> f64 {
+    let gl = ground_elevation(model);
+    let top_normal = model
+        .stories
+        .iter()
+        .filter(|s| matches!(s.level_kind, StoryLevelKind::Normal))
+        .map(|s| s.elevation)
+        .fold(f64::NEG_INFINITY, f64::max);
+    let top = if top_normal.is_finite() {
+        top_normal
+    } else {
+        model.stories.last().map(|s| s.elevation).unwrap_or(gl)
+    };
+    (top - gl).max(0.0)
+}
+
+/// 略算周期 T = h(0.02 + 0.01α) の鉄骨造比 α（令88条・昭和55年建設省告示第1793号）。
+///
+/// 「柱及び梁の大部分が鉄骨造である階（地階を除く）の高さの合計の h（建築物の高さ）
+/// に対する比」。`Story.structure` が `S`（鉄骨造）である地上一般階の階高の合計 ÷
+/// 建築物の高さ（[`building_height_mm`]）。RC・SRC は分子に算入せず、告示の
+/// 「地階を除く」に従い地下階は分子・分母とも算入しない。PH（塔屋）階も
+/// 建築物の高さに算入しない扱いに合わせて対象外とする。
+///
+/// 階高 h_i = elevation_i − elevation_{i−1}（最下の地上一般階は GL を
+/// elevation_{-1} とみなす）。階が定義されていない、または建築物の高さが 0 以下の
 /// 場合は 0.0 を返す（レビュー §1.5：従来はこの α を常に 0.0 にハードコード
-/// していたバグの修正）。
+/// していたバグの修正。地下階・PH 階の除外は照合レビューによる是正）。
 pub fn steel_height_ratio(model: &Model) -> f64 {
     if model.stories.is_empty() {
         return 0.0;
     }
-    let base = base_elevation(model);
-    let mut prev_elev = base;
-    let mut total_h = 0.0;
+    let gl = ground_elevation(model);
+    let total_h = building_height_mm(model);
+    if total_h <= 0.0 {
+        return 0.0;
+    }
+    let mut prev_elev = gl;
     let mut steel_h = 0.0;
     for story in &model.stories {
+        if !matches!(story.level_kind, StoryLevelKind::Normal) {
+            continue;
+        }
         let h = story.elevation - prev_elev;
         prev_elev = story.elevation;
-        total_h += h;
+        if h <= 0.0 {
+            continue;
+        }
         if matches!(story.structure, StoryStructure::S) {
             steel_h += h;
         }
     }
-    if total_h <= 0.0 {
-        0.0
-    } else {
-        (steel_h / total_h).clamp(0.0, 1.0)
-    }
+    (steel_h / total_h).clamp(0.0, 1.0)
 }
 
 /// [`distribute_pi_over_diaphragms`] の中核ロジック。剛床定義の列（階全体、
@@ -199,7 +252,10 @@ impl Analysis<'_> {
 
         let (t, _) = match mode {
             AiMode::Approx => {
-                let height_m = stories.last().map(|s| s.elevation).unwrap_or(0.0) / 1000.0;
+                // h は建築物の高さ（GL〜PH 階を除く最上階。地下深さ・塔屋は含めない。
+                // 令88条・告示1793号）。従来の「最上階の生 Z 標高」は、基部が
+                // Z=0 に無いモデルや地下階付きモデルで h を誤っていた。
+                let height_m = building_height_mm(self.model) / 1000.0;
                 let steel_ratio = steel_height_ratio(self.model);
                 (squid_n_load::ai::approx_t(height_m, steel_ratio), 0)
             }
@@ -227,12 +283,15 @@ impl Analysis<'_> {
 
         // PH（塔屋）階・地下階を含む階種別ごとの層せん断力算定式に対応する
         // （seismic_shear_distribution。全階 Normal なら ai_distribution と厳密一致）。
-        // 主系統の重量は ci_override（副剛床の Ci 直接入力）を持つ剛床の重量を
-        // 除外する（main_system_weight。§副剛床のCi直接入力）。
+        // 主系統の重量（Qi 用）は ci_override（副剛床の Ci 直接入力）を持つ剛床の
+        // 重量を除外する（main_system_weight。§副剛床のCi直接入力）。
+        // α・Ai・Ci は「全剛床の場合の Ci」に従うため、副剛床を含む階全体の
+        // 重量（ci_weight = seismic_weight）から算定する。
         let specs: Vec<squid_n_load::ai::StorySeismicSpec> = stories
             .iter()
             .map(|s| squid_n_load::ai::StorySeismicSpec {
                 weight: main_system_weight(s),
+                ci_weight: s.seismic_weight.unwrap_or(0.0),
                 level_kind: s.level_kind,
             })
             .collect();

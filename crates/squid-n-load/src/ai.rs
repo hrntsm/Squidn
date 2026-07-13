@@ -111,14 +111,20 @@ pub fn approx_t(height_m: f64, steel_ratio: f64) -> f64 {
 
 /// [`seismic_shear_distribution`] への入力層データ。
 pub struct StorySeismicSpec {
-    /// 当該層の地震用重量 Wi [N]。
+    /// 当該層のうち主系統（Ai 分布に従う剛床）が負担する地震用重量 Wi [N]。
+    /// 層せん断力 Qi = Ci・ΣWj の重量にはこちらを用いる。
     pub weight: f64,
+    /// α・Ai・Ci の算定に用いる階全体の地震用重量 [N]。
+    /// 「主剛床は全剛床の場合の Ci に従って層せん断力を計算する」規定に対応し、
+    /// 副剛床（Ci 直接入力）の重量も**含めた**値を渡す。副剛床が無い通常の階では
+    /// `weight` と同値。
+    pub ci_weight: f64,
     /// 階種別（一般/PH/地下）。地震層せん断力の算定式を切り替える。
     pub level_kind: StoryLevelKind,
 }
 
 /// 一般階・PH（塔屋）階・地下階が混在する建物の地震層せん断力分布を求める
-/// （RESP-D マニュアル「地震荷重の計算」）。
+/// （令88条および同条の実務的運用）。
 ///
 /// `stories_bottom_to_top` は建物の最下部（最も深い地下階、無ければ最下の一般階）
 /// から最上部（最上の PH 階、無ければ最上の一般階）の順に並べる。階種別は
@@ -128,12 +134,15 @@ pub struct StorySeismicSpec {
 /// - **一般階**: 通常の Ai 分布に従う（[`ai_distribution`] と同じ式）。
 ///   ただし αi・Wi の算定に用いる「当該階以上の重量」には PH 階の重量を
 ///   含める（PH は最上部の付加重量として扱う）。地下階の重量は含めない
-///   （αi は地上部分のみで正規化する）。
+///   （αi は地上部分のみで正規化する）。α・Ai・Ci は `ci_weight`
+///   （副剛床を含む階全体の重量）から求め、層せん断力 Qi = Ci・ΣWj の
+///   ΣWj は `weight`（主系統の重量）の累積とする（「主剛床は全剛床の
+///   場合の Ci に従って層せん断力を計算する」規定）。
 /// - **PH階**: Qi = k・ΣWj（j はその階以上の重量和、k は 0.5〜1.0 の指定震度）。
 ///   `ci` 欄には k をそのまま格納する（等価係数）。
 /// - **地下階**: Qi = Q(i+1) + Ki・Wi、Ki = 0.1・(1 − min(Hi,20)/40)・Z
-///   （Hi は地盤面からの深さ[m]、Q(i+1) は直上の層のせん断力）。
-///   `ci` 欄には Ki を格納する（等価係数）。
+///   （令88条4項。Hi は地盤面からの深さ[m]、20m 超は 20m。Q(i+1) は直上の層の
+///   せん断力）。`ci` 欄には Ki を格納する（等価係数）。
 ///
 /// Pi = Qi − Q(i+1)（最上層は Pi=Qi）は階種別によらず全層を通して算定する。
 /// 返り値の `alpha`・`ai` は一般階以外では意味を持たない（0.0 のまま）。
@@ -146,10 +155,10 @@ pub fn seismic_shear_distribution(
 ) -> AiDistribution {
     let n = stories_bottom_to_top.len();
 
-    // 全階が一般階なら既存の ai_distribution と厳密に一致させる（委譲）。
+    // 全階が一般階かつ副剛床の重量除外が無ければ ai_distribution と厳密一致（委譲）。
     if stories_bottom_to_top
         .iter()
-        .all(|s| matches!(s.level_kind, StoryLevelKind::Normal))
+        .all(|s| matches!(s.level_kind, StoryLevelKind::Normal) && s.ci_weight == s.weight)
     {
         let weights: Vec<f64> = stories_bottom_to_top.iter().map(|s| s.weight).collect();
         return ai_distribution(&weights, z, rt_val, c0, t);
@@ -174,17 +183,24 @@ pub fn seismic_shear_distribution(
         );
     }
 
+    // α・Ai・Ci 用（階全体の重量。副剛床の Ci 直接入力があっても全剛床分を含む）。
+    let total_ph_ci_weight: f64 = stories_bottom_to_top
+        .iter()
+        .filter(|s| matches!(s.level_kind, StoryLevelKind::Penthouse { .. }))
+        .map(|s| s.ci_weight)
+        .sum();
+    let total_normal_ci_weight: f64 = stories_bottom_to_top
+        .iter()
+        .filter(|s| matches!(s.level_kind, StoryLevelKind::Normal))
+        .map(|s| s.ci_weight)
+        .sum();
+    let total_above_ground_ci = total_normal_ci_weight + total_ph_ci_weight;
+    // Qi 用（主系統の重量）。
     let total_ph_weight: f64 = stories_bottom_to_top
         .iter()
         .filter(|s| matches!(s.level_kind, StoryLevelKind::Penthouse { .. }))
         .map(|s| s.weight)
         .sum();
-    let total_normal_weight: f64 = stories_bottom_to_top
-        .iter()
-        .filter(|s| matches!(s.level_kind, StoryLevelKind::Normal))
-        .map(|s| s.weight)
-        .sum();
-    let total_above_ground = total_normal_weight + total_ph_weight;
 
     let t_factor = 2.0 * t / (1.0 + 3.0 * t);
 
@@ -193,14 +209,18 @@ pub fn seismic_shear_distribution(
     let mut ci = vec![0.0; n];
     let mut qi = vec![0.0; n];
 
-    // 一般階: Wi = (当該階以上の一般階重量の累積) + PH階重量の合計。
+    // 一般階: α・Ai・Ci は階全体の重量（ci_weight）から求め、
+    // Qi = Ci・Wi の Wi は主系統重量（weight）の累積 + PH階主系統重量とする。
+    let mut cum_normal_ci = 0.0;
     let mut cum_normal = 0.0;
     for i in (0..n).rev() {
         if let StoryLevelKind::Normal = stories_bottom_to_top[i].level_kind {
+            cum_normal_ci += stories_bottom_to_top[i].ci_weight;
             cum_normal += stories_bottom_to_top[i].weight;
+            let wi_ci = cum_normal_ci + total_ph_ci_weight;
             let wi = cum_normal + total_ph_weight;
-            let a = if total_above_ground > 0.0 {
-                wi / total_above_ground
+            let a = if total_above_ground_ci > 0.0 {
+                wi_ci / total_above_ground_ci
             } else {
                 0.0
             };
@@ -339,10 +359,12 @@ mod tests {
         let stories = vec![
             StorySeismicSpec {
                 weight: 1000.0,
+                ci_weight: 1000.0,
                 level_kind: StoryLevelKind::Normal,
             },
             StorySeismicSpec {
                 weight: 1000.0,
+                ci_weight: 1000.0,
                 level_kind: StoryLevelKind::Penthouse { k: 0.0001 },
             },
         ];
@@ -361,6 +383,7 @@ mod tests {
             .iter()
             .map(|&w| StorySeismicSpec {
                 weight: w,
+                ci_weight: w,
                 level_kind: StoryLevelKind::Normal,
             })
             .collect();
@@ -379,14 +402,17 @@ mod tests {
         let stories = vec![
             StorySeismicSpec {
                 weight: 1000.0,
+                ci_weight: 1000.0,
                 level_kind: StoryLevelKind::Normal,
             },
             StorySeismicSpec {
                 weight: 1000.0,
+                ci_weight: 1000.0,
                 level_kind: StoryLevelKind::Normal,
             },
             StorySeismicSpec {
                 weight: 200.0,
+                ci_weight: 200.0,
                 level_kind: StoryLevelKind::Penthouse { k: 1.0 },
             },
         ];
@@ -421,10 +447,12 @@ mod tests {
         let stories = vec![
             StorySeismicSpec {
                 weight: w_basement,
+                ci_weight: w_basement,
                 level_kind: StoryLevelKind::Basement { depth_m: 5.0 },
             },
             StorySeismicSpec {
                 weight: w_normal,
+                ci_weight: w_normal,
                 level_kind: StoryLevelKind::Normal,
             },
         ];
@@ -474,18 +502,22 @@ mod tests {
         let stories = vec![
             StorySeismicSpec {
                 weight: 400.0,
+                ci_weight: 400.0,
                 level_kind: StoryLevelKind::Basement { depth_m: 3.0 },
             },
             StorySeismicSpec {
                 weight: 1000.0,
+                ci_weight: 1000.0,
                 level_kind: StoryLevelKind::Normal,
             },
             StorySeismicSpec {
                 weight: 900.0,
+                ci_weight: 900.0,
                 level_kind: StoryLevelKind::Normal,
             },
             StorySeismicSpec {
                 weight: 150.0,
+                ci_weight: 150.0,
                 level_kind: StoryLevelKind::Penthouse { k: 0.6 },
             },
         ];

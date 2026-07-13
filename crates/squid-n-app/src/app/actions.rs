@@ -111,10 +111,13 @@ impl App {
     /// T3: 線形静的解析を実行し、結果を `self.results` に格納する。
     /// 指定した荷重ケースが存在しない場合はエラーメッセージをセット。
     ///
-    /// 解析準備前にスラブ荷重を「床荷重(自動)」ケースへ同期する（レビュー §1.1）。
+    /// 解析準備前にスラブ荷重を「床荷重(自動)」ケースへ（レビュー §1.1）、
+    /// 自重を「自重(自動)」ケースへ同期する（照合レビュー：③梁自重・②壁荷重の
+    /// CMoQ 経路を長期応力解析へ接続する）。
     pub fn run_linear_static(&mut self, lc: LoadCaseId) {
         self.last_error = None;
         self.sync_slab_loads_action();
+        self.sync_self_weight_action();
         self.apply_rigid_zones_for_analysis();
         match Analysis::prepare(&self.model) {
             Ok(analysis) => match analysis.linear_static(lc) {
@@ -139,10 +142,12 @@ impl App {
     /// T7: 荷重組合せ解析を実行し、結果を `bundle.combos` に格納する。
     /// 指定インデックスの荷重組合せが存在しない場合はエラーメッセージをセット。
     ///
-    /// 解析準備前にスラブ荷重を「床荷重(自動)」ケースへ同期する（レビュー §1.1）。
+    /// 解析準備前にスラブ荷重を「床荷重(自動)」ケースへ、自重を「自重(自動)」
+    /// ケースへ同期する（レビュー §1.1・照合レビュー）。
     pub fn run_combination(&mut self, index: usize) {
         self.last_error = None;
         self.sync_slab_loads_action();
+        self.sync_self_weight_action();
         let Some(combo) = self.model.combinations.get(index).cloned() else {
             self.last_error = Some(format!("荷重組合せ #{} が存在しません", index));
             return;
@@ -276,21 +281,19 @@ impl App {
             );
         }
 
-        // T(1 次周期): 固有値解析があればそれを使用、なければ略算式。
+        // T(1 次周期): 固有値解析があればそれを使用、なければ略算式
+        // T = h(0.02+0.01α)。h は建築物の高さ（GL〜PH 階を除く最上階）、
+        // α は鉄骨造比（令88条・告示1793号。従来は α=0.0 固定・h は生の
+        // 最上階 Z 標高で、S 造モデルや地下階付きモデルの T を誤っていた）。
         let t = self
             .results
             .as_ref()
             .and_then(|r| r.modal.as_ref())
             .and_then(|m| m.period.first().copied())
             .unwrap_or_else(|| {
-                let height_m = self
-                    .model
-                    .stories
-                    .last()
-                    .map(|s| s.elevation)
-                    .unwrap_or(0.0)
-                    / 1000.0;
-                squid_n_load::ai::approx_t(height_m, 0.0)
+                let height_m = squid_n_solver::analysis::building_height_mm(&self.model) / 1000.0;
+                let steel_ratio = squid_n_solver::analysis::steel_height_ratio(&self.model);
+                squid_n_load::ai::approx_t(height_m, steel_ratio)
             });
         let rt = squid_n_load::ai::rt(t, squid_n_load::ai::tc_of(self.analysis_cfg.soil));
         let qud = qud_by_story(&weights, self.analysis_cfg.z, rt, t);
@@ -546,12 +549,16 @@ impl App {
                         let n_axial = mf.at.first().map(|(_, f)| f[0])?;
                         let mz = mf.at.iter().map(|(_, f)| f[5].abs()).fold(0.0, f64::max);
                         let my = mf.at.iter().map(|(_, f)| f[4].abs()).fold(0.0, f64::max);
+                        // 長期せん断力 QL（余裕率の分子控除 (Qsu−QL)/Qmu 用）。
+                        // このケース自体が重力（長期）ケースのため、そのまま採用する。
+                        let ql = mf.at.iter().map(|(_, f)| f[1].abs()).fold(0.0, f64::max);
                         Some((
                             *id,
                             MemberDemand {
                                 n_axial,
                                 mz,
                                 my,
+                                q_long: Some(ql),
                                 ..Default::default()
                             },
                         ))
@@ -575,21 +582,41 @@ impl App {
         if po.member_response.is_empty() {
             return None;
         }
+        // 長期せん断力 QL（余裕率の分子控除用）を重力ケースの静的結果から引く。
+        let gravity_lc = gravity_cases_for_seismic_weight(&self.model)
+            .first()
+            .copied();
+        let long_forces: Option<&[(ElemId, squid_n_element::beam::MemberForces)]> = self
+            .results
+            .as_ref()
+            .and_then(|res| {
+                gravity_lc.and_then(|lc| {
+                    res.statics
+                        .iter()
+                        .find(|(id, _)| *id == StaticCaseKey::User(lc))
+                })
+            })
+            .map(|(_, s)| s.member_forces.as_slice());
+        let ql_of = |elem: ElemId| -> Option<f64> {
+            long_forces?
+                .iter()
+                .find(|(id, _)| *id == elem)
+                .map(|(_, mf)| mf.at.iter().map(|(_, f)| f[1].abs()).fold(0.0, f64::max))
+        };
         Some(
             po.member_response
                 .iter()
                 .map(|r| {
-                    (
-                        r.elem,
-                        MemberDemand::from_pushover(
-                            r.axial,
-                            r.m_strong,
-                            r.m_weak,
-                            r.shear_strong,
-                            r.shear_weak,
-                            r.rp,
-                        ),
-                    )
+                    let mut d = MemberDemand::from_pushover(
+                        r.axial,
+                        r.m_strong,
+                        r.m_weak,
+                        r.shear_strong,
+                        r.shear_weak,
+                        r.rp,
+                    );
+                    d.q_long = ql_of(r.elem);
+                    (r.elem, d)
                 })
                 .collect(),
         )
@@ -1296,11 +1323,19 @@ impl App {
 
             let kind = member_kind_of(elem, &self.model);
             let length = elem_geometric_length(elem, &self.model);
-            // せん断スパン比 M/(Q·d) の代表値: |Mz| 最大の検定位置の (|M|, |Q|)。
+            // せん断スパン比 M/(Q·d) の代表値: 加力方向ごとに「モーメントが最大と
+            // なる検定位置」の (|M|, |Q|) を採用する（強軸: |Mz|max と対応 |Qy|、
+            // 弱軸: |My|max と対応 |Qz|。従来は強軸側の1組を弱軸検定にも流用して
+            // おり、弱軸曲げ卓越の柱で α を過大評価していた）。
             let shear_span = mf
                 .at
                 .iter()
                 .map(|(_, f)| (f[5].abs(), f[1].abs()))
+                .max_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+            let shear_span_y = mf
+                .at
+                .iter()
+                .map(|(_, f)| (f[4].abs(), f[2].abs()))
                 .max_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
             // 端部・中央の強軸曲げ（横座屈 C 係数・たわみ検定用）。
             let m_at = |target: f64| {
@@ -1368,6 +1403,7 @@ impl App {
                 lb: None,
                 lk,
                 shear_span,
+                shear_span_y,
                 rc_damage_control: self.analysis_cfg.rc_damage_control,
                 end_moments_z,
                 mid_moment_z,
@@ -1621,6 +1657,52 @@ impl App {
             &mut self.model,
             Box::new(squid_n_edit::SyncSlabLoadsToCase {
                 name: SLAB_AUTO_LOAD_CASE_NAME.to_string(),
+                nodal,
+                member,
+            }),
+        );
+        self.staleness.mark_edited();
+    }
+
+    /// 自重を専用の荷重ケース「自重(自動)」（kind=Dead）へ同期する
+    /// （照合レビュー: 大梁の CMoQ ①〜④のうち③梁自重（等分布部材荷重）と
+    /// ②壁荷重（三方スリット壁の上部大梁伝達を含む節点荷重）を長期応力解析へ
+    /// 接続する最重要修正。従来は自重が地震用重量にしか算入されず、長期応力・
+    /// 長期軸力が自重分だけ過小だった）。
+    ///
+    /// 算定は `squid_n_load::self_weight::self_weight_case_content`
+    /// （`story_gen` の地震用重量集計と同じ規則を共有）。内容が既存の
+    /// 「自重(自動)」ケースと一致するなら何もしない冪等な同期アクション
+    /// （`sync_slab_loads_action` と同じ規約）。
+    ///
+    /// このケースは地震用重量の重力ケース選択（`gravity_cases_for_seismic_weight`）
+    /// から名前で除外される（`story_gen` が自重を密度から直接集計するため）。
+    pub fn sync_self_weight_action(&mut self) {
+        let load_cfg = self.model.load_cfg.clone().unwrap_or_default();
+        let (nodal, member) =
+            squid_n_load::self_weight::self_weight_case_content(&self.model, &load_cfg);
+
+        let existing = self
+            .model
+            .load_cases
+            .iter()
+            .find(|lc| lc.name == SELF_WEIGHT_AUTO_LOAD_CASE_NAME);
+        let needs_create = existing.is_none() && !(nodal.is_empty() && member.is_empty());
+        let needs_update = existing
+            .map(|lc| {
+                lc.kind != squid_n_core::model::LoadCaseKind::Dead
+                    || lc.nodal != nodal
+                    || lc.member != member
+            })
+            .unwrap_or(false);
+        if !needs_create && !needs_update {
+            return;
+        }
+
+        self.undo.run(
+            &mut self.model,
+            Box::new(squid_n_edit::SyncSlabLoadsToCase {
+                name: SELF_WEIGHT_AUTO_LOAD_CASE_NAME.to_string(),
                 nodal,
                 member,
             }),

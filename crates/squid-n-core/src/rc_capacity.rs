@@ -47,11 +47,12 @@ pub struct RcCapacityInput {
     pub sigma_0: f64,
 }
 
-/// 曲げ終局モーメント Mu ≈ 0.9・at・σy・j（引張鉄筋降伏型の略算式、j = 7・d_e/8）。
+/// 曲げ終局モーメント Mu = 0.9・at・σy・d（引張鉄筋降伏型の略算式、d = 有効せい）。
 ///
-/// squid-n-skeleton のファイバ解析テスト（`test_rc_skeleton_ultimate_matches_handcalc`）が
-/// 照合に使っている規準式 `Mu = 0.9・at・σy・j`（AIJ『非線形解析指針』等の簡易式、
-/// 要・原典照合）と同一とする。
+/// 2007年版建築物の構造関係技術基準解説書 P.623 の略算式。係数 0.9 が応力中心間
+/// 距離のせい比（j/d 相当）を既に織り込んでいるため、d には有効せい d_e を
+/// そのまま用いる（さらに j = 7d/8 を乗じていた従来実装は Mu を 12.5%
+/// 過小評価する誤りだった）。
 ///
 /// 不正入力（at, d_eff, σy のいずれかが 0 以下）は 0.0 を返す（`ds::rc_member_rank` は
 /// qmu<=0 で FD を返す仕様に整合）。
@@ -59,8 +60,7 @@ pub fn rc_mu_simple(inp: &RcCapacityInput) -> f64 {
     if inp.at <= 0.0 || inp.d_eff <= 0.0 || inp.sigma_y <= 0.0 {
         return 0.0;
     }
-    let j = 7.0 * inp.d_eff / 8.0;
-    0.9 * inp.at * inp.sigma_y * j
+    0.9 * inp.at * inp.sigma_y * inp.d_eff
 }
 
 /// 曲げ終局時せん断力 Qmu = 2・Mu / h0（両端曲げ降伏・反曲点中央を仮定）。
@@ -197,9 +197,8 @@ mod tests {
     #[test]
     fn test_rc_mu_simple_matches_handcalc() {
         let inp = sample_input();
-        // 手計算: j = 7*530/8 = 463.75, Mu = 0.9*1935*345*463.75
-        let j = 7.0 * 530.0 / 8.0;
-        let mu_handcalc = 0.9 * 1935.0 * 345.0 * j;
+        // 手計算: Mu = 0.9·at·σy·d = 0.9*1935*345*530（技術基準解説書 P.623）
+        let mu_handcalc = 0.9 * 1935.0 * 345.0 * 530.0;
         let mu = rc_mu_simple(&inp);
         assert!(
             (mu - mu_handcalc).abs() < 1e-6,
@@ -254,8 +253,7 @@ mod tests {
     #[test]
     fn test_rc_qmu_simple_matches_handcalc() {
         let inp = sample_input();
-        let j = 7.0 * 530.0 / 8.0;
-        let mu_handcalc = 0.9 * 1935.0 * 345.0 * j;
+        let mu_handcalc = 0.9 * 1935.0 * 345.0 * 530.0;
         let qmu_handcalc = 2.0 * mu_handcalc / 3000.0;
         let qmu = rc_qmu_simple(&inp);
         assert!(

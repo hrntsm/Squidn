@@ -49,7 +49,8 @@ pub struct SrcBeamShearInput {
 /// rQu1 = b·rj·(α·fs + 0.5·rpw·rwσy)
 /// rQu2 = b·rj·(2·b'/b·fs + rpw·rwσy)
 /// sQu1 = sAw·sσy/√3,  sQu2 = ΣsMu/l'
-/// fs   = min(Fc/20, (5 + Fc/100)·1.5)
+/// fs   = min(Fc/20, (5 + Fc/100)·1.5)（工学単位 kgf/cm² で定義された式。
+///        SI では 5 kgf/cm² = 0.4903 N/mm² となり fs = min(Fc/20, (0.4903 + Fc/100)·1.5)）
 /// α    = 4/(M/(Q·rd)+1)（1≤α≤2 にクランプ）
 /// ```
 /// 不正入力（b・rj・Fc・l' のいずれかが 0 以下）は 0.0。
@@ -57,7 +58,10 @@ pub fn src_beam_shear_ultimate_tech_standard(inp: &SrcBeamShearInput) -> f64 {
     if inp.b <= 0.0 || inp.rj <= 0.0 || inp.fc <= 0.0 || inp.clear_span <= 0.0 {
         return 0.0;
     }
-    let fs = (inp.fc / 20.0).min((5.0 + inp.fc / 100.0) * 1.5);
+    // 定数 5 は kgf/cm²（長期許容せん断応力度の定数項）。N/mm² 入力に対しては
+    // 0.4903 に換算する（5 をそのまま使うと第2項を約10倍過大評価する）。
+    const FIVE_KGF_IN_SI: f64 = 5.0 * 0.098_066_5;
+    let fs = (inp.fc / 20.0).min((FIVE_KGF_IN_SI + inp.fc / 100.0) * 1.5);
     let alpha = (4.0 / (inp.m_over_qrd.max(0.0) + 1.0)).clamp(1.0, 2.0);
     let rqu1 = inp.b * inp.rj * (alpha * fs + 0.5 * inp.rpw * inp.rw_sigma_y);
     let rqu2 = inp.b * inp.rj * (2.0 * inp.b_prime / inp.b * fs + inp.rpw * inp.rw_sigma_y);
@@ -73,14 +77,18 @@ pub fn src_beam_shear_ultimate_tech_standard(inp: &SrcBeamShearInput) -> f64 {
 /// 技術基準解説書式との差異:
 /// - `rQu1 = b·rj·(0.5·α·fs + 0.5·rpw·rwσy)`（fs 係数が 0.5·α）
 /// - `rQu2 = b·rj·(b'/b·fs + rpw·rwσy)`（b'/b の係数が 1）
-/// - `fs = min(0.15·Fc, (22.5 + 4.5·Fc)/100)`（要・原典照合）
+/// - `fs = min(0.15·Fc, 22.5 + 4.5·Fc/100)`（工学単位 kgf/cm² で定義された式。
+///   SI では 22.5 kgf/cm² = 2.2065 N/mm² となり fs = min(0.15·Fc, 2.2065 + 0.045·Fc)。
+///   従来実装は括弧を (22.5+4.5Fc)/100 と誤読しさらに単位換算も欠いており、
+///   fs を約 1/2.5 に過小評価していた）
 ///
 /// 不正入力（b・rj・Fc・l' のいずれかが 0 以下）は 0.0。
 pub fn src_beam_shear_ultimate_src_standard(inp: &SrcBeamShearInput) -> f64 {
     if inp.b <= 0.0 || inp.rj <= 0.0 || inp.fc <= 0.0 || inp.clear_span <= 0.0 {
         return 0.0;
     }
-    let fs = (0.15 * inp.fc).min((22.5 + 4.5 * inp.fc) / 100.0);
+    const KGF22_5_IN_SI: f64 = 22.5 * 0.098_066_5;
+    let fs = (0.15 * inp.fc).min(KGF22_5_IN_SI + 0.045 * inp.fc);
     let alpha = (4.0 / (inp.m_over_qrd.max(0.0) + 1.0)).clamp(1.0, 2.0);
     let rqu1 = inp.b * inp.rj * (0.5 * alpha * fs + 0.5 * inp.rpw * inp.rw_sigma_y);
     let rqu2 = inp.b * inp.rj * (inp.b_prime / inp.b * fs + inp.rpw * inp.rw_sigma_y);
@@ -164,9 +172,13 @@ pub fn src_beam_shear_grid(inp: &SrcNonSolidWebShearInput) -> f64 {
     let j = 0.8 * inp.d_full;
     let k = nonweb_kappa(inp.high_strength_shear_rebar);
     let concrete = k * pt.powf(0.23) * kcs * (18.0 + inp.fc) / (ssr + 0.12);
-    let hoop_r = 0.85 * (inp.rpw * inp.rw_sigma_y).max(0.0).sqrt();
-    let hoop_s = 0.5 * (inp.spw * inp.s_band_sigma_y).max(0.0).sqrt();
-    (concrete + hoop_r + hoop_s) * inp.be * j
+    // 補強筋項は √(rpw·rσwy + (1/2)·spw·sσwy) に 0.85 を乗じる（√ が帯板項まで
+    // 全体に掛かる）。0.85√(rpw·rσwy)+0.5√(spw·sσwy) と分離していた従来実装は
+    // 補強筋項を過大評価する誤りだった。
+    let hoop = 0.85
+        * ((inp.rpw * inp.rw_sigma_y).max(0.0) + 0.5 * (inp.spw * inp.s_band_sigma_y).max(0.0))
+            .sqrt();
+    (concrete + hoop) * inp.be * j
 }
 
 /// 非充腹 SRC 梁（**ラチス材**）のせん断終局強度 Qsu [N]（RESP-D 非線形モデル）。
@@ -226,7 +238,8 @@ mod tests {
     fn test_src_beam_shear_tech_standard_matches_handcalc() {
         let inp = base_input();
         let qu = src_beam_shear_ultimate_tech_standard(&inp);
-        let fs = (24.0_f64 / 20.0).min((5.0 + 24.0 / 100.0) * 1.5);
+        // fs 第2項の定数 5 kgf/cm² は SI で 0.4903 N/mm²。
+        let fs = (24.0_f64 / 20.0).min((5.0 * 0.098_066_5 + 24.0 / 100.0) * 1.5);
         let alpha = (4.0_f64 / (2.0 + 1.0)).clamp(1.0, 2.0);
         let rqu1 = 500.0 * 600.0 * (alpha * fs + 0.5 * 0.004 * 295.0);
         let rqu2 = 500.0 * 600.0 * (2.0 * 300.0 / 500.0 * fs + 0.004 * 295.0);
@@ -243,7 +256,8 @@ mod tests {
     fn test_src_beam_shear_src_standard_matches_handcalc() {
         let inp = base_input();
         let qu = src_beam_shear_ultimate_src_standard(&inp);
-        let fs = (0.15_f64 * 24.0).min((22.5 + 4.5 * 24.0) / 100.0);
+        // fs = min(0.15Fc, 22.5 + 4.5Fc/100)[kgf/cm²] → SI: min(0.15Fc, 2.2065 + 0.045Fc)。
+        let fs = (0.15_f64 * 24.0).min(22.5 * 0.098_066_5 + 0.045 * 24.0);
         let alpha = (4.0_f64 / (2.0 + 1.0)).clamp(1.0, 2.0);
         let rqu1 = 500.0 * 600.0 * (0.5 * alpha * fs + 0.5 * 0.004 * 295.0);
         let rqu2 = 500.0 * 600.0 * (300.0 / 500.0 * fs + 0.004 * 295.0);
@@ -319,9 +333,8 @@ mod tests {
         let ssr: f64 = 2.0_f64.clamp(1.0, 3.0);
         let j = 0.8 * 700.0;
         let concrete = 0.053 * pt.powf(0.23) * 0.8 * (18.0 + 24.0) / (ssr + 0.12);
-        let hoop_r = 0.85 * (0.004_f64 * 295.0).sqrt();
-        let hoop_s = 0.5 * (0.003_f64 * 235.0).sqrt();
-        let hand = (concrete + hoop_r + hoop_s) * 500.0 * j;
+        let hoop = 0.85 * (0.004_f64 * 295.0 + 0.5 * 0.003 * 235.0).sqrt();
+        let hand = (concrete + hoop) * 500.0 * j;
         assert!((qu - hand).abs() < 1e-3, "grid Qu={qu} vs {hand}");
         assert!(qu > 0.0);
     }

@@ -180,7 +180,11 @@ pub fn rebar_allowable_shear(grade: &str, long_term: bool) -> f64 {
         } else {
             195.0
         }
-    } else if g.starts_with("SD295") {
+    } else if g == "SR235" {
+        // 短期は基準強度 F=235（令90条表。従来はフォールバック 295 に落ちて
+        // F 値を 25% 超過する非保守側の誤りだった）。
+        235.0
+    } else if g == "SR295" || g.starts_with("SD295") {
         295.0
     } else if g == "SD345" {
         345.0

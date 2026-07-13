@@ -51,7 +51,7 @@
 //! - [`column`][]: 鉄骨鉄筋コンクリート造柱の断面検定（累加強度式・fc′低減）。
 //! - [`panel_zone`][]: SRC 造柱梁接合部（パネルゾーン）の断面検定（SRC 規準）。
 
-use crate::{CheckResult, DesignCheck, DesignCtx, MemberForcesAt, MemberKind, QdMethod};
+use crate::{CheckResult, DesignCheck, DesignCtx, LoadTerm, MemberForcesAt, MemberKind, QdMethod};
 use squid_n_core::model::{Material, Section};
 use squid_n_core::section_shape::{BarSet, RcRebar, SectionShape, ShearBar};
 
@@ -270,12 +270,29 @@ fn src_seismic_qd(
     Some((s_qd, r_qd))
 }
 
+/// せん断検定の部材モード（SRC規準 1987 の梁・柱の式の切替）。
+enum SrcShearMode {
+    /// 梁: 鉄骨・RC の分担検定（長短共通）。
+    /// `rQA1 = b·rj·(rα·fs + 0.5·pw·wft)`、`rQA2 = b·rj·(2(b′/b)·fs + pw·wft)`。
+    Beam,
+    /// 柱（SRC規準 P.96-97）:
+    /// - 長期は併用式 `QA = (1+β)·b·rj·a′·fs` を全せん断力と比較する
+    ///   （`a′ = rα`（`b′/b ≥ rα/3` のとき）または `3b′/b`、`1 ≤ rα ≤ 2`）。
+    /// - 短期は鉄骨部 `sQA`（強軸 `dw·tw·sfs`／弱軸 `(4/3)·bf·tf·sfs`）と
+    ///   RC 部 `rQAS1 = b·rj·(fs + 0.5·pw·wft)`（**α を含まない**）・
+    ///   `rQAS2 = b·rj·(2(b′/b)·fs + pw·wft)` を分担 `sQD`/`rQD` と比較する。
+    ///
+    /// `beta` は鉄骨ウェブの形式と寸法による係数
+    /// （充腹 `β = n·tw·sd/(b·rj)`、弱軸・非充腹 `β = 1.33·n·bf·tf/(b·rj)`）。
+    Column { beta: f64 },
+}
+
 /// 全せん断力を鉄骨部分・RC 部分に分担させ、それぞれの許容せん断力と比較する
-/// （梁・柱の両方向で共通利用）。`seismic.ctx.seismic_qd` が Some で当該評価
-/// 位置の長期内力が見つかる場合は地震時短期の構造規定方式（[`src_seismic_qd`]）
-/// による設計用せん断力 `sQD`/`rQD` を用い、それ以外は SRC 規準・構造規定の
-/// 長期式の一般化（弾性分担 `share = sz/(sz+at・rj)` を当該組合せの全せん断力
-/// にそのまま適用）で代替する。
+/// （梁・柱の両方向で共通利用。式の切替は [`SrcShearMode`]）。
+/// `seismic.ctx.seismic_qd` が Some で当該評価位置の長期内力が見つかる場合は
+/// 地震時短期の構造規定方式（[`src_seismic_qd`]）による設計用せん断力
+/// `sQD`/`rQD` を用い、それ以外は弾性分担 `share = sz/(sz+at・rj)` を当該
+/// 組合せの全せん断力にそのまま適用して代替する。
 #[allow(clippy::too_many_arguments)]
 fn src_shear_check(
     q_signed: f64,
@@ -293,10 +310,48 @@ fn src_shear_check(
     s_fs: f64,
     steel_shear_area: f64,
     alpha_max: f64,
+    mode: &SrcShearMode,
     seismic: &SrcSeismicCtx,
 ) -> SrcShearResult {
     let alpha = shear_alpha_src(m_for_alpha, q_for_alpha, rd, alpha_max);
     let q = q_signed.abs();
+
+    // SRC 規準1987 準拠: 「pw が 0.6% を超える場合は 0.6% として算定する」
+    // （長期・短期の区別は記載されていないため、長短期とも 0.6% を上限とする。
+    // RC の短期 1.2% とは異なる点に注意）。
+    let pw_cap = 0.006;
+    let pw = pw_raw.min(pw_cap);
+
+    let b_ratio = if b > 1e-9 {
+        (b_prime / b).max(0.0)
+    } else {
+        0.0
+    };
+
+    // 柱・長期: 併用式 QA = (1+β)·b·rj·a′·fs（SRC規準 P.96-97）。
+    // 鉄骨・RC の分担ではなく、β で鉄骨ウェブの寄与を見込んだ全体式を
+    // 全せん断力と比較する。
+    if let SrcShearMode::Column { beta } = mode {
+        if seismic.ctx.term == LoadTerm::Long {
+            let a_prime = if b_ratio >= alpha / 3.0 {
+                alpha
+            } else {
+                3.0 * b_ratio
+            };
+            let qa = (1.0 + beta) * b * rj * a_prime * fs;
+            let ratio = if qa > 1e-9 { q / qa } else { 0.0 };
+            return SrcShearResult {
+                ratio,
+                s_q: 0.0,
+                r_q: q,
+                s_qa: steel_shear_area * s_fs,
+                r_qa: qa,
+                alpha,
+                pw,
+                used_qd: false,
+            };
+        }
+    }
 
     let denom = sz + at * rj;
     let share = if denom > 1e-12 { sz / denom } else { 1.0 };
@@ -311,18 +366,12 @@ fn src_shear_check(
 
     let s_qa = steel_shear_area * s_fs;
 
-    // SRC 規準1987 準拠: 「pw が 0.6% を超える場合は 0.6% として算定する」
-    // （RESP-D マニュアル「04 断面検定」SRC 部分。長期・短期の区別は記載
-    // されていないため、長短期とも 0.6% を上限とする。RC の短期 1.2% とは
-    // 異なる点に注意）。
-    let pw_cap = 0.006;
-    let pw = pw_raw.min(pw_cap);
-
-    let r_qa1 = b * rj * (alpha * fs + 0.5 * pw * w_ft);
-    let b_ratio = if b > 1e-9 {
-        (b_prime / b).max(0.0)
-    } else {
-        0.0
+    // RC 部の許容せん断力。柱の短期 rQAS1 は α を含まない（SRC規準。
+    // α を乗じると許容を最大2倍に過大評価する非保守側の誤りとなる）。
+    // 梁は長短とも rα（α_L/α_S1/α_S2）を含む。
+    let r_qa1 = match mode {
+        SrcShearMode::Beam => b * rj * (alpha * fs + 0.5 * pw * w_ft),
+        SrcShearMode::Column { .. } => b * rj * (fs + 0.5 * pw * w_ft),
     };
     let r_qa2 = b * rj * (2.0 * b_ratio * fs + pw * w_ft);
     let r_qa = r_qa1.min(r_qa2);

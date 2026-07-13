@@ -869,16 +869,19 @@ pub fn lateral_buckling_mu_ratio(lambda_b: f64, kappa: f64, w_f: f64, e_lambda_b
     };
     let r = if kappa <= 0.0 { 0.5 * kappa + 1.0 } else { 1.0 };
     let alpha_lambda = -0.2 * kappa - 0.25;
-    // 変形性能指標 Λc' = ((λb/eλb) + WF/3)^(1/3)。
-    let lambda_c = ((lambda_b / e_lambda_b) + w_f / 3.0).max(0.0).cbrt();
-    // 歪硬化による耐力上昇率 h0。
+    // 変形性能指標 Λc' = ((λb/eλb) + WF³)^(1/3)（井戸田ほか 2015。
+    // WF/3 としていた従来実装は原典 WF³ の誤読）。
+    let lambda_c = ((lambda_b / e_lambda_b) + w_f.powi(3)).max(0.0).cbrt();
+    // 歪硬化による耐力上昇率 h0 = αΛ·(Λc'−1.25)+1.0（Λc'≤1.25）。
+    // Λc' を余分に乗じていた従来実装を原典どおりに是正。
     let h0 = if lambda_c <= 1.25 {
-        alpha_lambda * lambda_c * (lambda_c - 1.25) + 1.0
+        alpha_lambda * (lambda_c - 1.25) + 1.0
     } else {
         1.0
     };
-    // 初期たわみ係数 cdef = qκ·kdef·r。
-    let c_def = q_kappa * K_DEF * r;
+    // 初期たわみ係数 cdef = qκ·kdef^r（べき乗。kdef·r の乗算は誤り。
+    // 既定 kdef=1.0 では kdef^r=1 となり cdef=qκ）。
+    let c_def = q_kappa * K_DEF.powf(r);
     let a = 1.0 + c_def * lambda_b + (1.0 + C_RES) * lambda_b * lambda_b;
     let disc = (a * a - 4.0 * lambda_b * lambda_b * (1.0 + C_RES * lambda_b * lambda_b)).max(0.0);
     let denom = a + disc.sqrt();

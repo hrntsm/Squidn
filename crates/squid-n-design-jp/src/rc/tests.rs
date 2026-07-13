@@ -174,6 +174,10 @@ fn test_rebar_allowable_tension_table() {
 #[test]
 fn test_rebar_allowable_shear_table() {
     assert!((rebar_allowable_shear("SR235", true) - 155.0).abs() < 1e-9);
+    // 短期は基準強度 F=235（令90条表）。フォールバック 295 に落ちて F 値を
+    // 超過していた回帰の防止。
+    assert!((rebar_allowable_shear("SR235", false) - 235.0).abs() < 1e-9);
+    assert!((rebar_allowable_shear("SR295", false) - 295.0).abs() < 1e-9);
     assert!((rebar_allowable_shear("SD345", true) - 195.0).abs() < 1e-9);
     assert!((rebar_allowable_shear("SD295A", false) - 295.0).abs() < 1e-9);
     assert!((rebar_allowable_shear("SD345", false) - 345.0).abs() < 1e-9);

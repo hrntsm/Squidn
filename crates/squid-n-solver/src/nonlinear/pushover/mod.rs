@@ -1,4 +1,6 @@
-use crate::analysis::{distribute_pi_over_diaphragms, steel_height_ratio, SeismicDir};
+use crate::analysis::{
+    building_height_mm, distribute_pi_over_diaphragms, steel_height_ratio, SeismicDir,
+};
 use crate::arc_length::ArcLengthSolver;
 use crate::constraint::Reducer;
 use crate::transaction::{StateSnapshot, StatefulModel};
@@ -360,9 +362,10 @@ pub fn pushover_analysis_recording(
     if stories.is_empty() {
         return Err("no stories defined".into());
     }
-    let height_m = stories.last().map(|s| s.elevation).unwrap_or(0.0) / 1000.0;
-    // 略算周期の鉄骨造比 α（レビュー §1.5）。steel_height_ratio は analysis.rs の
+    // h は建築物の高さ（GL〜PH 階を除く最上階。令88条・告示1793号）。
+    // steel_height_ratio / building_height_mm は analysis.rs の
     // seismic_static_with と共有する実装。
+    let height_m = building_height_mm(model) / 1000.0;
     let steel_ratio = steel_height_ratio(model);
     let t = squid_n_load::ai::approx_t(height_m, steel_ratio);
     let z = 1.0;
@@ -788,8 +791,9 @@ fn is_steel_shape(shape: &SectionShape) -> bool {
     )
 }
 
-/// 部材の曲げヒンジ閾値（実スケルトン）を算定する（RESP-D「05 非線形モデル」）。
-/// RC: Mc=κ·Fc·Ze（κ=0.56）・My=0.9·at·σy·j。鉄骨: Mp=Zp·σy（Mc=My）。
+/// 部材の曲げヒンジ閾値（実スケルトン）を算定する。
+/// RC: Mc=κ·√Fc·Ze（κ=0.56、技術基準解説書 P.621-623）・My=0.9·at·σy·d（同 P.623）。
+/// 鉄骨: Mp=Zp·σy（Mc=My）。
 /// 複合断面・形状不明は σy·Ze を降伏とする改良簡易値でフォールバックする。
 fn member_moment_thresholds(elem: &ElementData, model: &Model) -> HingeThreshold {
     let Some(sec) = elem.section.and_then(|sid| model.sections.get(sid.index())) else {
@@ -811,9 +815,9 @@ fn member_moment_thresholds(elem: &ElementData, model: &Model) -> HingeThreshold
     match &sec.shape {
         Some(SectionShape::RcRect { rebar, d, .. }) | Some(SectionShape::RcCircle { rebar, d }) => {
             let fc = mat.and_then(|m| m.fc).unwrap_or(0.0);
-            // 曲げひび割れ Mc = κ·Fc·Ze（κ=0.56、RESP-D「05 非線形モデル」）。
-            let mc = 0.56 * fc * ze;
-            // 曲げ降伏 My = 0.9·at·σy·j（rc_mu_simple）。at は片側引張筋（対称配筋仮定）。
+            // 曲げひび割れ Mc = κ·√Fc·Ze（κ=0.56、技術基準解説書 P.621-623）。
+            let mc = 0.56 * fc.max(0.0).sqrt() * ze;
+            // 曲げ降伏 My = 0.9·at·σy·d（rc_mu_simple）。at は片側引張筋（対称配筋仮定）。
             let sigma_y_rebar = mat.and_then(|m| m.fy).unwrap_or(345.0);
             let at = bar_set_area(&rebar.main_x) / 2.0;
             let d_eff = (d - rebar.cover - rebar.main_x.dia / 2.0).max(0.0);
@@ -845,7 +849,7 @@ fn member_moment_thresholds(elem: &ElementData, model: &Model) -> HingeThreshold
             let my = sigma_y_steel * ze;
             let fc = mat.and_then(|m| m.fc).unwrap_or(0.0);
             let mc = if fc > 0.0 {
-                (0.56 * fc * ze).min(my)
+                (0.56 * fc.sqrt() * ze).min(my)
             } else {
                 my
             };

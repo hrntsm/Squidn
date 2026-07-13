@@ -612,6 +612,11 @@ pub fn install_japanese_fonts(ctx: &egui::Context) {
 /// `sync_slab_loads_action` が同期先とする専用荷重ケース名（レビュー §1.1）。
 pub const SLAB_AUTO_LOAD_CASE_NAME: &str = "床荷重(自動)";
 
+/// `sync_self_weight_action` が同期先とする専用荷重ケース名。
+/// `squid_n_load::self_weight` の定数を単一ソースオブトゥルースとして再公開する。
+pub const SELF_WEIGHT_AUTO_LOAD_CASE_NAME: &str =
+    squid_n_load::self_weight::SELF_WEIGHT_AUTO_LOAD_CASE_NAME;
+
 /// 節点ペアが鉛直材（柱）かどうかを判定する。両端の水平距離（XY平面）が
 /// 1mm 未満なら鉛直とみなす（`squid_n_load::story_gen::is_vertical_pair` と
 /// 同じ判定規則。あちらは非公開のためここで同じ規則を再実装する）。
@@ -658,7 +663,10 @@ pub fn column_live_load_factors(model: &squid_n_core::model::Model) -> Vec<(Elem
 
 /// 地震用重量に算入する重力ケースを `LoadCaseKind` から選択する（レビュー §1.7）。
 ///
-/// - `kind == Dead` の全ケースを対象とする。
+/// - `kind == Dead` の全ケースを対象とする。ただし「自重(自動)」
+///   （[`SELF_WEIGHT_AUTO_LOAD_CASE_NAME`]）は除外する。階の自動生成
+///   （`story_gen`）が自重を密度から直接集計するため、自動生成された
+///   自重ケースを含めると二重計上になる。
 /// - `kind == LiveSeismic`（地震用積載）のケースがあれば併せて対象とする。
 ///   無ければ `kind == Live`（長期用積載）で代用する
 ///   （マニュアル「床の積載荷重は地震用の値とします」の趣旨。地震用の値が
@@ -680,7 +688,7 @@ fn gravity_cases_for_seismic_weight(model: &squid_n_core::model::Model) -> Vec<L
     let mut result: Vec<LoadCaseId> = model
         .load_cases
         .iter()
-        .filter(|lc| lc.kind == LoadCaseKind::Dead)
+        .filter(|lc| lc.kind == LoadCaseKind::Dead && lc.name != SELF_WEIGHT_AUTO_LOAD_CASE_NAME)
         .map(|lc| lc.id)
         .collect();
 

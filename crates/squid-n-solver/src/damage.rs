@@ -7,7 +7,7 @@
 //!   各サイクルの片振幅を μ として `Nf = (μ/C)^(−1/β)`（破断寿命）、`Di = Nei/Nfi`、
 //!   `D = Σ Di`（Miner 則）。振幅は振れ幅（peak-to-peak）としてカウントされるため、
 //!   片振幅としての μ は振れ幅の 1/2 とする。
-//! - **累積塑性変形倍率（最大振幅）**: `D = η/4·(μmax−1)·(μmax/C)^(1/β)`。
+//! - **累積塑性変形倍率（最大振幅）**: `D = η/(4·(μmax−1))·(μmax/C)^(1/β)`。
 
 /// 鉄骨疲労特性（`Nf = (μ/C)^(−1/β)`）。
 ///
@@ -122,12 +122,14 @@ pub fn cumulative_damage_rainflow(ductility_series: &[f64], p: FatigueParams) ->
 }
 
 /// 累積塑性変形倍率（最大振幅）による累積損傷度
-/// `D = η/4·(μmax−1)·(μmax/C)^(1/β)`。`μmax<1` は 0。
+/// `D = η/(4·(μmax−1))·(μmax/C)^(1/β)`。`μmax≤1` は 0。
+/// （(μmax−1) は分母。分子に乗じていた従来実装は μmax が大きいほど
+/// D を過大、1 に近いほど過小に評価する誤りだった。）
 pub fn cumulative_damage_max_amplitude(mu_max: f64, eta: f64, p: FatigueParams) -> f64 {
     if p.c <= 0.0 || p.beta <= 0.0 || mu_max <= 1.0 {
         return 0.0;
     }
-    (eta / 4.0) * (mu_max - 1.0) * (mu_max / p.c).powf(1.0 / p.beta)
+    eta / (4.0 * (mu_max - 1.0)) * (mu_max / p.c).powf(1.0 / p.beta)
 }
 
 /// 累積損傷度の算定方式（RESP-D「07」）。
@@ -188,11 +190,11 @@ mod tests {
 
     #[test]
     fn test_cumulative_damage_max_amplitude_handcalc() {
-        // D = η/4·(μmax−1)·(μmax/C)^(1/β)。μmax=4,η=1,C=20,β=0.5:
-        // 0.25·3·(0.2)^2 = 0.25·3·0.04 = 0.03。
+        // D = η/(4·(μmax−1))·(μmax/C)^(1/β)。μmax=4,η=1,C=20,β=0.5:
+        // 1/(4·3)·(0.2)^2 = (1/12)·0.04 = 0.003333…。
         let p = FatigueParams { c: 20.0, beta: 0.5 };
         let d = cumulative_damage_max_amplitude(4.0, 1.0, p);
-        assert!((d - 0.03).abs() < 1e-9, "D={d}");
+        assert!((d - 0.04 / 12.0).abs() < 1e-9, "D={d}");
         // μmax<1 は 0。
         assert_eq!(cumulative_damage_max_amplitude(0.5, 1.0, p), 0.0);
     }

@@ -90,9 +90,13 @@ pub struct FemaBeamParams {
     pub fc_prime: f64,
 }
 
-/// C 判定（せん断補強良好）: s ≤ D/3 かつ Vs ≥ 0.75・V。それ以外は NC。
+/// C 判定（せん断補強良好）: s ≤ d/3 かつ Vs ≥ 0.75・V。それ以外は NC。
+///
+/// s の比較基準は FEMA 356 Table 6-7 脚注のとおり有効せい d（`d`）とする。
+/// 全せい D（`depth_d`）を基準にすると D > d のぶん C 側（緩い側）に
+/// 判定されやすく、原典より非保守になるため用いない。
 pub fn fema_is_c(p: &FemaBeamParams) -> bool {
-    p.s <= p.depth_d / 3.0 && p.vs >= 0.75 * p.v_yield
+    p.s <= p.d / 3.0 && p.vs >= 0.75 * p.v_yield
 }
 
 /// 区間 [x0, x1] の線形補間（x は [x0, x1] にクランプ）。
@@ -184,6 +188,12 @@ pub struct StagedStrengthLossResult {
 /// - 水平材（梁系）: 材端の鉛直相対変位 / 材長（弦回転角）。
 ///
 /// `disp` は `PushoverStep::node_disp`（`DofMap` アクティブ添字順の全節点変位）。
+///
+/// **既知の近似（保守側）:** この弦回転角は弾性変形・剛体回転成分を含む
+/// 全回転角であり、FEMA 356 の塑性回転角 a（降伏後の塑性成分のみ）と
+/// 比較する際は塑性成分を過大評価する（喪失判定が早まる＝保有耐力を
+/// 過小評価する保守側）。降伏時回転角の控除（θp = θ − θy）は
+/// ヒンジ塑性回転の抽出を要するため将来課題とする。
 fn member_drift_angle(model: &Model, dofmap: &DofMap, disp: &[f64], elem: &ElementData) -> f64 {
     if elem.nodes.len() < 2 {
         return 0.0;

@@ -16,7 +16,7 @@
 //!   ξ・η の定義は要原典照合）、無い場合は矩形の 1.2
 //!
 //! 上下大梁の剛性倍率（既定 100 倍）は梁要素側（`beam.rs`）で扱う。
-//! 側柱の面内両端ピン化は未対応（方向別端部解放が必要。照合レポート参照）。
+//! 側柱の面内両端ピン化は `side_column.rs`（方向別端部解放の静縮約）で扱う。
 
 use crate::beam::BeamElement;
 use crate::behavior::{Ctx, ElemState, ElementBehavior, LocalMat, LocalVec, MassOption};

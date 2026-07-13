@@ -450,7 +450,9 @@ fn test_member_load_reaction_distribution_end_to_end() {
 
 #[test]
 fn test_face_reduction_applies_only_to_concrete() {
-    // §1.8: RC/SRC 梁(fc あり)は柱面間距離、S 梁(fc なし)は節点間距離。
+    // §1.8: RC/SRC の柱（鉛直材）は床上面から床上面（＝節点間距離。フェイス控除
+    // しない）、S 柱も節点間距離。single_beam_model は鉛直材（柱）なので、
+    // fc の有無によらず全長で算定される（マニュアル「柱の長さ」）。
     let len = 4000.0;
     let area = 90000.0;
     let density = 2.4e-9;
@@ -462,8 +464,7 @@ fn test_face_reduction_applies_only_to_concrete() {
 
     let rc_model = single_beam_model(len, density, area, Some(24.0), rz, None);
     let rc = generate_stories(&rc_model, None).unwrap();
-    let eff_len_rc = len - 300.0 - 300.0;
-    let expected_rc = density * area * eff_len_rc * GRAVITY_MM_S2 / 2.0;
+    let expected_rc = density * area * len * GRAVITY_MM_S2 / 2.0;
     assert!(
         (rc.stories[0].seismic_weight.unwrap() - expected_rc).abs() < 1e-6,
         "{}",
@@ -477,6 +478,93 @@ fn test_face_reduction_applies_only_to_concrete() {
         (s.stories[0].seismic_weight.unwrap() - expected_s).abs() < 1e-6,
         "{}",
         s.stories[0].seismic_weight.unwrap()
+    );
+}
+
+#[test]
+fn test_face_reduction_applies_to_horizontal_concrete_beam() {
+    // §1.8: RC/SRC の水平材（梁）は柱面間距離（len − face_i − face_j）で算定する。
+    // 鉛直材（柱）は同じフェイス値でも控除しない（前テストで検証）。
+    let len = 6000.0;
+    let area = 400.0 * 700.0;
+    let density = 2.4e-9;
+    let mut model = Model::default();
+    for (i, c) in [
+        [0.0, 0.0, 0.0],
+        [0.0, 0.0, 3000.0],
+        [len, 0.0, 3000.0],
+        [len, 0.0, 0.0],
+    ]
+    .iter()
+    .enumerate()
+    {
+        model.nodes.push(Node {
+            id: NodeId(i as u32),
+            coord: *c,
+            restraint: if c[2] == 0.0 {
+                Dof6Mask::FIXED
+            } else {
+                Dof6Mask::FREE
+            },
+            mass: None,
+            story: None,
+        });
+    }
+    model.sections.push(Section {
+        id: SectionId(0),
+        name: "RC".into(),
+        area,
+        iy: 1.0e8,
+        iz: 1.0e8,
+        j: 1.0e8,
+        depth: 700.0,
+        width: 400.0,
+        as_y: 0.0,
+        as_z: 0.0,
+        panel_thickness: None,
+        thickness: None,
+        shape: None,
+    });
+    model.materials.push(Material {
+        concrete_class: Default::default(),
+        id: MaterialId(0),
+        name: "Fc24".into(),
+        young: 22000.0,
+        poisson: 0.2,
+        density,
+        shear: None,
+        fc: Some(24.0),
+        fy: None,
+    });
+    // 水平梁（節点1→2）のみ断面・材料を持たせ、フェイス控除を検証する。
+    model.elements.push(ElementData {
+        id: ElemId(0),
+        kind: ElementKind::Beam,
+        nodes: [NodeId(1), NodeId(2)].into_iter().collect(),
+        section: Some(SectionId(0)),
+        material: Some(MaterialId(0)),
+        local_axis: LocalAxis {
+            ref_vector: [0.0, 0.0, 1.0],
+        },
+        end_cond: [EndCondition::Fixed, EndCondition::Fixed],
+        force_regime: ForceRegime::Auto,
+        rigid_zone: RigidZone {
+            face_i: 400.0,
+            face_j: 400.0,
+            ..Default::default()
+        },
+        plastic_zone: None,
+        spring: None,
+    });
+
+    let gen = generate_stories(&model, None).unwrap();
+    let eff_len = len - 400.0 - 400.0;
+    let expected = density * area * eff_len * GRAVITY_MM_S2;
+    assert!(
+        (gen.stories[0].seismic_weight.unwrap() - expected).abs() < 1e-6,
+        "w={} expected={}",
+        gen.stories[0].seismic_weight.unwrap(),
+        expected
     );
 }
 

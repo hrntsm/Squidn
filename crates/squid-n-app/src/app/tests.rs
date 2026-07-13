@@ -422,7 +422,14 @@ fn test_seismic_flow_requires_then_uses_stories() {
     app.nav.focus_result = Some(StaticKey::Case(StaticCaseKey::Seismic(SeismicDir::X)));
     assert_eq!(app.current_static().unwrap().disp, seismic_disp);
 
-    // undo で階定義が戻る
+    // undo で自重(自動)の同期 → 階定義の順に戻る
+    // （run_linear_static が自重(自動)ケースの同期を undo 履歴に積むため 2 回）
+    app.undo.undo(&mut app.model);
+    assert!(app
+        .model
+        .load_cases
+        .iter()
+        .all(|lc| lc.name != SELF_WEIGHT_AUTO_LOAD_CASE_NAME));
     app.undo.undo(&mut app.model);
     assert!(app.model.stories.is_empty());
 }
@@ -1163,8 +1170,9 @@ fn test_rc_capacity_input_from_rect_matches_handcalc() {
     assert_eq!(input.clear_span, clear_span);
 
     // rc_qsu_simple/rc_qmu_simple の結果を、式を独立に書き下した手計算と照合する。
+    // Mu = 0.9·at·σy·d（技術基準解説書 P.623。d = 有効せい）。
     let j = 7.0 * d_eff_expected / 8.0;
-    let mu_handcalc = 0.9 * at_expected * 345.0 * j;
+    let mu_handcalc = 0.9 * at_expected * 345.0 * d_eff_expected;
     let qmu_handcalc = 2.0 * mu_handcalc / clear_span;
     let pt = 100.0 * at_expected / (400.0 * d_eff_expected);
     let shear_span_ratio = (clear_span / (2.0 * d_eff_expected)).clamp(1.0, 3.0);

@@ -87,6 +87,10 @@ pub struct MemberDemand {
     /// 部材別のヒンジ回転角 Rp [rad]（プッシュオーバー終局時の部材変形角）。`Some`
     /// のとき ν・cotφ・μ・tanθ に用いる Rp を [`UltimateShearOptions::rp`] から置き換える。
     pub rp: Option<f64>,
+    /// 長期せん断力 QL [N]（絶対値で扱う）。`Some` のとき梁のせん断・付着余裕率の
+    /// 分子を `(Qsu − QL)`・`(Qbu − QL)` とする（余裕率
+    /// `(Qsu−QL)/Qmu ≥ 1.0` の定義。`None` は従来どおり QL=0 扱い）。
+    pub q_long: Option<f64>,
 }
 
 impl MemberDemand {
@@ -99,6 +103,7 @@ impl MemberDemand {
             shear: None,
             shear_weak: None,
             rp: None,
+            q_long: None,
         }
     }
 
@@ -121,6 +126,7 @@ impl MemberDemand {
             shear: Some(shear),
             shear_weak: Some(shear_weak),
             rp: Some(rp),
+            q_long: None,
         }
     }
 }
@@ -629,11 +635,18 @@ fn check_member(
         (0.0, 0.0)
     };
 
-    let shear_margin = if qmu > 0.0 { qsu / qmu } else { f64::INFINITY };
+    // 梁の余裕率は分子から長期せん断力 QL を控除する
+    // （(Qsu−QL)/Qmu・(Qbu−QL)/Qmu ≥ 1.0。QL 未指定は 0 扱い＝従来動作）。
+    let ql = demand.q_long.map(|q| q.abs()).unwrap_or(0.0);
+    let shear_margin = if qmu > 0.0 {
+        ((qsu - ql).max(0.0)) / qmu
+    } else {
+        f64::INFINITY
+    };
     let bond_margin = if !opts.include_bond {
         f64::INFINITY
     } else if qmu > 0.0 {
-        qbu / qmu
+        ((qbu - ql).max(0.0)) / qmu
     } else {
         f64::INFINITY
     };

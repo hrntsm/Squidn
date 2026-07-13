@@ -8,26 +8,29 @@
 //! せん断はひび割れ Qc、軸は (引張ひび割れ Nct, 引張降伏 Nut, 圧縮降伏 Nuc)。
 //!
 //! # 準拠する規準・出典
-//! - 曲げひび割れ Mc=κ·Fc·Ze（κ=0.56）: 技術基準解説書 P.621-623。
+//! - 曲げひび割れ Mc=κ·√Fc·Ze（κ=0.56、Fc [N/mm²]）: 技術基準解説書 P.621-623。
 //! - 曲げ降伏時剛性低下率 αy（菅野式）: 梅村魁『鉄筋コンクリート建物の動的
 //!   耐震設計法』P.106-108（[`squid_n_core::rc_capacity::rc_alpha_y_sugano`]）。
-//! - 曲げ終局 My=0.9·at·σy·j: 技術基準解説書 P.623（[`squid_n_core::rc_capacity::rc_mu_simple`]）。
-//! - せん断ひび割れ Qc=(0.061·(Fc+49)/(M/(Q·d)+1.7))·b·j: RESP-D 非線形モデル。
-//! - 軸: Nct=κ·Fc·Ac（κ=0.56）, Nut=at·σy, Nuc=at·σy+Fc·(Ac−at)。
+//! - 曲げ終局 My=0.9·at·σy·d（d=有効せい）: 技術基準解説書 P.623
+//!   （[`squid_n_core::rc_capacity::rc_mu_simple`]）。
+//! - せん断ひび割れ Qc=(0.061·(Fc+49)/(M/(Q·d)+1.7))·b·j: 実務式（要原典照合）。
+//! - 軸: Nct=κ·√Fc·Ac（κ=0.56）, Nut=at·σy, Nuc=at·σy+Fc·(Ac−at)。
 
 use squid_n_core::rc_capacity::{rc_alpha_y_sugano, rc_mu_simple, RcCapacityInput};
 
-/// RC 梁の曲げひび割れ強度 Mc [N·mm]（RESP-D 非線形モデル）。
-/// `Mc = κ·Fc·Ze`（κ=0.56、Ze=鉄筋を考慮した引張側断面係数 Ie/(D−g) または Ie/g）。
+/// RC 梁の曲げひび割れ強度 Mc [N·mm]（技術基準解説書 P.621-623）。
+/// `Mc = κ·√Fc·Ze`（κ=0.56、Fc [N/mm²]、Ze=鉄筋を考慮した引張側断面係数
+/// Ie/(D−g) または Ie/g）。√Fc を 1 乗の Fc としていた従来実装は Mc を
+/// √Fc 倍（Fc=24 で約 4.9 倍）過大評価する誤りだった。
 /// 不正入力（Fc・Ze のいずれかが 0 以下）は 0.0。
 pub fn rc_beam_crack_moment(fc: f64, ze: f64) -> f64 {
     if fc <= 0.0 || ze <= 0.0 {
         return 0.0;
     }
-    0.56 * fc * ze
+    0.56 * fc.sqrt() * ze
 }
 
-/// RC 梁のせん断ひび割れ強度 Qc [N]（RESP-D 非線形モデル、トリリニア用）。
+/// RC 梁のせん断ひび割れ強度 Qc [N]（実務式・トリリニア用。要原典照合）。
 /// `Qc = (0.061·(Fc+49)/(M/(Q·d)+1.7))·b·j`。
 /// 不正入力（Fc・b・j のいずれかが 0 以下）は 0.0。
 pub fn rc_beam_shear_crack(fc: f64, m_over_qd: f64, b: f64, j: f64) -> f64 {
@@ -37,8 +40,9 @@ pub fn rc_beam_shear_crack(fc: f64, m_over_qd: f64, b: f64, j: f64) -> f64 {
     (0.061 * (fc + 49.0) / (m_over_qd.max(0.0) + 1.7)) * b * j
 }
 
-/// RC 梁の軸復元力特性（引張ひび割れ・引張降伏・圧縮降伏）[N]（RESP-D 非線形モデル）。
-/// - 引張ひび割れ `Nct = κ·Fc·Ac`（κ=0.56、引張正）
+/// RC 梁の軸復元力特性（引張ひび割れ・引張降伏・圧縮降伏）[N]。
+/// - 引張ひび割れ `Nct = κ·√Fc·Ac`（κ=0.56、Fc [N/mm²]、引張正。
+///   曲げひび割れ Mc と同じ κ·√Fc 系の略算）
 /// - 引張降伏 `Nut = at·σy`
 /// - 圧縮降伏 `Nuc = at·σy + Fc·(Ac − at)`
 #[derive(Clone, Copy, Debug)]
@@ -52,7 +56,7 @@ pub struct RcAxial {
 /// `sigma_y`: 鉄筋降伏、`fc`: コンクリート強度。
 pub fn rc_beam_axial(fc: f64, ac: f64, at: f64, sigma_y: f64) -> RcAxial {
     let nct = if fc > 0.0 && ac > 0.0 {
-        0.56 * fc * ac
+        0.56 * fc.sqrt() * ac
     } else {
         0.0
     };
@@ -138,10 +142,10 @@ mod tests {
 
     #[test]
     fn test_rc_beam_crack_moment() {
-        // Mc = 0.56·24·(300·600²/6) = 0.56·24·1.8e7
+        // Mc = 0.56·√24·(300·600²/6)（技術基準解説書 P.621-623）
         let ze = 300.0 * 600.0_f64.powi(2) / 6.0;
         let mc = rc_beam_crack_moment(24.0, ze);
-        assert!((mc - 0.56 * 24.0 * ze).abs() < 1e-3);
+        assert!((mc - 0.56 * 24.0_f64.sqrt() * ze).abs() < 1e-3);
         assert_eq!(rc_beam_crack_moment(0.0, ze), 0.0);
     }
 
@@ -156,7 +160,7 @@ mod tests {
     #[test]
     fn test_rc_beam_axial_matches_handcalc() {
         let ax = rc_beam_axial(24.0, 180_000.0, 2000.0, 345.0);
-        assert!((ax.tension_crack - 0.56 * 24.0 * 180_000.0).abs() < 1e-3);
+        assert!((ax.tension_crack - 0.56 * 24.0_f64.sqrt() * 180_000.0).abs() < 1e-3);
         assert!((ax.tension_yield - 2000.0 * 345.0).abs() < 1e-6);
         assert!(
             (ax.compression_yield - (2000.0 * 345.0 + 24.0 * (180_000.0 - 2000.0))).abs() < 1e-3
@@ -180,9 +184,8 @@ mod tests {
             ec: 21000.0,
         };
         let b = rc_beam_bending(&inp);
-        // My = 0.9·at·σy·(7·d_eff/8) の手計算一致。
-        let j = 7.0 * 540.0 / 8.0;
-        assert!((b.my - 0.9 * 1935.0 * 345.0 * j).abs() < 1e-3);
+        // My = 0.9·at·σy·d の手計算一致（技術基準解説書 P.623。d = 有効せい）。
+        assert!((b.my - 0.9 * 1935.0 * 345.0 * 540.0).abs() < 1e-3);
         // ひび割れ < 降伏（健全な折れ点順序）。
         assert!(b.mc > 0.0 && b.mc < b.my, "Mc={} My={}", b.mc, b.my);
         // αy は 0〜1 の妥当値。

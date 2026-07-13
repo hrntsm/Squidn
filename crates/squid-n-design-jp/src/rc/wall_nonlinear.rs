@@ -107,10 +107,11 @@ impl WallShearTrilinear {
     }
 }
 
-/// せん断ひび割れ強度 Qc [N]（RESP-D 非線形モデル・耐震壁）。
+/// せん断ひび割れ強度 Qc [N]（技術基準解説書 P.635-637・耐震壁）。
 ///
-/// `Qc = (0.043·pg + 0.051)·√Fc·Aw`（Fc [kgf/cm²]・Aw [cm²]・pg [%] → Qc [kgf]）。
-/// `pg = 100·(引張側最端の柱1本の主筋量)/Aw` [%]。
+/// `Qc = (0.043·pg + 0.051)·Fc·Aw`（Fc [kgf/cm²]・Aw [cm²]・pg [%] → Qc [kgf]）。
+/// `pg = 100·(引張側最端の柱1本の主筋量)/Aw` [%]。Fc は 1 乗で用いる
+/// （√Fc としていた従来実装は Qc を大幅に過小評価する誤りだった）。
 ///
 /// 入力は SI 系で受け取り、内部で工学単位系へ換算して評価し N へ戻す。
 /// 不正入力（Fc・Aw のいずれかが 0 以下）は 0.0 を返す。
@@ -122,7 +123,7 @@ pub fn wall_shear_crack(inp: &WallShearTrilinearInput) -> f64 {
     let aw_cm2 = inp.aw / 100.0;
     // pg [%]（面積比は単位に依存しないため mm² のまま比を取り 100 倍する）。
     let pg_pct = 100.0 * inp.tension_column_main_area.max(0.0) / inp.aw;
-    let qc_kgf = (0.043 * pg_pct + 0.051) * fc_kgf.sqrt() * aw_cm2;
+    let qc_kgf = (0.043 * pg_pct + 0.051) * fc_kgf * aw_cm2;
     qc_kgf * KGF_TO_N
 }
 
@@ -155,9 +156,12 @@ pub fn wall_shear_opening_reduction(opening: Option<(f64, f64, f64, f64)>) -> f6
 /// 終局せん断強度 Qu [N]（荒川mean式系・耐震壁、RESP-D 非線形モデル）。
 ///
 /// ```text
-/// Qu = { k·pte^0.23·(Fc+18)/(M/(Q·D)+0.12) + 0.85·√(σwh·pwh) + 0.1·σ0 }·te·j·r
+/// Qu = { 0.053·pte^0.23·(Fc+18)/(M/(Q·D)+0.12)    + 0.85·√(σwh·pwh) + 0.1·σ0 }·te·j·r
+/// Qu = { 0.068·pte^0.23·(Fc+18)/√(M/(Q·D)+0.12)   + 0.85·√(σwh·pwh) + 0.1·σ0 }·te·j·r
 /// ```
-/// - `k = 0.053`（既定）／`0.068`（高強度せん断補強筋）
+/// - `k = 0.053`（既定。技術基準解説書 P.638-639 の式で、せん断スパン比の
+///   分母は 1 乗）／`0.068`（高強度せん断補強筋。同 P.281-282 の式で、
+///   分母は `√(M/(Q·D)+0.12)`）
 /// - `pte = 100·at/(te·d)` [%]（等価引張鉄筋比）
 /// - `d = D − Dc/2`、`j = 7/8·d`
 /// - `M/(Q·D)` は適用範囲 1.0〜3.0 にクランプ
@@ -190,7 +194,13 @@ pub fn wall_shear_ultimate(inp: &WallShearTrilinearInput) -> f64 {
     } else {
         0.0
     };
-    let concrete_term = k * pte.powf(0.23) * (inp.fc + 18.0) / (shear_span_ratio + 0.12);
+    // 0.053 式は分母 1 乗、0.068 式（高強度せん断補強筋）は分母 √(M/(Q·D)+0.12)。
+    let denom = if inp.high_strength_shear_rebar {
+        (shear_span_ratio + 0.12).sqrt()
+    } else {
+        shear_span_ratio + 0.12
+    };
+    let concrete_term = k * pte.powf(0.23) * (inp.fc + 18.0) / denom;
     let hoop_term = 0.85 * (pwh * inp.sigma_wh).max(0.0).sqrt();
     let sigma_0 = inp.sigma_0.clamp(0.0, 0.4 * inp.fc);
     let axial_term = 0.1 * sigma_0;
@@ -199,10 +209,17 @@ pub fn wall_shear_ultimate(inp: &WallShearTrilinearInput) -> f64 {
 }
 
 /// RC 造耐震壁のせん断トリリニア骨格（Qc・βu・Qu・r）を一括算定する。
+///
+/// 壁筋・付帯柱主筋が少ない壁では式上 Qc > Qu となり得る（ひび割れと同時に
+/// 終局に至る挙動）。トリリニア骨格として単調増加を保つため、その場合は
+/// ひび割れ点を Qu で頭打ちにする（バイリニア相当に縮退）。
 pub fn wall_shear_trilinear(inp: &WallShearTrilinearInput) -> WallShearTrilinear {
+    let qu = wall_shear_ultimate(inp);
+    let qc_raw = wall_shear_crack(inp);
+    let qc = if qu > 0.0 { qc_raw.min(qu) } else { qc_raw };
     WallShearTrilinear {
-        qc: wall_shear_crack(inp),
-        qu: wall_shear_ultimate(inp),
+        qc,
+        qu,
         beta_u: wall_shear_beta_u(inp),
         r_opening: wall_shear_opening_reduction(inp.opening),
     }
@@ -239,11 +256,11 @@ mod tests {
     fn test_wall_shear_crack_matches_handcalc() {
         let inp = base_input();
         let qc = wall_shear_crack(&inp);
-        // 手計算（工学単位換算）:
+        // 手計算（工学単位換算。Fc は 1 乗。技術基準解説書 P.635-637）:
         let fc_kgf: f64 = 24.0 * (1.0 / 0.0980665);
         let aw_cm2: f64 = 1_440_000.0 / 100.0;
         let pg_pct = 100.0 * 3097.0 / 1_440_000.0;
-        let qc_kgf = (0.043 * pg_pct + 0.051) * fc_kgf.sqrt() * aw_cm2;
+        let qc_kgf = (0.043 * pg_pct + 0.051) * fc_kgf * aw_cm2;
         let qc_hand = qc_kgf * 9.80665;
         assert!((qc - qc_hand).abs() < 1e-3, "Qc={qc} vs handcalc={qc_hand}");
         assert!(qc > 0.0);
@@ -339,9 +356,11 @@ mod tests {
         let k1 = 8000.0 * 1_440_000.0; // G·Aw 相当
         let pts = tri.skeleton_points(k1);
         assert_eq!(pts[0], (0.0, 0.0));
-        // 変形・耐力とも単調増加、終局点は割線剛性 βu·K1 上。
-        assert!(pts[1].0 > 0.0 && pts[2].0 > pts[1].0);
-        assert!(pts[1].1 > 0.0 && pts[2].1 > pts[1].1);
+        // 変形・耐力とも単調非減少、終局点は割線剛性 βu·K1 上。
+        // （軽配筋の壁では Qc が Qu で頭打ちされバイリニア相当に縮退する）
+        assert!(pts[1].0 > 0.0 && pts[2].0 >= pts[1].0);
+        assert!(pts[1].1 > 0.0 && pts[2].1 >= pts[1].1);
+        assert!(tri.qc <= tri.qu, "Qc={} Qu={}", tri.qc, tri.qu);
         let gamma_u = tri.qu / (tri.beta_u * k1);
         assert!((pts[2].0 - gamma_u).abs() < 1e-9);
     }

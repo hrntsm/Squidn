@@ -52,11 +52,17 @@ pub fn friction_max_force(mu: f64, axial_n: f64) -> f64 {
 // RESP-D「07 非線形解析（動的解析）」免震支承材「鉛プラグ挿入型積層ゴム a) LRB 統一型」。
 
 /// LRB 統一型の降伏後剛性のひずみ依存修正係数 `CKd(γ)`。
-/// `CKd = { 0.779·γ^0.41 (γ<0.25); γ^−0.25 (0.25≤γ<1.0); γ^−0.12 (1.0≤γ) }`。
+/// `CKd = { 0.779·γ^−0.43 (γ<0.25); γ^−0.25 (0.25≤γ<1.0); γ^−0.12 (1.0≤γ) }`。
+///
+/// 第1分岐の指数は **−0.43**（負）。分岐点 γ=0.25 で
+/// `0.779·0.25^−0.43 = 1.4144 ≒ 0.25^−0.25 = 1.4142` と連続になることから
+/// 確定した（+0.41 としていた従来実装は γ<0.25 域で CKd を最大 1/7 に
+/// 過小評価し、γ=0.25 で約 3.2 倍の不連続を生じる誤りだった。低ひずみ域で
+/// 剛性が単調に増加するのが積層ゴムの実挙動で、他分岐の負指数とも整合する）。
 pub fn lrb_stiffness_strain_factor(gamma: f64) -> f64 {
     let g = gamma.abs().max(1e-9);
     if g < 0.25 {
-        0.779 * g.powf(0.41)
+        0.779 * g.powf(-0.43)
     } else if g < 1.0 {
         g.powf(-0.25)
     } else {
@@ -234,12 +240,16 @@ mod tests {
 
     #[test]
     fn test_lrb_stiffness_strain_factor_handcalc() {
-        // 3 区間の代表値。
-        assert!((lrb_stiffness_strain_factor(0.1) - 0.779 * 0.1f64.powf(0.41)).abs() < 1e-9);
+        // 3 区間の代表値（第1分岐の指数は −0.43）。
+        assert!((lrb_stiffness_strain_factor(0.1) - 0.779 * 0.1f64.powf(-0.43)).abs() < 1e-9);
         assert!((lrb_stiffness_strain_factor(0.5) - 0.5f64.powf(-0.25)).abs() < 1e-9);
         assert!((lrb_stiffness_strain_factor(2.0) - 2.0f64.powf(-0.12)).abs() < 1e-9);
-        // 区間の折れ点で連続性は不要だが、単調傾向（大歪で剛性低下）を確認。
+        // 単調傾向（大歪で剛性低下）を確認。
         assert!(lrb_stiffness_strain_factor(2.0) < lrb_stiffness_strain_factor(0.5));
+        // 分岐点 γ=0.25 での連続性（−0.43 の根拠。相対誤差 0.1% 以内）。
+        let lo = lrb_stiffness_strain_factor(0.25 - 1e-9);
+        let hi = lrb_stiffness_strain_factor(0.25 + 1e-9);
+        assert!((lo - hi).abs() / hi < 1e-3, "CKd 不連続: {lo} vs {hi}");
     }
 
     #[test]

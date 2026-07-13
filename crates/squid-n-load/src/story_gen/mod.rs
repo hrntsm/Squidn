@@ -24,7 +24,7 @@
 use squid_n_core::dof::{Dof, Dof6Mask};
 use squid_n_core::ids::{LoadCaseId, NodeId, StoryId};
 use squid_n_core::model::{
-    Constraint, DiaphragmDef, ElementData, ElementKind, KBraceWeightRule, MemberLoadKind,
+    Constraint, DiaphragmDef, ElementData, ElementKind, KBraceWeightRule, LoadCfg, MemberLoadKind,
     MiscWallTransfer, Model, Node, Story,
 };
 
@@ -95,7 +95,7 @@ fn steel_density_ton_mm3() -> f64 {
     )
 }
 
-/// 仕上げ周長 φ（RESP-D マニュアル「柱梁自重」の仕上げ荷重）。
+/// 仕上げ周長 φ（マニュアル「柱梁自重」の仕上げ荷重）。
 /// 鉛直材（柱）は四周仕上げ `2(b+D)`、それ以外（梁）は三面仕上げ `b+2D`。
 /// 断面の `width`/`depth` のいずれかが 0 以下の場合は 0（換算対象外）とする。
 fn finish_perimeter(width: f64, depth: f64, is_vertical: bool) -> f64 {
@@ -107,6 +107,228 @@ fn finish_perimeter(width: f64, depth: f64, is_vertical: bool) -> f64 {
     } else {
         width + 2.0 * depth
     }
+}
+
+/// 自重 1 件分の重量とその帰属。
+///
+/// 地震用重量の節点集計（[`generate_stories_multi`]）と、長期応力解析用の
+/// 自重(自動)荷重ケース（[`crate::self_weight`]）が同じ算定を共有するための
+/// 中間表現。重量の算定規則（自重算定長・スラブ厚控除・仕上げ・ダンパー置換等）は
+/// [`enumerate_self_weight`] に一元化する。
+pub(crate) enum SelfWeightItem {
+    /// 線材（柱・梁・ブレース）の自重（総量 [N]）。`elem_idx` は `model.elements` の添字。
+    Line { elem_idx: usize, total: f64 },
+    /// ダンパー装置＋支持部の重量（総量 [N]）。両端節点（`model.nodes` 添字）へ 1/2 ずつ。
+    Damper { ni: usize, nj: usize, total: f64 },
+    /// 壁・シェルの自重の頂点配分（`model.nodes` 添字 → [N]）。
+    Panel { shares: Vec<(usize, f64)> },
+}
+
+/// モデル全要素の自重を列挙する（§柱梁自重・§壁自重・§ダンパー自重）。
+///
+/// - 線材（柱・梁・ブレース, `ElementKind::Beam`/`Brace`）: ρ·A·L·g。
+///   §1.8: 自重算定長 L は、コンクリート材（`mat.fc` あり = RC/SRC）の水平材（梁）は
+///   柱面間距離（`len - face_i - face_j`、負にならない範囲）、鉛直材（柱）は
+///   床上面から床上面まで（＝節点間距離。フェイス控除しない）、鋼材（S 梁・柱）は
+///   節点間距離（マニュアル「柱梁自重」：RC/SRC 大梁は柱面間距離、
+///   RC/SRC 柱は床上面から床上面、S 梁・柱は節点間距離）。
+///   §1.9: RC/SRC 梁の断面積は梁上部のスラブ厚分 b·t を控除する
+///   （w_c = γ·b(D−t)+…。スラブ重量は構造芯間の面積で別途計上されるため、
+///   控除しないと梁幅×スラブ厚の体積が二重計上になる）。スラブが定義されて
+///   いないモデル（純フレーム等）では控除しない。
+///   §柱の長さ: コンクリート柱（鉛直材）で下端節点に別の柱（鉛直 Beam/Brace）が
+///   下から接続していない場合、下端節点に取り付く梁（非鉛直 Beam）の最大せいを
+///   自重算定長へ加算する（マニュアル「下階に柱がない場合...柱脚に取付く梁の最大せいの
+///   長さを柱長さに付加」）。
+///   ギャップ対応: 鋼材のみ `load_cfg.effective_steel_factor()`（鉄骨重量割増率）を乗じ、
+///   `load_cfg.extra_line_weight`（耐火被覆等の付加線重量 [N/mm]）・
+///   `load_cfg.finish_area_weight`（仕上げ面重量 w_f、周長 φ から自動換算）が
+///   あれば自重算定長を掛けて加算する。
+/// - 壁・シェル（`ElementKind::Wall`/`Shell`, 節点数3以上）: ρ·t·(A−開口面積)·g＋開口重量
+///   （§壁自重）を全頂点に等分配。三方スリット壁は最上位標高の頂点へ全量集中
+///   （マニュアル「壁に三方スリットが指定されている場合、壁荷重は全て上部の大梁に伝達」）。
+///   §1.2: マニュアル「壁の重量を階高の中央で上下階の節点に分配」に対応
+///   （矩形壁なら上下2節点ずつに1/4ずつ配分される）。
+/// - ダンパー（`load_cfg.dampers` に登録された Beam/Brace 要素）: 断面自重
+///   （ρ·A·L·g）は使わず、装置重量＋支持部重量に置き換える（§ダンパー自重。
+///   `device_weight=0` かつ `support_area>0` の場合は支持部のみが算入され、
+///   マニュアル「自重を考慮しない部材」に対応する）。
+pub(crate) fn enumerate_self_weight(model: &Model, load_cfg: &LoadCfg) -> Vec<SelfWeightItem> {
+    let mut items = Vec::new();
+    for (elem_idx, elem) in model.elements.iter().enumerate() {
+        // ダンパー自重（§ダンパー自重）: 対象部材は断面からの自重計算をスキップし、
+        // 装置重量＋支持部断面積×(節点間距離−装置長さ)×鋼材単位体積重量で置き換える。
+        if matches!(elem.kind, ElementKind::Beam | ElementKind::Brace { .. })
+            && elem.nodes.len() >= 2
+        {
+            if let Some(damper) = load_cfg.dampers.iter().find(|d| d.elem == elem.id) {
+                let ni = elem.nodes[0].index();
+                let nj = elem.nodes[1].index();
+                let len = dist3(model.nodes[ni].coord, model.nodes[nj].coord);
+                let support_len = (len - damper.device_length).max(0.0);
+                let w = damper.device_weight
+                    + damper.support_area * support_len * steel_density_ton_mm3() * GRAVITY_MM_S2;
+                items.push(SelfWeightItem::Damper { ni, nj, total: w });
+                continue;
+            }
+        }
+
+        let (Some(sec_id), Some(mat_id)) = (elem.section, elem.material) else {
+            continue;
+        };
+        let (Some(sec), Some(mat)) = (
+            model.sections.get(sec_id.index()),
+            model.materials.get(mat_id.index()),
+        ) else {
+            continue;
+        };
+
+        match elem.kind {
+            ElementKind::Beam | ElementKind::Brace { .. } if elem.nodes.len() >= 2 => {
+                let ni = elem.nodes[0].index();
+                let nj = elem.nodes[1].index();
+                let (ci, cj) = (model.nodes[ni].coord, model.nodes[nj].coord);
+                let len = dist3(ci, cj);
+                let is_vertical = is_vertical_pair(ci, cj);
+                let is_concrete = mat.fc.is_some();
+                // §1.8: 柱面間距離の控除は水平材（梁）のみ。鉛直材（柱）は
+                // 床上面から床上面（＝節点間距離）で算定する（マニュアル「柱の長さ」）。
+                let mut eff_len = if is_concrete && !is_vertical {
+                    (len - elem.rigid_zone.face_i - elem.rigid_zone.face_j).max(0.0)
+                } else {
+                    len
+                };
+
+                // §柱の長さ: コンクリート造の柱で、下端節点から下に続く柱が無い場合、
+                // 下端節点に取り付く梁（非鉛直 Beam）の最大せいを自重算定長へ加算する。
+                if is_concrete && is_vertical {
+                    let bottom_local = if ci[2] <= cj[2] { 0 } else { 1 };
+                    let bottom_id = elem.nodes[bottom_local];
+                    let bottom_z = model.nodes[bottom_id.index()].coord[2];
+                    let has_column_below = model.elements.iter().any(|e2| {
+                        e2.id != elem.id
+                            && matches!(e2.kind, ElementKind::Beam | ElementKind::Brace { .. })
+                            && e2.nodes.len() >= 2
+                            && e2.nodes.contains(&bottom_id)
+                            && {
+                                let (a, b) = (
+                                    model.nodes[e2.nodes[0].index()].coord,
+                                    model.nodes[e2.nodes[1].index()].coord,
+                                );
+                                is_vertical_pair(a, b) && {
+                                    let other = if e2.nodes[0] == bottom_id { b } else { a };
+                                    other[2] < bottom_z - LEVEL_TOL_MM
+                                }
+                            }
+                    });
+                    if !has_column_below {
+                        let max_depth = model
+                            .elements
+                            .iter()
+                            .filter(|e2| {
+                                e2.kind == ElementKind::Beam
+                                    && e2.id != elem.id
+                                    && e2.nodes.len() >= 2
+                                    && e2.nodes.contains(&bottom_id)
+                            })
+                            .filter_map(|e2| {
+                                let (a, b) = (
+                                    model.nodes[e2.nodes[0].index()].coord,
+                                    model.nodes[e2.nodes[1].index()].coord,
+                                );
+                                if is_vertical_pair(a, b) {
+                                    None
+                                } else {
+                                    e2.section
+                                        .and_then(|sid| model.sections.get(sid.index()))
+                                        .map(|s| s.depth)
+                                }
+                            })
+                            .fold(0.0_f64, f64::max);
+                        eff_len += max_depth;
+                    }
+                }
+
+                let factor = if is_concrete {
+                    1.0
+                } else {
+                    load_cfg.effective_steel_factor()
+                };
+                // §1.9: RC/SRC 梁（水平材）はスラブ厚分の断面積 b·t を控除する
+                // （w_c = γ·b(D−t)+…。スラブ重量が構造芯間の面積で別途計上される
+                // ための二重計上防止）。スラブが無いモデルでは控除しない。
+                let self_weight_area = if is_concrete
+                    && !is_vertical
+                    && model.slab_thickness > 0.0
+                    && !model.slabs.is_empty()
+                {
+                    (sec.area - sec.width * model.slab_thickness.min(sec.depth)).max(0.0)
+                } else {
+                    sec.area
+                };
+                let mut w = mat.density * self_weight_area * eff_len * GRAVITY_MM_S2 * factor;
+                if let Some(&(_, lw)) = load_cfg
+                    .extra_line_weight
+                    .iter()
+                    .find(|(id, _)| *id == elem.id)
+                {
+                    w += lw * eff_len;
+                }
+                // §仕上げ荷重の自動換算: w_f × 仕上げ周長 φ を自重算定長に乗じて加算する。
+                if let Some(&(_, wf)) = load_cfg
+                    .finish_area_weight
+                    .iter()
+                    .find(|(id, _)| *id == elem.id)
+                {
+                    let phi = finish_perimeter(sec.width, sec.depth, is_vertical);
+                    w += wf * phi * eff_len;
+                }
+
+                items.push(SelfWeightItem::Line { elem_idx, total: w });
+            }
+            ElementKind::Wall | ElementKind::Shell if elem.nodes.len() >= 3 => {
+                let Some(t) = sec.thickness else {
+                    continue;
+                };
+                let pts: Vec<[f64; 3]> = elem
+                    .nodes
+                    .iter()
+                    .map(|n| model.nodes[n.index()].coord)
+                    .collect();
+                let area = polygon_area_3d(&pts);
+
+                // §壁自重: 開口控除・開口重量。三方スリットは全量を最上位標高の頂点へ。
+                let attr = model.wall_attrs.iter().find(|a| a.elem == elem.id);
+                let opening_area = attr.map(|a| a.total_opening_area()).unwrap_or(0.0);
+                let opening_weight = attr.map(|a| a.opening_weight).unwrap_or(0.0);
+                let three_side_slit = attr.map(|a| a.three_side_slit).unwrap_or(false);
+                let net_area = (area - opening_area).max(0.0);
+                let w = (mat.density * t * net_area * GRAVITY_MM_S2 + opening_weight).max(0.0);
+
+                let shares = if three_side_slit {
+                    // 壁荷重は全て上部の節点（頂点のうち標高最大のもの。同率上位は等分）へ。
+                    let max_z = pts.iter().map(|p| p[2]).fold(f64::MIN, f64::max);
+                    let top_indices: Vec<usize> = pts
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, p)| (p[2] - max_z).abs() < LEVEL_TOL_MM)
+                        .map(|(i, _)| i)
+                        .collect();
+                    let share = w / top_indices.len() as f64;
+                    top_indices
+                        .into_iter()
+                        .map(|i| (elem.nodes[i].index(), share))
+                        .collect()
+                } else {
+                    let share = w / pts.len() as f64;
+                    elem.nodes.iter().map(|n| (n.index(), share)).collect()
+                };
+                items.push(SelfWeightItem::Panel { shares });
+            }
+            _ => {}
+        }
+    }
+    items
 }
 
 /// モデル全節点のうち、指定点に最も近い節点。
@@ -153,7 +375,16 @@ fn nearest_column_element(model: &Model, pt: [f64; 3]) -> Option<&ElementData> {
 ///   モデル全節点中の最近接節点（配置階の代表的な節点）へ全量を伝達する
 ///   （マニュアルの「配置階の剛床へ伝達」の簡易近似）。
 fn accumulate_misc_wall_weight(model: &Model, node_weight: &mut [f64]) {
+    for (i, w) in misc_wall_weight_shares(model) {
+        node_weight[i] += w;
+    }
+}
+
+/// [`accumulate_misc_wall_weight`] の配分内容（`model.nodes` 添字 → [N]）を返す。
+/// 地震用重量の集計と自重(自動)荷重ケース（[`crate::self_weight`]）で共有する。
+pub(crate) fn misc_wall_weight_shares(model: &Model) -> Vec<(usize, f64)> {
     const SEGMENT_LEN: f64 = 500.0;
+    let mut shares: Vec<(usize, f64)> = Vec::new();
     for wall in &model.misc_walls {
         let (s, e) = (wall.start, wall.end);
         let (dx, dy, dz) = (e[0] - s[0], e[1] - s[1], e[2] - s[2]);
@@ -177,15 +408,15 @@ fn accumulate_misc_wall_weight(model: &Model, node_weight: &mut [f64]) {
                     if let Some(col) = nearest_column_element(model, center) {
                         let ni = col.nodes[0].index();
                         let nj = col.nodes[1].index();
-                        node_weight[ni] += seg_weight / 2.0;
-                        node_weight[nj] += seg_weight / 2.0;
+                        shares.push((ni, seg_weight / 2.0));
+                        shares.push((nj, seg_weight / 2.0));
                     } else if let Some(n) = nearest_node(model, center) {
-                        node_weight[n.index()] += seg_weight;
+                        shares.push((n.index(), seg_weight));
                     }
                 }
                 MiscWallTransfer::Beam | MiscWallTransfer::SelfStanding => {
                     if let Some(n) = nearest_node(model, center) {
-                        node_weight[n.index()] += seg_weight;
+                        shares.push((n.index(), seg_weight));
                     }
                 }
             }
@@ -193,6 +424,7 @@ fn accumulate_misc_wall_weight(model: &Model, node_weight: &mut [f64]) {
             offset += SEGMENT_LEN;
         }
     }
+    shares
 }
 
 /// 単純支持梁（節点間距離 `len` を支間とする静定梁）の等価節点重量（両端反力）。
@@ -311,145 +543,22 @@ pub fn generate_stories_multi(
         }
     }
 
-    // 自重。
-    // - 線材（柱・梁・ブレース, `ElementKind::Beam`/`Brace`）: ρ·A·L·g を両端に半分ずつ
-    //   （対称等分布荷重の静定反力。K型ブレースは §K型ブレースの規則で再配分）。
-    //   §1.8: 自重算定長 L は、コンクリート材（`mat.fc` あり = RC/SRC 梁）は柱面間距離
-    //   （`len - face_i - face_j`、負にならない範囲）、鋼材（S 梁）は従来どおり節点間距離
-    //   （マニュアル「柱梁自重」：RC/SRC 大梁は柱面間距離、S 梁は節点間距離）。
-    //   §柱の長さ: コンクリート柱（鉛直材）で下端節点に別の柱（鉛直 Beam/Brace）が
-    //   下から接続していない場合、下端節点に取り付く梁（非鉛直 Beam）の最大せいを
-    //   自重算定長へ加算する（マニュアル「下階に柱がない場合...柱脚に取付く梁の最大せいの
-    //   長さを柱長さに付加」）。
-    //   ギャップ対応: 鋼材のみ `load_cfg.effective_steel_factor()`（鉄骨重量割増率）を乗じ、
-    //   `load_cfg.extra_line_weight`（耐火被覆等の付加線重量 [N/mm]）・
-    //   `load_cfg.finish_area_weight`（仕上げ面重量 w_f、周長 φ から自動換算）が
-    //   あれば自重算定長を掛けて加算する（両端配分は自重と同じ経路）。
-    // - 壁・シェル（`ElementKind::Wall`/`Shell`, 節点数3以上）: ρ·t·(A−開口面積)·g＋開口重量
-    //   （§壁自重）を全頂点に等分配。三方スリット壁は最上位標高の頂点へ全量集中。
-    //   §1.2: マニュアル「壁の重量を階高の中央で上下階の節点に分配」に対応
-    //   （矩形壁なら上下2節点ずつに1/4ずつ配分される）。
-    // - ダンパー（`load_cfg.dampers` に登録された Beam/Brace 要素）: 断面自重
-    //   （ρ·A·L·g）は使わず、装置重量＋支持部重量に置き換える（§ダンパー自重）。
-    for elem in &model.elements {
-        // ダンパー自重（§ダンパー自重）: 対象部材は断面からの自重計算をスキップし、
-        // 装置重量＋支持部断面積×(節点間距離−装置長さ)×鋼材単位体積重量で置き換える。
-        // 両端節点へ 1/2 ずつ（鉛直配置は上下階へ、水平配置は同一階の両節点へ、が
-        // 節点標高から自然に成立する）。`device_weight=0` かつ `support_area>0` の
-        // 場合は支持部のみが算入される（マニュアル「自重を考慮しない部材」に対応）。
-        if matches!(elem.kind, ElementKind::Beam | ElementKind::Brace { .. })
-            && elem.nodes.len() >= 2
-        {
-            if let Some(damper) = load_cfg.dampers.iter().find(|d| d.elem == elem.id) {
-                let ni = elem.nodes[0].index();
-                let nj = elem.nodes[1].index();
-                let len = dist3(model.nodes[ni].coord, model.nodes[nj].coord);
-                let support_len = (len - damper.device_length).max(0.0);
-                let w = damper.device_weight
-                    + damper.support_area * support_len * steel_density_ton_mm3() * GRAVITY_MM_S2;
-                node_weight[ni] += w / 2.0;
-                node_weight[nj] += w / 2.0;
-                continue;
+    // 自重（算定規則は enumerate_self_weight に一元化。§柱梁自重・§壁自重・§ダンパー自重）。
+    // - 線材: 総重量を両端に半分ずつ（対称等分布荷重の静定反力。
+    //   K型ブレースは §K型ブレースの規則で再配分）。
+    // - ダンパー: 両端節点へ 1/2 ずつ（鉛直配置は上下階へ、水平配置は同一階の
+    //   両節点へ、が節点標高から自然に成立する）。
+    // - 壁・シェル: 頂点配分（三方スリットは最上位標高の頂点へ全量）。
+    for item in enumerate_self_weight(model, &load_cfg) {
+        match item {
+            SelfWeightItem::Damper { ni, nj, total } => {
+                node_weight[ni] += total / 2.0;
+                node_weight[nj] += total / 2.0;
             }
-        }
-
-        let (Some(sec_id), Some(mat_id)) = (elem.section, elem.material) else {
-            continue;
-        };
-        let (Some(sec), Some(mat)) = (
-            model.sections.get(sec_id.index()),
-            model.materials.get(mat_id.index()),
-        ) else {
-            continue;
-        };
-
-        match elem.kind {
-            ElementKind::Beam | ElementKind::Brace { .. } if elem.nodes.len() >= 2 => {
+            SelfWeightItem::Line { elem_idx, total } => {
+                let elem = &model.elements[elem_idx];
                 let ni = elem.nodes[0].index();
                 let nj = elem.nodes[1].index();
-                let (ci, cj) = (model.nodes[ni].coord, model.nodes[nj].coord);
-                let len = dist3(ci, cj);
-                let is_vertical = is_vertical_pair(ci, cj);
-                let is_concrete = mat.fc.is_some();
-                let mut eff_len = if is_concrete {
-                    (len - elem.rigid_zone.face_i - elem.rigid_zone.face_j).max(0.0)
-                } else {
-                    len
-                };
-
-                // §柱の長さ: コンクリート造の柱で、下端節点から下に続く柱が無い場合、
-                // 下端節点に取り付く梁（非鉛直 Beam）の最大せいを自重算定長へ加算する。
-                if is_concrete && is_vertical {
-                    let bottom_local = if ci[2] <= cj[2] { 0 } else { 1 };
-                    let bottom_id = elem.nodes[bottom_local];
-                    let bottom_z = model.nodes[bottom_id.index()].coord[2];
-                    let has_column_below = model.elements.iter().any(|e2| {
-                        e2.id != elem.id
-                            && matches!(e2.kind, ElementKind::Beam | ElementKind::Brace { .. })
-                            && e2.nodes.len() >= 2
-                            && e2.nodes.contains(&bottom_id)
-                            && {
-                                let (a, b) = (
-                                    model.nodes[e2.nodes[0].index()].coord,
-                                    model.nodes[e2.nodes[1].index()].coord,
-                                );
-                                is_vertical_pair(a, b) && {
-                                    let other = if e2.nodes[0] == bottom_id { b } else { a };
-                                    other[2] < bottom_z - LEVEL_TOL_MM
-                                }
-                            }
-                    });
-                    if !has_column_below {
-                        let max_depth = model
-                            .elements
-                            .iter()
-                            .filter(|e2| {
-                                e2.kind == ElementKind::Beam
-                                    && e2.id != elem.id
-                                    && e2.nodes.len() >= 2
-                                    && e2.nodes.contains(&bottom_id)
-                            })
-                            .filter_map(|e2| {
-                                let (a, b) = (
-                                    model.nodes[e2.nodes[0].index()].coord,
-                                    model.nodes[e2.nodes[1].index()].coord,
-                                );
-                                if is_vertical_pair(a, b) {
-                                    None
-                                } else {
-                                    e2.section
-                                        .and_then(|sid| model.sections.get(sid.index()))
-                                        .map(|s| s.depth)
-                                }
-                            })
-                            .fold(0.0_f64, f64::max);
-                        eff_len += max_depth;
-                    }
-                }
-
-                let factor = if is_concrete {
-                    1.0
-                } else {
-                    load_cfg.effective_steel_factor()
-                };
-                let mut w = mat.density * sec.area * eff_len * GRAVITY_MM_S2 * factor;
-                if let Some(&(_, lw)) = load_cfg
-                    .extra_line_weight
-                    .iter()
-                    .find(|(id, _)| *id == elem.id)
-                {
-                    w += lw * eff_len;
-                }
-                // §仕上げ荷重の自動換算: w_f × 仕上げ周長 φ を自重算定長に乗じて加算する。
-                if let Some(&(_, wf)) = load_cfg
-                    .finish_area_weight
-                    .iter()
-                    .find(|(id, _)| *id == elem.id)
-                {
-                    let phi = finish_perimeter(sec.width, sec.depth, is_vertical);
-                    w += wf * phi * eff_len;
-                }
-
                 if matches!(elem.kind, ElementKind::Brace { .. })
                     && load_cfg.k_brace_rule == KBraceWeightRule::BaseNodesOnly
                 {
@@ -457,58 +566,23 @@ pub fn generate_stories_multi(
                     // 片端が内部節点ならその分も基準節点側へ全量、両端とも内部節点は
                     // フォールバックで従来どおり 1/2 ずつ。
                     match (is_base_node[ni], is_base_node[nj]) {
-                        (true, false) => node_weight[ni] += w,
-                        (false, true) => node_weight[nj] += w,
+                        (true, false) => node_weight[ni] += total,
+                        (false, true) => node_weight[nj] += total,
                         (true, true) | (false, false) => {
-                            node_weight[ni] += w / 2.0;
-                            node_weight[nj] += w / 2.0;
+                            node_weight[ni] += total / 2.0;
+                            node_weight[nj] += total / 2.0;
                         }
                     }
                 } else {
-                    node_weight[ni] += w / 2.0;
-                    node_weight[nj] += w / 2.0;
+                    node_weight[ni] += total / 2.0;
+                    node_weight[nj] += total / 2.0;
                 }
             }
-            ElementKind::Wall | ElementKind::Shell if elem.nodes.len() >= 3 => {
-                let Some(t) = sec.thickness else {
-                    continue;
-                };
-                let pts: Vec<[f64; 3]> = elem
-                    .nodes
-                    .iter()
-                    .map(|n| model.nodes[n.index()].coord)
-                    .collect();
-                let area = polygon_area_3d(&pts);
-
-                // §壁自重: 開口控除・開口重量。三方スリットは全量を最上位標高の頂点へ。
-                let attr = model.wall_attrs.iter().find(|a| a.elem == elem.id);
-                let opening_area = attr.map(|a| a.total_opening_area()).unwrap_or(0.0);
-                let opening_weight = attr.map(|a| a.opening_weight).unwrap_or(0.0);
-                let three_side_slit = attr.map(|a| a.three_side_slit).unwrap_or(false);
-                let net_area = (area - opening_area).max(0.0);
-                let w = (mat.density * t * net_area * GRAVITY_MM_S2 + opening_weight).max(0.0);
-
-                if three_side_slit {
-                    // 壁荷重は全て上部の節点（頂点のうち標高最大のもの。同率上位は等分）へ。
-                    let max_z = pts.iter().map(|p| p[2]).fold(f64::MIN, f64::max);
-                    let top_indices: Vec<usize> = pts
-                        .iter()
-                        .enumerate()
-                        .filter(|(_, p)| (p[2] - max_z).abs() < LEVEL_TOL_MM)
-                        .map(|(i, _)| i)
-                        .collect();
-                    let share = w / top_indices.len() as f64;
-                    for i in top_indices {
-                        node_weight[elem.nodes[i].index()] += share;
-                    }
-                } else {
-                    let share = w / pts.len() as f64;
-                    for n in &elem.nodes {
-                        node_weight[n.index()] += share;
-                    }
+            SelfWeightItem::Panel { shares } => {
+                for (i, w) in shares {
+                    node_weight[i] += w;
                 }
             }
-            _ => {}
         }
     }
 
