@@ -228,9 +228,13 @@ fn effective_damage_control(
 
 /// せん断スパン比による割増係数 α = 4/(M/(Q・d)+1)。`max_alpha` でクランプ
 /// （梁 2.0、柱 1.5）。下限は共通で 1.0。
+///
+/// 退化時の規約: Q≈0 かつ M>0 は M/(Q・d)→∞ すなわち α→下限 1.0 を返す
+/// （従来は上限 max_alpha を返しており、割増を最大化する非保守側だった）。
+/// M も Q も 0（無応力）または d≤0 は中立な α=1.0（割増なし）とする。
 fn shear_alpha(m: f64, q: f64, d: f64, max_alpha: f64) -> f64 {
     if q.abs() < 1e-9 || d <= 0.0 {
-        return max_alpha;
+        return 1.0;
     }
     let mqd = m.abs() / (q.abs() * d);
     let alpha = 4.0 / (mqd + 1.0);

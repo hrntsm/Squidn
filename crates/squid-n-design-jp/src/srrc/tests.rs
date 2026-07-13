@@ -167,6 +167,7 @@ fn test_src_beam_shear_split_handcalc() {
         s_fs,
         9.0 * (500.0 - 2.0 * 14.0),
         2.0,
+        &SrcShearMode::Beam,
         &seismic,
     );
     assert!(!shear.used_qd);
@@ -209,9 +210,22 @@ fn test_src_shear_pw_capped_at_0_6_percent_both_terms() {
             r_mu: 0.0,
         };
         let shear = src_shear_check(
-            100_000.0, 0.0, 100_000.0,
+            100_000.0,
+            0.0,
+            100_000.0,
             0.0, // 鉄骨寄与を 0 として RC 側の pw の効果だけを見る
-            props.at, props.j, props.d, props.b, 200.0, props.pw, fs, w_ft, s_fs, 0.0, 2.0,
+            props.at,
+            props.j,
+            props.d,
+            props.b,
+            200.0,
+            props.pw,
+            fs,
+            w_ft,
+            s_fs,
+            0.0,
+            2.0,
+            &SrcShearMode::Beam,
             &seismic,
         );
         assert!(
@@ -220,6 +234,117 @@ fn test_src_shear_pw_capped_at_0_6_percent_both_terms() {
             shear.pw
         );
     }
+}
+
+/// SRC 柱の短期 RC 部許容せん断力 rQAS1 は α を含まない
+/// （SRC規準。rQAS1 = b・rj・(fs + 0.5・pw・wft)）。
+#[test]
+fn test_src_column_short_rc_allowable_has_no_alpha() {
+    let shape = src_rect_shape(
+        400.0, 700.0, 6, 22.0, 2, 40.0, 13.0, 100.0, 2, 500.0, 200.0, 9.0, 14.0, "SN400B",
+    );
+    let rebar = match &shape {
+        SectionShape::SrcRect { rebar, .. } => rebar.clone(),
+        _ => unreachable!(),
+    };
+    let props = src_rect_axis_props(400.0, 700.0, &rebar.main_x, &rebar);
+    let fs = concrete_allowable_shear(24.0, false);
+    let w_ft = rebar_allowable_shear("SD345", false);
+    let ctx = ctx_column(LoadTerm::Short);
+    let seismic = SrcSeismicCtx {
+        ctx: &ctx,
+        pos: 0.0,
+        q_index: 1,
+        s_ft_short: 0.0,
+        r_mu: 0.0,
+    };
+    // m_for_alpha=0 → α は上限側（=2）に張り付く条件。α が式に入っていれば
+    // rQA1 が 2 倍近く動くが、柱の短期 rQAS1 は α 非依存であること。
+    let shear = src_shear_check(
+        100_000.0,
+        0.0,
+        100_000.0,
+        0.0, // 鉄骨寄与 0 で RC 側のみを見る
+        props.at,
+        props.j,
+        props.d,
+        props.b,
+        390.0, // b′ を大きく取り rQA2 を支配させない
+        props.pw,
+        fs,
+        w_ft,
+        0.0,
+        0.0,
+        2.0,
+        &SrcShearMode::Column { beta: 0.0 },
+        &seismic,
+    );
+    let pw = props.pw.min(0.006);
+    let expected_rqa1 = props.b * props.j * (fs + 0.5 * pw * w_ft);
+    let expected_rqa2 = props.b * props.j * (2.0 * (390.0 / props.b) * fs + pw * w_ft);
+    let expected = expected_rqa1.min(expected_rqa2);
+    assert!(
+        (shear.r_qa - expected).abs() / expected < 1e-9,
+        "rQA={} expected={}（α を含まない短期式）",
+        shear.r_qa,
+        expected
+    );
+}
+
+/// SRC 柱の長期は併用式 QA = (1+β)・b・rj・a′・fs を全せん断力と比較する
+/// （SRC規準 P.96-97。a′ = rα（b′/b ≥ rα/3 のとき）または 3b′/b）。
+#[test]
+fn test_src_column_long_combined_formula() {
+    let shape = src_rect_shape(
+        400.0, 700.0, 6, 22.0, 2, 40.0, 13.0, 100.0, 2, 500.0, 200.0, 9.0, 14.0, "SN400B",
+    );
+    let rebar = match &shape {
+        SectionShape::SrcRect { rebar, .. } => rebar.clone(),
+        _ => unreachable!(),
+    };
+    let props = src_rect_axis_props(400.0, 700.0, &rebar.main_x, &rebar);
+    let fs = concrete_allowable_shear(24.0, true);
+    let ctx = ctx_column(LoadTerm::Long);
+    let seismic = SrcSeismicCtx {
+        ctx: &ctx,
+        pos: 0.0,
+        q_index: 1,
+        s_ft_short: 0.0,
+        r_mu: 0.0,
+    };
+    let beta = 0.25;
+    let q = 150_000.0;
+    // m=0 → α=2（上限）。b′/b=0.5 < α/3=2/3 なので a′=3b′/b=1.5 が採用される。
+    let b_prime = 0.5 * props.b;
+    let shear = src_shear_check(
+        q,
+        0.0,
+        q,
+        1.0e6,
+        props.at,
+        props.j,
+        props.d,
+        props.b,
+        b_prime,
+        props.pw,
+        fs,
+        0.0,
+        100.0,
+        1000.0,
+        2.0,
+        &SrcShearMode::Column { beta },
+        &seismic,
+    );
+    let a_prime = 1.5;
+    let qa = (1.0 + beta) * props.b * props.j * a_prime * fs;
+    assert!(
+        (shear.r_qa - qa).abs() / qa < 1e-9,
+        "QA={} expected={}",
+        shear.r_qa,
+        qa
+    );
+    assert!((shear.ratio - q / qa).abs() < 1e-9, "ratio={}", shear.ratio);
+    assert!(!shear.used_qd);
 }
 
 // ------------------------------------------------------------------
@@ -327,6 +452,7 @@ fn test_src_beam_seismic_qd2_handcalc() {
         s_fs,
         9.0 * (500.0 - 2.0 * 14.0),
         2.0,
+        &SrcShearMode::Beam,
         &seismic,
     );
 
@@ -424,6 +550,7 @@ fn test_src_beam_seismic_qd1_handcalc() {
         s_fs,
         9.0 * (500.0 - 2.0 * 14.0),
         2.0,
+        &SrcShearMode::Beam,
         &seismic,
     );
 
@@ -485,6 +612,7 @@ fn test_src_beam_seismic_qd_none_falls_back_to_elastic_share() {
         s_fs,
         9.0 * (500.0 - 2.0 * 14.0),
         2.0,
+        &SrcShearMode::Beam,
         &seismic,
     );
 

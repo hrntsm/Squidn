@@ -66,7 +66,6 @@ pub(crate) fn check_beam(
     // せん断応力度 τ = Qy / As（せん断有効断面積）。
     let tau = forces.qy.abs() / safe_denom(as_shear);
 
-    let c = steel_lateral_buckling_c(ctx);
     let (fb, ratio_shear, shear_basis);
     match shape {
         ShapeCategory::H => {
@@ -80,6 +79,14 @@ pub(crate) fn check_beam(
                     .map(|a| resolve_lb(forces.pos, ctx.length, a.lb_direct, a.lateral_brace_count))
                     .unwrap_or(ctx.length)
             });
+            // C 係数は「座屈区間端部」のモーメント比によるが、実装が保持するのは
+            // 部材端モーメントのみ。横補剛で lb が部材の部分区間となる場合は
+            // 区間端モーメント比が不明なため、安全側の C=1.0 とする。
+            let c = if lb < ctx.length - 1e-9 {
+                1.0
+            } else {
+                steel_lateral_buckling_c(ctx)
+            };
             fb = steel_fb_h(f, term, lb, i_t, h, af, c);
             // H形ウェブの von Mises 型合成検定（鋼構造設計規準）:
             // σb′ = σb・(H−2tf)/H（ウェブ負担分に換算した曲げ応力度）、
@@ -140,16 +147,23 @@ pub(crate) fn check_beam(
 // 大梁必要横補剛数（情報出力のみ。検定比には含めない）
 // ---------------------------------------------------------------------
 
-/// 大梁の必要横補剛数 n と弱軸細長比 λy を求める（マニュアル「大梁の必要
-/// 横補剛数」）。検定比には含めない参考情報。
+/// 大梁の必要横補剛数 n と弱軸細長比 λy を求める（保有耐力横補剛・
+/// 均等間隔配置。昭55建告1791号第2・技術基準解説書）。検定比には含めない
+/// 参考情報。
 ///
 /// `λy = L/iy_weak`（`iy_weak = √(Iz/A)`：squid-n の弱軸＝断面二次モーメント
-/// `Section.iz` に対応する断面二次半径、`L = DesignCtx.length`）として:
-/// - F値 235・215（400N/mm²級）: `n = (170 − λy)/20`
-/// - それ以外（275以上・490N/mm²級）: `n = (130 − λy)/20`
+/// `Section.iz` に対応する断面二次半径、`L = DesignCtx.length`）に対し、
+/// 均等間隔配置の条件は
+/// - F値 235・215（400N/mm²級）: `λy ≦ 170 + 20n`
+/// - それ以外（275以上・490N/mm²級）: `λy ≦ 130 + 20n`
 ///
-/// 負値は 0 に切り上げ、`n = ceil(max(0, 計算値))`。`length` が 0 以下の
+/// であり、必要本数は `n = ceil(max(0, (λy − 170)/20))`（490級は 130）となる。
+/// 細長い梁（λy が大きい）ほど必要本数が増える。`length` が 0 以下の
 /// 場合は `None`（算定省略）。
+///
+/// 注: 参照実装のマニュアルには `n = (170 − λy)/20` と逆向きの式が記載されて
+/// いるが、λy が大きいほど n=0 となり技術基準解説書の条件と矛盾するため
+/// 誤記と判断し、告示・解説書の向きで実装する。
 fn steel_required_lateral_bracing_count(f: f64, length: f64, sec: &Section) -> Option<(u32, f64)> {
     if length <= 1e-9 {
         return None;
@@ -166,7 +180,7 @@ fn steel_required_lateral_bracing_count(f: f64, length: f64, sec: &Section) -> O
     let is_400_grade = (f - 235.0).abs() < 1e-6 || (f - 215.0).abs() < 1e-6;
     let coef = if is_400_grade { 170.0 } else { 130.0 };
 
-    let n_raw = (coef - lambda_y) / 20.0;
+    let n_raw = (lambda_y - coef) / 20.0;
     let n = n_raw.max(0.0).ceil() as u32;
     Some((n, lambda_y))
 }
@@ -460,7 +474,8 @@ mod tests {
     // 大梁必要横補剛数
     // -------------------------------------------------------------
 
-    /// λy=90, 400N/mm²級（F=235）: n=(170-90)/20=4.0 → ceil=4。
+    /// 均等間隔配置 λy ≦ 170 + 20n（400N/mm²級。告示1791号・技術基準解説書）:
+    /// λy=90 ≦ 170 → n=0（補剛不要）、λy=250 → n=(250−170)/20=4。
     #[test]
     fn test_required_lateral_bracing_count_hand_calc() {
         let sec = Section {
@@ -480,7 +495,11 @@ mod tests {
         };
         let (n, lambda_y) = steel_required_lateral_bracing_count(235.0, 9000.0, &sec).unwrap();
         assert!((lambda_y - 90.0).abs() < 1e-9, "λy={}", lambda_y);
-        assert_eq!(n, 4);
+        assert_eq!(n, 0, "λy=90 ≦ 170 のため補剛不要");
+
+        let (n, lambda_y) = steel_required_lateral_bracing_count(235.0, 25000.0, &sec).unwrap();
+        assert!((lambda_y - 250.0).abs() < 1e-9, "λy={}", lambda_y);
+        assert_eq!(n, 4, "λy=250 → n=(250−170)/20=4");
     }
 
     /// length=0 の場合は算定を省略する（None）。

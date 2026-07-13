@@ -103,13 +103,19 @@ const SRC_XN_RATIO_MIN: f64 = 0.02;
 const SRC_XN_RATIO_MAX: f64 = 10.0;
 
 /// N-M 相関曲線（RC 部分のみ）を xn/D の対数スキャンで構成する。
+///
+/// 圧縮側は `(rnc, 0)`、引張側は `(rnt, 0)` をアンカーとして追加する。
+/// 引張側アンカーが無いと、xn スキャン最小点より引張側で許容曲げが
+/// 頭打ちクランプされ、純引張耐力 rNt 近傍の rM を過大評価する
+/// （正しくは N → rNt で rM → 0 に収束する）。
 fn src_column_nm_curve(
     axis: &SrcColumnAxis,
     fc_prime: f64,
     n_ratio: f64,
     rnc: f64,
+    rnt: f64,
 ) -> Vec<(f64, f64)> {
-    let mut pts = Vec::with_capacity(SRC_XN_SCAN_POINTS + 1);
+    let mut pts = Vec::with_capacity(SRC_XN_SCAN_POINTS + 2);
     let log_min = SRC_XN_RATIO_MIN.ln();
     let log_max = SRC_XN_RATIO_MAX.ln();
     for i in 0..SRC_XN_SCAN_POINTS {
@@ -118,11 +124,15 @@ fn src_column_nm_curve(
         let xn = axis.props.d_full * ratio;
         if let Some(pt) = src_column_nm_at_xn(axis, fc_prime, n_ratio, xn) {
             if pt.0.is_finite() && pt.1.is_finite() {
-                pts.push(pt);
+                // 引張側アンカーより外の点は含めない（rNt が最小 N）。
+                if pt.0 >= rnt {
+                    pts.push(pt);
+                }
             }
         }
     }
     pts.push((rnc, 0.0));
+    pts.push((rnt, 0.0));
     pts.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
     pts
 }
@@ -260,8 +270,8 @@ pub(crate) fn src_column_check(
         ft: ft_y,
     };
 
-    let curve_z = src_column_nm_curve(&axis_z, fc_prime, n_ratio, rnc);
-    let curve_y = src_column_nm_curve(&axis_y, fc_prime, n_ratio, rnc);
+    let curve_z = src_column_nm_curve(&axis_z, fc_prime, n_ratio, rnc, rnt);
+    let curve_y = src_column_nm_curve(&axis_y, fc_prime, n_ratio, rnc, rnt);
 
     let n_design = -forces.n; // 圧縮を正とする設計軸力に変換
 
@@ -321,6 +331,25 @@ pub(crate) fn src_column_check(
         n_design,
     );
 
+    // β: 鉄骨ウェブの形式と寸法による係数（SRC規準 P.96-97 の併用式）。
+    // 強軸方向（ウェブがせん断を負担）は β = n・tw・sd/(b・rj)、
+    // 弱軸方向（フランジが負担）は β = 1.33・n・bf・tf/(b・rj)。
+    // sd はフランジ重心間距離 = H − tf、n はヤング係数比。
+    let n_ratio = young_ratio_n(fc_raw);
+    let sd_flange = (steel_height - steel_flange_thick).max(0.0);
+    let beta_z = if props_z.b * props_z.j > 1e-9 {
+        n_ratio * steel_web_thick * sd_flange / (props_z.b * props_z.j)
+    } else {
+        0.0
+    };
+    let beta_y = if props_y.b * props_y.j > 1e-9 {
+        1.33 * n_ratio * steel_width * steel_flange_thick / (props_y.b * props_y.j)
+    } else {
+        0.0
+    };
+
+    // せん断スパン比の割増係数は SRC規準の柱規定 1≦rα≦2 による（RC 柱の 1.5 とは
+    // 異なる）。弱軸方向は shear_span_y（|My|max と対応 |Qz|）を用いる。
     let (m_alpha_z, q_alpha_z) = ctx.shear_span.unwrap_or((forces.mz.abs(), forces.qy.abs()));
     let b_prime_z = (b - steel_width).max(0.0);
     let seismic_z = SrcSeismicCtx {
@@ -344,12 +373,16 @@ pub(crate) fn src_column_check(
         fs,
         w_ft,
         s_fs,
+        // 強軸方向の鉄骨部 sQA = dw・tw・sfs（dw = H − 2tf）。
         steel_web_thick * (steel_height - 2.0 * steel_flange_thick),
-        1.5,
+        2.0,
+        &super::SrcShearMode::Column { beta: beta_z },
         &seismic_z,
     );
 
-    let (m_alpha_y, q_alpha_y) = ctx.shear_span.unwrap_or((forces.my.abs(), forces.qz.abs()));
+    let (m_alpha_y, q_alpha_y) = ctx
+        .shear_span_y
+        .unwrap_or((forces.my.abs(), forces.qz.abs()));
     let b_prime_y = (d_full - steel_height).max(0.0);
     let seismic_y = SrcSeismicCtx {
         ctx,
@@ -372,8 +405,11 @@ pub(crate) fn src_column_check(
         fs,
         w_ft,
         s_fs,
-        2.0 * steel_flange_thick * steel_width,
-        1.5,
+        // 弱軸方向の鉄骨部 sQA = (4/3)・bf・tf・sfs（SRC規準。従来の 2・tf・bf は
+        // 1.5 倍の非保守側だった）。
+        (4.0 / 3.0) * steel_width * steel_flange_thick,
+        2.0,
+        &super::SrcShearMode::Column { beta: beta_y },
         &seismic_y,
     );
 

@@ -285,10 +285,21 @@ fn box_limits_for(grade_name: &str, thickness: f64) -> WtLimits {
 
 /// 鋼種級（400N/mm²級 or 490N/mm²級）を判定する。
 ///
-/// [`crate::steel::steel_f_value_prefix`] を板厚で呼び、F≧295 なら 490 級、
-/// それ未満なら 400 級とする。鋼種名が解決できない場合は、限界幅厚比がより
-/// 厳しい（小さい）490 級を安全側として採用する。
+/// 鋼種級は引張強さによる区分であり、まず鋼種名の数値部で判定する
+/// （…490/520 系 → 490 級、…400 系 → 400 級。SS490 は F=275 だが
+/// 引張強さ 490N/mm² 級であり、F 値のみの判定では 400 級に誤分類され
+/// 限界幅厚比が緩くなる非保守側の誤りとなる）。名称で判定できない場合は
+/// [`crate::steel::steel_f_value_prefix`] を板厚で呼び F≧295 なら 490 級と
+/// するフォールバックを用い、それも解決できなければ限界幅厚比がより厳しい
+/// （小さい）490 級を安全側として採用する。
 fn is_490_class(grade_name: &str, thickness: f64) -> bool {
+    let name = grade_name.trim().to_ascii_uppercase();
+    // 名称中の3桁数値（引張強さ表記）による判定を優先する。
+    for (needle, is_490) in [("490", true), ("520", true), ("550", true), ("400", false)] {
+        if name.contains(needle) {
+            return is_490;
+        }
+    }
     match crate::steel::steel_f_value_prefix(grade_name, thickness) {
         Some(f) => f >= 295.0,
         None => true,

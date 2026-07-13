@@ -14,6 +14,11 @@
 //! - 冷間成形角形鋼管の軸力比に用いる存在軸力は当該解析ケースの軸力
 //!   （`NL + 1.5·NE` の割増は組合せ分離情報が無いため未対応）。
 //! - S 造パネルの梁段違い形式（せい差 150mm 以上）は判別せず標準形式で計算する。
+//! - S 造パネルの軸力比 n は最初に見つかった鋼柱 1 本の軸力から算定する
+//!   （マニュアルの「上下階の柱軸力の平均値＋ブレース軸力の鉛直方向成分」は
+//!   未対応の簡略化）。パネルの Fy も同じ柱の鋼種から板厚 40mm 区分で解決する
+//!   （「下側柱の降伏強さ」の上下判別・実パネル厚の板厚区分は未対応。
+//!   tp > 40mm の極厚パネルでは F 値を過大評価しうる点に注意）。
 //! - 耐震壁は `SectionShape::RcWall` を割り当てた Wall 要素のみ検定する。
 //!   設計用せん断力は等価梁化された壁要素の内力の最大水平せん断成分を用いる
 //!   （暫定）。`Model::wall_attrs` に開口面積合計・個別開口寸法・三方スリット
@@ -547,10 +552,40 @@ pub fn collect_joint_checks_with_long(
             } else {
                 0.8 * beam0.sec.depth
             };
+            // Qdj1 の ΣMy は「大梁の降伏モーメント」の和（マニュアル
+            // Qdj1 = ΣMy/j・(1−ξ)）。弾性解析の梁端モーメントではなく、
+            // 梁の QD1 と同じ略算降伏モーメント（rc_mu_simple、対称配筋・
+            // スラブ筋非考慮）を用いる。RcRect でない梁（情報不足）は
+            // 従来どおり弾性端モーメントで代用する。
             let sum_beam_moments: f64 = rc_beams
                 .iter()
-                .filter_map(|b| b.end_forces(nid))
-                .map(|f| f[5].abs())
+                .map(|b| {
+                    if let Some(SectionShape::RcRect {
+                        b: bw,
+                        d,
+                        ref rebar,
+                        ..
+                    }) = b.sec.shape
+                    {
+                        let at = squid_n_core::section_shape::bar_set_area(&rebar.main_x) / 2.0;
+                        let dt = rc_dt(rebar);
+                        let mu_inp = squid_n_core::rc_capacity::RcCapacityInput {
+                            b: bw,
+                            d,
+                            at,
+                            d_eff: d - dt,
+                            sigma_y: crate::material_strength::rebar_sigma_y(b.mat),
+                            fc: b.mat.fc.unwrap_or(0.0),
+                            pw: 0.0,
+                            sigma_wy: 0.0,
+                            clear_span: 0.0,
+                            sigma_0: 0.0,
+                        };
+                        squid_n_core::rc_capacity::rc_mu_simple(&mu_inp)
+                    } else {
+                        b.end_forces(nid).map(|f| f[5].abs()).unwrap_or(0.0)
+                    }
+                })
                 .sum();
             let col_shear = cols
                 .iter()
@@ -913,7 +948,11 @@ pub fn collect_joint_checks_with_long(
                             _ => 0.9 * b.sec.depth,
                         })
                         .fold(0.0, f64::max);
-                    let mpp = panel_mpp(dc, db, tp, f_l, n_l);
+                    // パネル軸力比 n は「上柱、下柱軸力の平均から計算する」
+                    // （マニュアル■パネル耐力。片側しか存在しない場合は
+                    // 存在する柱の値がそのまま平均になる）。
+                    let n_panel = (n_u + n_l) / 2.0;
+                    let mpp = panel_mpp(dc, db, tp, f_l, n_panel);
                     let inp = ColdFormedInput {
                         zp_col_upper: zp_u,
                         zp_col_lower: zp_l,

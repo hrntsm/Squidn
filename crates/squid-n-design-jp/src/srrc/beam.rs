@@ -111,6 +111,7 @@ pub(crate) fn src_beam_check(
         s_fs,
         steel_web_thick * dw,
         2.0,
+        &super::SrcShearMode::Beam,
         &seismic,
     );
 

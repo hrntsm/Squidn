@@ -329,23 +329,47 @@ fn cft_box_check(
         0.0
     };
 
-    let dw = (height - 2.0 * thick).max(0.0);
-    let s_aw = 2.0 * thick * dw;
-    let s_qa = s_aw * s_fs;
-    // 地震時短期は QD2 = |QL| + n・|Q−QL| を qy/qz 各成分に適用してから
-    // 大きい方を用いる（ctx.seismic_qd が None なら解析せん断力のまま）。
+    // せん断有効断面積は方向別（qy: せい方向の側壁 2t(H−2t)、qz: 幅方向の
+    // 側壁 2t(B−2t)）。従来は両方向とも H 基準で、H≠B の断面の幅方向せん断を
+    // 非保守側に評価していた。
+    let s_aw_y = 2.0 * thick * (height - 2.0 * thick).max(0.0);
+    let s_aw_z = 2.0 * thick * (width - 2.0 * thick).max(0.0);
+    let s_qa_y = s_aw_y * s_fs;
+    let s_qa_z = s_aw_z * s_fs;
+    // 地震時短期は QD2 = |QL| + n・|Q−QL| を qy/qz 各成分に適用する
+    // （ctx.seismic_qd が None なら解析せん断力のまま）。
     let q_design_y = cft_q_design(ctx, forces.pos, forces.qy, 1);
     let q_design_z = cft_q_design(ctx, forces.pos, forces.qz, 2);
-    let q_max = q_design_y.max(q_design_z);
-    let ratio_shear = if s_qa > 1e-9 { q_max / s_qa } else { 0.0 };
+    let ratio_shear_y = if s_qa_y > 1e-9 {
+        q_design_y / s_qa_y
+    } else {
+        0.0
+    };
+    let ratio_shear_z = if s_qa_z > 1e-9 {
+        q_design_z / s_qa_z
+    } else {
+        0.0
+    };
+    let ratio_shear = ratio_shear_y.max(ratio_shear_z);
 
     let ratio = ratio_axial.max(ratio_biaxial).max(ratio_shear);
 
     let basis = "CFT柱(角形): SRC規準に基づく累加強度式".to_string();
     let detail = format!(
         "cNc={:.1} N, sNc={:.1} N, sNt={:.1} N, N={:.1} N, MAz={:.1} N·mm, MAy={:.1} N·mm, \
-         mz={:.1} N·mm, my={:.1} N·mm, sQA={:.1} N, qy={:.1} N, qz={:.1} N",
-        cnc, s_nc, s_nt, n_design, ma_z, ma_y, forces.mz, forces.my, s_qa, forces.qy, forces.qz
+         mz={:.1} N·mm, my={:.1} N·mm, sQAy={:.1} N, sQAz={:.1} N, qy={:.1} N, qz={:.1} N",
+        cnc,
+        s_nc,
+        s_nt,
+        n_design,
+        ma_z,
+        ma_y,
+        forces.mz,
+        forces.my,
+        s_qa_y,
+        s_qa_z,
+        forces.qy,
+        forces.qz
     );
 
     CheckResult {

@@ -257,8 +257,9 @@ pub(crate) fn column_check(
         };
         let ratio_qy = if qay > 0.0 { q_design_y / qay } else { 0.0 };
 
-        let (m_for_alpha_z, q_for_alpha_z) =
-            ctx.shear_span.unwrap_or((forces.my.abs(), forces.qz.abs()));
+        let (m_for_alpha_z, q_for_alpha_z) = ctx
+            .shear_span_y
+            .unwrap_or((forces.my.abs(), forces.qz.abs()));
         let alpha_z = shear_alpha(m_for_alpha_z, q_for_alpha_z, axis.props.d, 1.5);
         let qaz = shear_capacity_for(
             &axis.props,
@@ -405,8 +406,9 @@ pub(crate) fn column_check(
     };
     let ratio_qy = if qay > 0.0 { q_design_y / qay } else { 0.0 };
 
-    let (m_for_alpha_z, q_for_alpha_z) =
-        ctx.shear_span.unwrap_or((forces.my.abs(), forces.qz.abs()));
+    let (m_for_alpha_z, q_for_alpha_z) = ctx
+        .shear_span_y
+        .unwrap_or((forces.my.abs(), forces.qz.abs()));
     let alpha_z = shear_alpha(m_for_alpha_z, q_for_alpha_z, axis_y.props.d, 1.5);
     let qaz = shear_capacity_for(
         &axis_y.props,

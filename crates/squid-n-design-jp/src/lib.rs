@@ -128,10 +128,15 @@ pub struct DesignCtx {
     pub lb: Option<f64>,
     /// 座屈長さ lk [mm]。None なら `length`（座屈長さ係数 K=1 相当）。
     pub lk: Option<f64>,
-    /// せん断スパン比 M/(Q·d) 算定用の部材代表値 `(|M|max, 対応する |Q|)`。
-    /// マニュアルの規定（モーメントが最大となる検定位置の値を採用）に対応する。
-    /// None の場合は当該評価位置の |M|, |Q| を使う。
+    /// せん断スパン比 M/(Q·d) 算定用の部材代表値 `(|Mz|max, 対応する |Qy|)`
+    /// （強軸曲げ方向）。「モーメントが最大となる検定位置の値を採用」の規定に
+    /// 対応する。None の場合は当該評価位置の |Mz|, |Qy| を使う。
     pub shear_span: Option<(f64, f64)>,
+    /// せん断スパン比の弱軸曲げ方向代表値 `(|My|max, 対応する |Qz|)`。
+    /// 柱の二方向せん断検定で qz 方向の α に用いる（加力方向ごとに
+    /// せん断スパン比を評価する規定）。None の場合は当該評価位置の
+    /// |My|, |Qz| を使う（強軸側の値を流用しない）。
+    pub shear_span_y: Option<(f64, f64)>,
     /// RC 短期許容せん断力で「損傷制御のための検討」式（2/3·α）を使うか。
     /// false の場合は「安全確保のための検討」式。
     pub rc_damage_control: bool,
@@ -160,6 +165,7 @@ impl Default for DesignCtx {
             lb: None,
             lk: None,
             shear_span: None,
+            shear_span_y: None,
             rc_damage_control: true,
             end_moments_z: None,
             mid_moment_z: None,
