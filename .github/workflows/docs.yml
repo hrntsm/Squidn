@@ -5,14 +5,19 @@ on:
     branches: [main]
   workflow_dispatch:
 
-# Cloudflare Pages へのデプロイには以下のリポジトリシークレットが必要:
-#   CLOUDFLARE_API_TOKEN : Pages の編集権限を持つ API トークン
-#   CLOUDFLARE_ACCOUNT_ID: Cloudflare アカウント ID
-# また、Cloudflare ダッシュボード（または wrangler）で
-# projectName と同名のプロジェクトを事前作成しておくこと。
-
+# GitHub Pages へのデプロイに必要な権限
 permissions:
   contents: read
+  pages: write
+  id-token: write
+
+# 同時に 1 つのデプロイのみ実行
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+env:
+  MDBOOK_VERSION: "0.4.52"
 
 jobs:
   build:
@@ -20,15 +25,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # 事前ビルド済みバイナリを取得（cargo install より高速）
       - name: Install mdBook
-        uses: peaceiris/actions-mdbook@v2
-        with:
-          mdbook-version: "0.4.52"
-
-      # cargo doc の再コンパイルを回避
-      - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
+        run: |
+          cargo install mdbook --version "${MDBOOK_VERSION}" --locked
 
       - name: Build book
         run: mdbook build
@@ -41,29 +40,18 @@ jobs:
           cp -r target/doc/. book/api/
           echo '<meta http-equiv="refresh" content="0; url=squid_n_core/index.html">' > book/api/index.html
 
-      - name: Upload build artifact
-        uses: actions/upload-artifact@v4
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
         with:
-          name: book
           path: book
-          if-no-files-found: error
 
   deploy:
     needs: build
     runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
     steps:
-      - name: Download build artifact
-        uses: actions/download-artifact@v4
-        with:
-          name: book
-          path: book
-
-      - name: Deploy to Cloudflare Pages
-        uses: cloudflare/pages-action@v1
-        with:
-          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-          projectName: squidn-docs
-          directory: book
-          branch: main
-          gitHubToken: ${{ secrets.GITHUB_TOKEN }}
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
