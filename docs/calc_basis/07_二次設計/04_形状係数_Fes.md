@@ -22,11 +22,10 @@
 - 弾力半径 \\( r_{ex} = \sqrt{K_R/\sum D_x} \\)、\\( K_R = \sum(D_x \cdot \bar{y}^2) + \sum(D_y \cdot \bar{x}^2) \\)
 - \\( R_e = e/r_e \\)、\\( F_e = \begin{cases} 1.0 & (R_e \le 0.15) \\\\ \min(1.0 + 0.5(R_e - 0.15)/0.15, 1.5) & (R_e > 0.15) \end{cases} \\)
 
-**実装**：`secondary::eccentricity`（D 値法略算）と `secondary::eccentricity_analysis`（応力解析結果からの精算層。
-剛心は解析剛性、重心は長期軸力による）、および `holding_capacity::fe` が算定する。
+**実装**：`secondary::eccentricity`（D 値法略算）と `secondary::eccentricity_analysis`（応力解析結果からの精算層。剛心は解析剛性、重心は長期軸力による）、および `holding_capacity::fe` が算定する。
 
-**整合性**：doc に令82条の6、告示1792号、武藤 D 値法を明記している。Fe の上限を 1.5 で頭打ちにする扱いは
-[原典照合リスト 優先度3](https://github.com/hrntsm/squid-n/blob/main/specs/原典照合リスト.md#優先度3fes形状係数の頭打ち挙動)で要照合である（☐）。
+**整合性**：doc に令82条の6、告示1792号、武藤 D 値法を明記している。
+Fe の上限を 1.5 で頭打ちにする扱いは[原典照合リスト 優先度3](https://github.com/hrntsm/squid-n/blob/main/specs/原典照合リスト.md#優先度3fes形状係数の頭打ち挙動)で要照合である（☐）。
 偏心率は弾性剛性（弾性解析結果）に基づいて算定する（令82条の6 の運用に基づく実務的取扱い）。
 
 ## 7.4.3 形状係数 Fes

@@ -13,6 +13,8 @@ SRC・CFT の断面検定を、SRC規準1987（累加強度式・併用せん断
 - CFT 柱は SRC 規準を CFT 断面に適用する（相互拘束効果の強度割増しは考慮せず、非拘束・安全側とする）。せん断有効断面積は方向別（\\( 2t(H-2t) \\)／\\( 2t(B-2t) \\)）
 - CFT 柱の地震時設計用せん断は \\( Q_D = \min(Q_{D1}, Q_{D2}) \\)。\\( Q_{D1} = \sum {}\_c M_y/h' \\) の cMy には CFT 指針（コンクリート充填鋼管構造設計指針）の N-M 相互作用による終局曲げ耐力 Mu(N)（柱分類対応）を用い、柱頭・柱脚同一断面の仮定で \\( \sum {}\_c M_y = 2 \cdot M_u(N) \\) とする。\\( Q_{D2} = Q_L + n \cdot Q_E \\)
 
-**実装**：`srrc::{beam, column, panel_zone}`、`cft::mod` が検定する。SRC パネルゾーンは \\( {}\_c V \cdot j\delta \cdot f_s \cdot (1+\beta) \ge (h'/h)({}\_B M_1 + {}\_B M_2) \\)。
+**実装**：`srrc::{beam, column, panel_zone}`、`cft::mod` が検定する。
+SRC パネルゾーンは \\( {}\_c V \cdot j\delta \cdot f_s \cdot (1+\beta) \ge (h'/h)({}\_B M_1 + {}\_B M_2) \\)。
 
-**整合性**：SRC パネルゾーン検定式・jδ は原典図と照合済み（cVe → cV、h/h' → h'/h へ修正、[原典照合リスト](https://github.com/hrntsm/squid-n/blob/main/specs/原典照合リスト.md)☑）。CFT の残る簡略化（円形柱 N-M の数値積分等）は実装 doc に明記している。
+**整合性**：SRC パネルゾーン検定式・jδ は原典図と照合済み（cVe → cV、h/h' → h'/h へ修正、[原典照合リスト](https://github.com/hrntsm/squid-n/blob/main/specs/原典照合リスト.md)☑）。
+CFT の残る簡略化（円形柱 N-M の数値積分等）は実装 doc に明記している。

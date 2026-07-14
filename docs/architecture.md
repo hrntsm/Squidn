@@ -12,7 +12,8 @@ Layer 5: squid-n-design-jp（日本仕様設計計算）、squid-n-io（結果I/
 Layer 6: squid-n-mcp（MCP サーバ）、squid-n-app（GUI アプリケーション）
 ```
 
-依存方向は上層から下層のみです。循環依存は次のコマンドで検出します。
+依存方向は上層から下層のみです。
+循環依存は次のコマンドで検出します。
 
 ```bash
 cargo run -p xtask -- check-deps
@@ -40,5 +41,4 @@ cargo run -p xtask -- check-deps
 
 ## API リファレンス
 
-各クレートの API ドキュメント（rustdoc）は、CI で `cargo doc` から生成され、
-このサイトの [`api/`](./api/squid_n_core/index.html) 以下に併設されます。
+各クレートの API ドキュメント（rustdoc）は、CI で `cargo doc` から生成され、このサイトの [`api/`](./api/squid_n_core/index.html) 以下に併設されます。
