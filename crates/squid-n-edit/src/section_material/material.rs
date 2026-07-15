@@ -1,0 +1,188 @@
+//! 材料の編集コマンド（追加・削除・プロパティ編集）。
+
+use super::*;
+use squid_n_core::ids::*;
+
+/// 材料追加。末尾に `MaterialId(len)` で追加する（ID＝配列インデックスの不変条件を維持）。
+/// 逆操作は材料削除。
+pub struct AddMaterial {
+    pub name: String,
+    pub young: f64,
+    pub poisson: f64,
+    pub density: f64,
+    pub fc: Option<f64>,
+    pub fy: Option<f64>,
+}
+
+impl EditCommand for AddMaterial {
+    fn apply(&self, model: &mut Model) -> Box<dyn EditCommand> {
+        let new_id = MaterialId(model.materials.len() as u32);
+        model.materials.push(squid_n_core::model::Material {
+            concrete_class: Default::default(),
+            id: new_id,
+            name: self.name.clone(),
+            young: self.young,
+            poisson: self.poisson,
+            density: self.density,
+            shear: None,
+            fc: self.fc,
+            fy: self.fy,
+        });
+        Box::new(DeleteMaterial { id: new_id })
+    }
+
+    fn label(&self) -> &str {
+        "材料追加"
+    }
+}
+
+/// 材料削除。部材から参照中の材料は Noop。逆操作は [`InsertMaterial`]。
+/// ID＝配列インデックスの不変条件を保つため、後続の材料 ID と部材からの参照を繰り上げる。
+pub struct DeleteMaterial {
+    pub id: MaterialId,
+}
+
+impl EditCommand for DeleteMaterial {
+    fn apply(&self, model: &mut Model) -> Box<dyn EditCommand> {
+        let idx = self.id.index();
+        if idx >= model.materials.len() || model.materials[idx].id != self.id {
+            return Box::new(Noop);
+        }
+        if model.elements.iter().any(|e| e.material == Some(self.id)) {
+            return Box::new(Noop);
+        }
+        let removed = model.materials.remove(idx);
+        shift_material_ids(model, |mid| {
+            if mid.0 > self.id.0 {
+                mid.0 -= 1;
+            }
+        });
+        Box::new(InsertMaterial {
+            index: idx,
+            old: removed,
+        })
+    }
+
+    fn label(&self) -> &str {
+        "材料削除"
+    }
+}
+
+/// 指定インデックスへ材料を再挿入する（[`DeleteMaterial`] の逆操作専用）。
+pub struct InsertMaterial {
+    pub index: usize,
+    pub old: squid_n_core::model::Material,
+}
+
+impl EditCommand for InsertMaterial {
+    fn apply(&self, model: &mut Model) -> Box<dyn EditCommand> {
+        if self.index > model.materials.len() {
+            return Box::new(Noop);
+        }
+        let id = MaterialId(self.index as u32);
+        shift_material_ids(model, |mid| {
+            if mid.0 >= id.0 {
+                mid.0 += 1;
+            }
+        });
+        let mut mat = self.old.clone();
+        mat.id = id;
+        model.materials.insert(self.index, mat);
+        Box::new(DeleteMaterial { id })
+    }
+
+    fn label(&self) -> &str {
+        "材料削除の取り消し"
+    }
+}
+
+/// モデル内の全ての `MaterialId` 参照（材料自身の ID を含む）に `f` を適用する。
+fn shift_material_ids(model: &mut Model, mut f: impl FnMut(&mut MaterialId)) {
+    for mat in &mut model.materials {
+        f(&mut mat.id);
+    }
+    for elem in &mut model.elements {
+        if let Some(mid) = &mut elem.material {
+            f(mid);
+        }
+    }
+}
+
+/// 編集対象の材料プロパティ。
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum MaterialField {
+    Young,
+    Poisson,
+    Density,
+    Fc,
+    Fy,
+}
+
+/// 材料プロパティ変更（E・ポアソン比・密度・Fc・Fy）。
+pub struct SetMaterialField {
+    pub id: MaterialId,
+    pub field: MaterialField,
+    pub value: Option<f64>,
+}
+
+impl EditCommand for SetMaterialField {
+    fn apply(&self, model: &mut Model) -> Box<dyn EditCommand> {
+        let idx = self.id.index();
+        if idx >= model.materials.len() || model.materials[idx].id != self.id {
+            return Box::new(Noop);
+        }
+        let mat = &mut model.materials[idx];
+        let old = match self.field {
+            MaterialField::Young => {
+                let old = Some(mat.young);
+                mat.young = self.value.unwrap_or(mat.young);
+                old
+            }
+            MaterialField::Poisson => {
+                let old = Some(mat.poisson);
+                mat.poisson = self.value.unwrap_or(mat.poisson);
+                old
+            }
+            MaterialField::Density => {
+                let old = Some(mat.density);
+                mat.density = self.value.unwrap_or(mat.density);
+                old
+            }
+            MaterialField::Fc => std::mem::replace(&mut mat.fc, self.value),
+            MaterialField::Fy => std::mem::replace(&mut mat.fy, self.value),
+        };
+        Box::new(SetMaterialField {
+            id: self.id,
+            field: self.field,
+            value: old,
+        })
+    }
+
+    fn label(&self) -> &str {
+        "材料プロパティ変更"
+    }
+}
+
+/// 材料名変更。
+pub struct SetMaterialName {
+    pub id: MaterialId,
+    pub name: String,
+}
+
+impl EditCommand for SetMaterialName {
+    fn apply(&self, model: &mut Model) -> Box<dyn EditCommand> {
+        let idx = self.id.index();
+        if idx >= model.materials.len() || model.materials[idx].id != self.id {
+            return Box::new(Noop);
+        }
+        let old = std::mem::replace(&mut model.materials[idx].name, self.name.clone());
+        Box::new(SetMaterialName {
+            id: self.id,
+            name: old,
+        })
+    }
+
+    fn label(&self) -> &str {
+        "材料名変更"
+    }
+}

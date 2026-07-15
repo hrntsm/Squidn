@@ -1,6 +1,9 @@
 use super::*;
+use crate::transform::LocalFrame;
 use squid_n_core::ids::{ElemId, NodeId};
-use squid_n_core::model::{ElementData, ElementKind, LocalAxis, Material, Node, Section};
+use squid_n_core::model::{
+    ElementData, ElementKind, EndCondition, LocalAxis, Material, Model, Node, RigidZone, Section,
+};
 
 fn make_test_beam() -> BeamElement {
     BeamElement {

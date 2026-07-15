@@ -1,0 +1,171 @@
+//! UI 描画用の代表応答記録と層間変形角の集計。
+//!
+//! - [`choose_record_dir_y`] — 記録方向（X/Y）の自動選択
+//! - [`pick_record_node`] — 記録節点（最上部）の選択
+//! - [`record_history_step`] — 1 ステップ分の代表応答記録
+//! - [`total_mass`] — 記録方向の合計質量 rᵀ·M·r
+//! - [`update_story_drift`] — 層間変形角（各層最大値）の更新
+
+use super::config::GroundMotion;
+use super::result::ResponseHistory;
+use crate::constraint::Reducer;
+use squid_n_core::dof::{DofMap, DOF_PER_NODE};
+use squid_n_core::model::Model;
+
+/// 記録方向を自動選択する: `accel_y` が Some かつ Σ|accel_y| > Σ|accel_x| なら Y、
+/// そうでなければ X（従来互換）。
+pub(crate) fn choose_record_dir_y(wave: &GroundMotion) -> bool {
+    let sum_x: f64 = wave.accel_x.iter().map(|v| v.abs()).sum();
+    let sum_y: f64 = wave
+        .accel_y
+        .as_ref()
+        .map(|a| a.iter().map(|v| v.abs()).sum())
+        .unwrap_or(0.0);
+    wave.accel_y.is_some() && sum_y > sum_x
+}
+
+/// 記録節点を選ぶ: 記録方向（`dir_idx`: 0=X, 1=Y）が自由な節点のうち
+/// 最も標高(Z)が高いもの。
+pub(crate) fn pick_record_node(
+    model: &Model,
+    dofmap: &DofMap,
+    dir_idx: usize,
+) -> Option<squid_n_core::ids::NodeId> {
+    model
+        .nodes
+        .iter()
+        .filter(|n| {
+            dofmap
+                .active(n.id.index() * DOF_PER_NODE + dir_idx)
+                .is_some()
+        })
+        .max_by(|a, b| {
+            a.coord[2]
+                .partial_cmp(&b.coord[2])
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .map(|n| n.id)
+}
+
+/// 最上階の現在の層間変形角（符号付き、記録方向 `dir_idx`）。階が未定義なら 0。
+fn current_top_drift(model: &Model, dofmap: &DofMap, u_free: &[f64], dir_idx: usize) -> f64 {
+    let Some(si) = model.stories.len().checked_sub(1) else {
+        return 0.0;
+    };
+    let story = &model.stories[si];
+    let height_mm = if si == 0 {
+        story.elevation
+    } else {
+        story.elevation - model.stories[si - 1].elevation
+    };
+    if height_mm <= 0.0 {
+        return 0.0;
+    }
+    let top = story.node_ids.first().copied();
+    let bot = if si == 0 {
+        model.nodes.iter().find(|n| n.story.is_none()).map(|n| n.id)
+    } else {
+        model.stories[si - 1].node_ids.first().copied()
+    };
+    if let (Some(tn), Some(bn)) = (top, bot) {
+        (node_disp(u_free, dofmap, tn, dir_idx) - node_disp(u_free, dofmap, bn, dir_idx))
+            / height_mm
+    } else {
+        0.0
+    }
+}
+
+/// 1 ステップ分の代表応答を記録する。
+/// `dir_idx` は記録方向（0=X, 1=Y）、`m_r` は当該方向の M·r、`rmr` は当該方向の
+/// rᵀ·M·r（合計質量）、`a_red` は縮約空間の相対加速度、`xg` は当該時刻の
+/// 記録方向の地動加速度。
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn record_history_step(
+    history: &mut ResponseHistory,
+    model: &Model,
+    dofmap: &DofMap,
+    reducer: &Reducer,
+    dir_idx: usize,
+    m_r: &[f64],
+    rmr: f64,
+    u_free: &[f64],
+    a_red: &[f64],
+    xg: f64,
+) {
+    let disp = history
+        .node
+        .map(|n| node_disp(u_free, dofmap, n, dir_idx))
+        .unwrap_or(0.0);
+    history.node_disp.push(disp);
+    let a_free = reducer.expand_u(a_red);
+    let ma: f64 = m_r.iter().zip(a_free.iter()).map(|(m, a)| m * a).sum();
+    history.base_shear.push(-(ma + xg * rmr));
+    history
+        .top_drift_angle
+        .push(current_top_drift(model, dofmap, u_free, dir_idx));
+}
+
+/// rᵀ·M·r （記録方向 `dir_idx` の合計質量）。ベースシア計算に使う。
+pub(crate) fn total_mass(m_r: &[f64], dofmap: &DofMap, n_nodes: usize, dir_idx: usize) -> f64 {
+    let mut s = 0.0;
+    for ni in 0..n_nodes {
+        if let Some(a) = dofmap.active(ni * DOF_PER_NODE + dir_idx) {
+            s += m_r[a as usize];
+        }
+    }
+    s
+}
+
+/// 層間変形角を更新する（各層の最大値を追跡）。X 方向の水平変位差／階高。
+pub(crate) fn update_story_drift(
+    model: &Model,
+    dofmap: &DofMap,
+    u_free: &[f64],
+    story_drift_angle: &mut [f64],
+) {
+    for (si, story) in model.stories.iter().enumerate() {
+        if si >= story_drift_angle.len() {
+            break;
+        }
+        let height_mm = if si == 0 {
+            story.elevation
+        } else {
+            story.elevation - model.stories[si - 1].elevation
+        };
+        if height_mm <= 0.0 {
+            continue;
+        }
+        let top = story.node_ids.first().copied();
+        let bot = if si == 0 {
+            // 1層目: 基礎節点（story=None の最初の節点）を下端とする
+            model.nodes.iter().find(|n| n.story.is_none()).map(|n| n.id)
+        } else {
+            model.stories[si - 1].node_ids.first().copied()
+        };
+        if let (Some(tn), Some(bn)) = (top, bot) {
+            // 層間変形角は従来通り X 方向（0）で評価する（ResponseHistory の
+            // 記録方向とは独立）。
+            let du = (node_disp(u_free, dofmap, tn, 0) - node_disp(u_free, dofmap, bn, 0)).abs();
+            let angle = du / height_mm;
+            if angle > story_drift_angle[si] {
+                story_drift_angle[si] = angle;
+            }
+        }
+    }
+}
+
+/// 節点の並進自由度 `dir_idx`（0=X, 1=Y, 2=Z）の相対変位を返す。
+fn node_disp(
+    u_free: &[f64],
+    dofmap: &DofMap,
+    node_id: squid_n_core::ids::NodeId,
+    dir_idx: usize,
+) -> f64 {
+    let ni = node_id.index();
+    let g = ni * DOF_PER_NODE + dir_idx;
+    if let Some(a) = dofmap.active(g) {
+        u_free[a as usize]
+    } else {
+        0.0
+    }
+}

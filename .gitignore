@@ -27,3 +27,6 @@ opencode.json
 
 # mdBook ドキュメントサイトのビルド出力
 /book
+
+# Claude Code のエージェント作業用 worktree（一時的・追跡対象外）
+/.claude/

@@ -1,0 +1,326 @@
+//! 階（Story）生成の本体。
+//!
+//! - [`StoryGenResult`] — 生成結果（呼び出し側が [`Model`] へ適用する）
+//! - [`generate_stories_multi`] — 複数重力荷重ケースを地震用重量に算入する階生成
+//! - [`generate_stories`] — 単一ケース指定の従来互換ラッパー
+
+use super::misc_wall::accumulate_misc_wall_weight;
+use super::reactions::static_reactions;
+use super::*;
+
+/// 生成結果。[`Model`] へ適用するのは呼び出し側（EditCommand 経由）。
+#[derive(Clone, Debug, PartialEq)]
+pub struct StoryGenResult {
+    /// 下から順の階（基部レベルは含まない）。
+    pub stories: Vec<Story>,
+    /// 各節点の所属階（`model.nodes` と同順。基部レベルは None）。
+    /// 長さは `model.nodes.len()`（新規に生成される代表節点は含まない。
+    /// 代表節点の所属階は `rep_nodes` 側の `story` フィールドが正）。
+    pub node_story: Vec<Option<StoryId>>,
+    /// 各階の剛床拘束（`Reducer` が読む `model.constraints` 用）。
+    pub constraints: Vec<Constraint>,
+    /// 生成・更新される剛床代表節点（座標＝慣性力重心、拘束・所属階設定済み）。
+    /// ID が既存の `model.nodes` 範囲内なら置換（再利用）、範囲外なら新規追加。
+    pub rep_nodes: Vec<Node>,
+    /// 適用後の `model.generated_masters` の全量。
+    pub generated_masters: Vec<NodeId>,
+}
+
+/// 節点 Z 座標から階を自動生成する（複数の重力荷重ケースを地震用重量に算入する版）。
+///
+/// - 最下レベルは基部(支点レベル)とみなし階に含めない
+/// - 前回生成した剛床代表節点（`model.generated_masters`）は構造節点の
+///   クラスタリング対象から除外する（再生成時に過去の代表節点を混ぜない）
+/// - 各階の剛床代表節点は、その階の全構造節点の慣性力重心（重量重み付き重心）に
+///   新規生成する（既存の `generated_masters` があれば座標・拘束・所属階を更新して再利用）
+/// - `gravity_lcs` に指定した各ケースの鉛直下向き荷重を地震重量に算入する
+///   （自重は材料密度から常に算入）。重複 ID は 1 回だけ処理する
+///   （固定荷重＋地震用積載荷重など複数ケースの合算に対応する下準備）。
+pub fn generate_stories_multi(
+    model: &Model,
+    gravity_lcs: &[LoadCaseId],
+) -> Result<StoryGenResult, String> {
+    if model.nodes.is_empty() {
+        return Err("節点がありません".into());
+    }
+
+    // --- 0. 構造節点の抽出（前回生成分の剛床代表節点を除外） ---
+    let generated: std::collections::HashSet<NodeId> =
+        model.generated_masters.iter().copied().collect();
+    let struct_nodes: Vec<&Node> = model
+        .nodes
+        .iter()
+        .filter(|n| !generated.contains(&n.id))
+        .collect();
+    if struct_nodes.is_empty() {
+        return Err("節点がありません".into());
+    }
+
+    // --- 1. Z レベルのクラスタリング（構造節点のみ） ---
+    let mut zs: Vec<f64> = struct_nodes.iter().map(|n| n.coord[2]).collect();
+    zs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let mut levels: Vec<f64> = Vec::new();
+    for z in zs {
+        match levels.last() {
+            Some(&last) if (z - last).abs() <= LEVEL_TOL_MM => {}
+            _ => levels.push(z),
+        }
+    }
+    if levels.len() < 2 {
+        return Err(
+            "節点の標高(Z)が 1 レベルしかありません。階を生成するには 2 レベル以上必要です。"
+                .into(),
+        );
+    }
+
+    let level_of = |z: f64| -> usize {
+        levels
+            .iter()
+            .position(|&l| (z - l).abs() <= LEVEL_TOL_MM)
+            .unwrap_or(0)
+    };
+
+    // --- 2. 節点の重量配分 ---
+    let mut node_weight = vec![0.0f64; model.nodes.len()];
+    let load_cfg = model.load_cfg.clone().unwrap_or_default();
+
+    // K型ブレースの重量配分（§K型ブレース）に用いる「基準節点」判定。
+    // 基準節点＝ Brace 以外の要素が 1 つでも接続する節点。それ以外は「内部節点」。
+    let mut is_base_node = vec![false; model.nodes.len()];
+    for e in &model.elements {
+        if !matches!(e.kind, ElementKind::Brace { .. }) {
+            for n in &e.nodes {
+                if let Some(slot) = is_base_node.get_mut(n.index()) {
+                    *slot = true;
+                }
+            }
+        }
+    }
+
+    // 自重（算定規則は enumerate_self_weight に一元化。§柱梁自重・§壁自重・§ダンパー自重）。
+    // - 線材: 総重量を両端に半分ずつ（対称等分布荷重の静定反力。
+    //   K型ブレースは §K型ブレースの規則で再配分）。
+    // - ダンパー: 両端節点へ 1/2 ずつ（鉛直配置は上下階へ、水平配置は同一階の
+    //   両節点へ、が節点標高から自然に成立する）。
+    // - 壁・シェル: 頂点配分（三方スリットは最上位標高の頂点へ全量）。
+    for item in enumerate_self_weight(model, &load_cfg) {
+        match item {
+            SelfWeightItem::Damper { ni, nj, total } => {
+                node_weight[ni] += total / 2.0;
+                node_weight[nj] += total / 2.0;
+            }
+            SelfWeightItem::Line { elem_idx, total } => {
+                let elem = &model.elements[elem_idx];
+                let ni = elem.nodes[0].index();
+                let nj = elem.nodes[1].index();
+                if matches!(elem.kind, ElementKind::Brace { .. })
+                    && load_cfg.k_brace_rule == KBraceWeightRule::BaseNodesOnly
+                {
+                    // §K型ブレース: 基準節点のみへ配分。両端とも基準節点は 1/2 ずつ、
+                    // 片端が内部節点ならその分も基準節点側へ全量、両端とも内部節点は
+                    // フォールバックで従来どおり 1/2 ずつ。
+                    match (is_base_node[ni], is_base_node[nj]) {
+                        (true, false) => node_weight[ni] += total,
+                        (false, true) => node_weight[nj] += total,
+                        (true, true) | (false, false) => {
+                            node_weight[ni] += total / 2.0;
+                            node_weight[nj] += total / 2.0;
+                        }
+                    }
+                } else {
+                    node_weight[ni] += total / 2.0;
+                    node_weight[nj] += total / 2.0;
+                }
+            }
+            SelfWeightItem::Panel { shares } => {
+                for (i, w) in shares {
+                    node_weight[i] += w;
+                }
+            }
+        }
+    }
+
+    // §フレーム外雑壁: 部材としてモデル化しない壁の重量を近傍節点へ集計する。
+    accumulate_misc_wall_weight(model, &mut node_weight);
+
+    // 指定荷重ケース（複数可）の鉛直下向き成分。
+    // §1.4: 部材荷重は単純梁の静定反力（`static_reactions`）で両端に配分する
+    // （令88条の実務的取扱い: 地震用節点重量 = 大梁の CMoQo 計算による梁せん断力 Q0）。
+    let mut seen_lcs: std::collections::HashSet<LoadCaseId> = std::collections::HashSet::new();
+    for &lc_id in gravity_lcs {
+        if !seen_lcs.insert(lc_id) {
+            continue;
+        }
+        let Some(lc) = model.load_cases.iter().find(|c| c.id == lc_id) else {
+            continue;
+        };
+        for nl in &lc.nodal {
+            if nl.values[2] < 0.0 {
+                node_weight[nl.node.index()] += -nl.values[2];
+            }
+        }
+        for ml in &lc.member {
+            let Some(elem) = model
+                .elements
+                .iter()
+                .find(|e| e.id == ml.elem)
+                .filter(|e| e.nodes.len() >= 2)
+            else {
+                continue;
+            };
+            // 全体座標系の作用方向（正規化済み）の鉛直下向き成分
+            let dz = ml.dir[2];
+            if dz >= 0.0 {
+                continue;
+            }
+            let ni = elem.nodes[0].index();
+            let nj = elem.nodes[1].index();
+            let (ci, cj) = (model.nodes[ni].coord, model.nodes[nj].coord);
+            let len = ((cj[0] - ci[0]).powi(2) + (cj[1] - ci[1]).powi(2) + (cj[2] - ci[2]).powi(2))
+                .sqrt();
+            let (ri, rj) = static_reactions(&ml.kind, len);
+            let scale = -dz;
+            node_weight[ni] += ri * scale;
+            node_weight[nj] += rj * scale;
+        }
+    }
+
+    // --- 3. 階の構築（レベル 1 以上、下から順） ---
+    let mut stories = Vec::new();
+    let mut node_story = vec![None; model.nodes.len()];
+    let mut constraints = Vec::new();
+    let mut rep_nodes: Vec<Node> = Vec::new();
+    let mut generated_masters: Vec<NodeId> = Vec::new();
+
+    // 既存の代表節点は昇順（下の階から順）に再利用し、足りない分は末尾連番で新規生成する。
+    let mut reuse_masters = model.generated_masters.iter().copied();
+    let mut next_new_id = model.nodes.len() as u32;
+
+    // 剛床代表節点の拘束: 要素が接続しない浮遊節点のため、剛床が拘束しない
+    // 3 自由度（Uz, Rx, Ry）を固定しないと特異行列になる。Ux, Uy, Rz は自由。
+    let mut rep_restraint = Dof6Mask::FREE;
+    rep_restraint.set_fixed(Dof::Uz);
+    rep_restraint.set_fixed(Dof::Rx);
+    rep_restraint.set_fixed(Dof::Ry);
+
+    for (si, &elev) in levels.iter().enumerate().skip(1) {
+        let story_id = StoryId((si - 1) as u32);
+        let node_ids: Vec<NodeId> = struct_nodes
+            .iter()
+            .filter(|n| level_of(n.coord[2]) == si)
+            .map(|n| n.id)
+            .collect();
+        if node_ids.is_empty() {
+            continue;
+        }
+
+        let weight: f64 = node_ids.iter().map(|n| node_weight[n.index()]).sum();
+
+        // 慣性力重心（重量重み付き重心）。重量が算定できない場合は幾何重心へフォールバック。
+        let (gx, gy) = if weight > 0.0 {
+            let gx = node_ids
+                .iter()
+                .map(|n| node_weight[n.index()] * model.nodes[n.index()].coord[0])
+                .sum::<f64>()
+                / weight;
+            let gy = node_ids
+                .iter()
+                .map(|n| node_weight[n.index()] * model.nodes[n.index()].coord[1])
+                .sum::<f64>()
+                / weight;
+            (gx, gy)
+        } else {
+            let gx = node_ids
+                .iter()
+                .map(|n| model.nodes[n.index()].coord[0])
+                .sum::<f64>()
+                / node_ids.len() as f64;
+            let gy = node_ids
+                .iter()
+                .map(|n| model.nodes[n.index()].coord[1])
+                .sum::<f64>()
+                / node_ids.len() as f64;
+            (gx, gy)
+        };
+
+        // 剛床代表節点（慣性力重心に置く専用の仮想節点）の生成/再利用。
+        let master = reuse_masters.next().unwrap_or_else(|| {
+            let id = NodeId(next_new_id);
+            next_new_id += 1;
+            id
+        });
+        rep_nodes.push(Node {
+            id: master,
+            coord: [gx, gy, elev],
+            restraint: rep_restraint,
+            mass: None,
+            story: Some(story_id),
+        });
+        generated_masters.push(master);
+
+        // 当該階の全構造節点がスレーブ（マスターは専用節点のため、既存節点は 1 点でも全てスレーブ）。
+        let slaves = node_ids.clone();
+
+        for n in &node_ids {
+            node_story[n.index()] = Some(story_id);
+        }
+        constraints.push(Constraint::RigidDiaphragm {
+            story: story_id,
+            master,
+            slaves: slaves.clone(),
+        });
+        stories.push(Story {
+            id: story_id,
+            name: format!("{}F", si),
+            elevation: elev,
+            node_ids,
+            diaphragms: vec![DiaphragmDef {
+                ci_override: None,
+                master,
+                slaves,
+                rigid: true,
+                weight: Some(weight),
+            }],
+            seismic_weight: Some(weight),
+            structure: Default::default(),
+            level_kind: Default::default(),
+        });
+    }
+
+    if stories.is_empty() {
+        return Err("階を構成する節点が見つかりませんでした。".into());
+    }
+
+    // 階数が減って余った旧代表節点は不活性化する（拘束固定・所属階なし）が、
+    // `generated_masters` には残して次回再生成時に再利用できるようにする。
+    for id in reuse_masters {
+        rep_nodes.push(Node {
+            id,
+            coord: model.nodes[id.index()].coord,
+            restraint: Dof6Mask::FIXED,
+            mass: None,
+            story: None,
+        });
+        generated_masters.push(id);
+    }
+
+    Ok(StoryGenResult {
+        stories,
+        node_story,
+        constraints,
+        rep_nodes,
+        generated_masters,
+    })
+}
+
+/// 節点 Z 座標から階を自動生成する（重力荷重ケース単一指定・従来互換の薄いラッパー）。
+///
+/// 詳細は [`generate_stories_multi`] を参照。`gravity_lc` を `Some` で渡した場合は
+/// その 1 ケースのみを地震用重量に算入する（`None` は自重のみ）。
+pub fn generate_stories(
+    model: &Model,
+    gravity_lc: Option<LoadCaseId>,
+) -> Result<StoryGenResult, String> {
+    let lcs: Vec<LoadCaseId> = gravity_lc.into_iter().collect();
+    generate_stories_multi(model, &lcs)
+}
