@@ -35,7 +35,13 @@ impl ElementBehavior for BeamElement {
     }
 
     fn geometric_stiffness(&self, n: f64) -> LocalMat {
-        let l = self.length;
+        // 幾何剛性も弾性剛性と整合させる: 可撓長で組み、剛域変換で節点自由度へ写す。
+        // 剛域があれば P-δ は可撓部でのみ生じ、剛域は剛体アームとして働く。
+        // 剛域なし（li=lj=0）では従来どおり全長 L の幾何剛性に一致する。
+        let l = self.length - self.rigid.length_i - self.rigid.length_j;
+        if l < 1e-12 {
+            return LocalMat::zeros(12);
+        }
         let c = n / l;
         let mut kg = LocalMat::zeros(12);
         let mut s = |i: usize, j: usize, v: f64| {
@@ -66,8 +72,10 @@ impl ElementBehavior for BeamElement {
         s(4, 4, c * 2.0 * l * l / 15.0);
         s(10, 10, c * 2.0 * l * l / 15.0);
         s(4, 10, -c * l * l / 30.0);
-        // 幾何剛性もグローバル系へ回転（P-Δ を組立系で正しく加算するため）
-        self.axis.to_global(&kg)
+        // 剛域変換 → 全体系（P-Δ を組立系で正しく加算するため）
+        let kg_node =
+            self.apply_rigid_zone_transform(&kg, self.rigid.length_i, self.rigid.length_j);
+        self.axis.to_global(&kg_node)
     }
 
     fn internal_force(&self, _state: &ElemState, _ctx: &Ctx) -> LocalVec {
