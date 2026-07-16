@@ -8,6 +8,14 @@ license = "MIT"
 default = []
 mcp = ["dep:rmcp", "dep:tokio"]
 
+# MCP サーバ起動用バイナリ。ライブラリは feature なしでもビルドできるが、
+# stdio サーバの実体（rmcp/tokio）は mcp feature が要るため bin だけを
+# required-features でゲートする（feature なしのビルド対象から自動で外れる）。
+[[bin]]
+name = "squid-n-mcp"
+path = "src/main.rs"
+required-features = ["mcp"]
+
 [dependencies]
 squid-n-core = { path = "../squid-n-core" }
 squid-n-element = { path = "../squid-n-element" }
