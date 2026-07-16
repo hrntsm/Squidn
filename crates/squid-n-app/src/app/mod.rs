@@ -1255,7 +1255,7 @@ impl eframe::App for App {
                 if ui
                     .button("📤 ST-Bridge 書出（断面形状）…")
                     .on_hover_text(
-                        "断面を ST-Bridge 標準要素（StbSecColumn_S 等）＋形鋼ライブラリで書き出す。BIM・他ソフト向け。形状の無い断面や SRC/CFT/耐震壁は物性直持ちにフォールバックします",
+                        "断面を ST-Bridge 標準要素（StbSecColumn_S 等）＋形鋼ライブラリで書き出す。BIM・他ソフト向けの一方向出力（Squid-N では読み戻せません）。形状の無い断面や SRC/CFT/耐震壁は物性直持ちにフォールバックします",
                     )
                     .clicked()
                 {

@@ -43,7 +43,12 @@ pub enum SectionExportMode {
     /// ST-Bridge 標準の断面要素（`StbSecColumn_S`/`StbSecBeam_S`/`StbSecColumn_RC`/
     /// `StbSecBeam_RC`）＋形鋼ライブラリ（`StbSecSteel`）で書き出す。BIM/他ソフトとの
     /// 連携向け。形状（`Section.shape`）を持たない断面や SRC・CFT・耐震壁は `StbSecRaw`
-    /// へフォールバックする。標準断面要素は `import_stbridge` では読み戻せない（outbound 専用）。
+    /// へフォールバックする。
+    ///
+    /// **outbound 専用**: `import_stbridge` は標準断面要素を解釈しないため、本モードで
+    /// 書き出したファイルを読み戻すと断面が復元されず（フォールバックした `StbSecRaw` を除く）、
+    /// 部材の断面参照がダングリングになり `Model::validate` に通らない。Squid-N で再利用する
+    /// モデルは [`Raw`](Self::Raw) か `.scz` で保存すること。
     Standard,
 }
 
