@@ -570,8 +570,16 @@ fn test_pinned_end_rotation_stiffness_exactly_zero() {
     let k = beam.local_stiffness();
     for r in [3usize, 4, 5] {
         for c in 0..12 {
-            assert_eq!(k.get(r, c), 0.0, "released rot DOF {r} row must be exactly 0 at col {c}");
-            assert_eq!(k.get(c, r), 0.0, "released rot DOF {r} col must be exactly 0 at row {c}");
+            assert_eq!(
+                k.get(r, c),
+                0.0,
+                "released rot DOF {r} row must be exactly 0 at col {c}"
+            );
+            assert_eq!(
+                k.get(c, r),
+                0.0,
+                "released rot DOF {r} col must be exactly 0 at row {c}"
+            );
         }
     }
 }

@@ -73,7 +73,8 @@ impl ElementBehavior for BeamElement {
         s(10, 10, c * 2.0 * l * l / 15.0);
         s(4, 10, -c * l * l / 30.0);
         // 剛域変換 → 全体系（P-Δ を組立系で正しく加算するため）
-        let kg_node = self.apply_rigid_zone_transform(&kg, self.rigid.length_i, self.rigid.length_j);
+        let kg_node =
+            self.apply_rigid_zone_transform(&kg, self.rigid.length_i, self.rigid.length_j);
         self.axis.to_global(&kg_node)
     }
 
