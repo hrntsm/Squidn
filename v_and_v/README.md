@@ -158,7 +158,12 @@
 | 固有値 | ✅ | eigen.rs |
 | 時刻歴 | 🔶 | timehistory.rs（P6 実装後に本格化） |
 | プッシュオーバー | 🔶 | pushover.rs（P5 実装後に本格化） |
+| 並列バッチ（値一致） | ✅ | squid-n-solver/tests/parallel_batch.rs（並列時のケース並列バッチが個別解と一致） |
 
 ## 性能ベンチマーク
 
 `criterion` による性能ベンチマーク（線形静的・固有値・プッシュオーバー1ステップ・時刻歴1ステップ）の計測は CI 導入時（P9）に整備予定。
+
+並列計算（ケース並列バッチ・faer 内部並列）の速度比は
+`cargo run -p squid-n-solver --example parallel_bench --release` で計測できる
+（ドキュメントサイト 5.10 並列計算に参考値を記載）。

@@ -11,6 +11,7 @@ squid-n-material = { path = "../squid-n-material" }
 squid-n-element = { path = "../squid-n-element" }
 squid-n-load   = { path = "../squid-n-load" }
 faer      = { workspace = true }
+rayon     = { workspace = true }
 smallvec  = { workspace = true }
 thiserror = { workspace = true }
 serde     = { workspace = true }

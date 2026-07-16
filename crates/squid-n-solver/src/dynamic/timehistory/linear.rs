@@ -63,7 +63,7 @@ pub fn linear_time_history_with_state(
     initial_vel: &[f64],
     use_kg: bool,
 ) -> Result<(ResponseResult, TimeStepState), SolveError> {
-    faer::set_global_parallelism(faer::Par::Seq);
+    squid_n_math::parallelism::apply_to_faer();
 
     let dt = if newmark.dt > 0.0 {
         newmark.dt
@@ -221,7 +221,7 @@ pub fn linear_time_history_from_state(
     state: &TimeStepState,
     use_kg: bool,
 ) -> Result<(ResponseResult, TimeStepState), SolveError> {
-    faer::set_global_parallelism(faer::Par::Seq);
+    squid_n_math::parallelism::apply_to_faer();
 
     let dt = if newmark.dt > 0.0 {
         newmark.dt

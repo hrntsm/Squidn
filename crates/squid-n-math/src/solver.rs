@@ -1,6 +1,9 @@
 use faer::sparse::SparseColMat;
 
-pub trait LinearSolver {
+/// 疎行列ソルバの共通インタフェース。
+/// 荷重ケース並列（`squid-n-solver` の batch API）で分解済みソルバを
+/// スレッド間共有するため `Send + Sync` を要求する。
+pub trait LinearSolver: Send + Sync {
     fn factorize(&mut self, k: &SparseColMat<usize, f64>) -> Result<(), SolveError>;
     fn solve(&self, rhs: &[f64]) -> Result<Vec<f64>, SolveError>;
 }

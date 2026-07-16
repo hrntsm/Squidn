@@ -41,7 +41,7 @@ pub fn nonlinear_time_history_analysis(
     max_iter: usize,
     tol: f64,
 ) -> Result<ResponseResult, SolveError> {
-    faer::set_global_parallelism(faer::Par::Seq);
+    squid_n_math::parallelism::apply_to_faer();
 
     let dt = if newmark.dt > 0.0 {
         newmark.dt

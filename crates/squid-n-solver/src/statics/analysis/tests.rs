@@ -945,3 +945,31 @@ fn test_wind_static_excludes_penthouse_story_from_height_and_load() {
         total_force
     );
 }
+
+/// バッチ API（逐次モード）が個別呼び出しとビット一致すること。
+/// 並列モードの検証はプロセス分離した統合テスト
+/// （tests/parallel_batch.rs）で行う（並列度設定はプロセスグローバルのため）。
+#[test]
+fn test_linear_static_batch_matches_individual() {
+    let model = make_cantilever_model();
+    let analysis = Analysis::prepare(&model).unwrap();
+    let batch = analysis.linear_static_batch(&[LoadCaseId(1), LoadCaseId(2)]);
+    assert_eq!(batch.len(), 2);
+    let r1 = analysis.linear_static(LoadCaseId(1)).unwrap();
+    let r2 = analysis.linear_static(LoadCaseId(2)).unwrap();
+    let b1 = batch[0].as_ref().unwrap();
+    let b2 = batch[1].as_ref().unwrap();
+    assert_eq!(b1.disp, r1.disp);
+    assert_eq!(b2.disp, r2.disp);
+
+    // 組合せバッチも個別呼び出しとビット一致する
+    let combos = vec![model.combinations[0].clone()];
+    let cb = analysis.linear_combination_batch(&combos);
+    let c1 = analysis.linear_combination(&model.combinations[0]).unwrap();
+    assert_eq!(cb[0].as_ref().unwrap().disp, c1.disp);
+
+    // 存在しないケースはバッチ内でも個別にエラーになる（他ケースへ影響しない）
+    let with_missing = analysis.linear_static_batch(&[LoadCaseId(1), LoadCaseId(99)]);
+    assert!(with_missing[0].is_ok());
+    assert!(matches!(with_missing[1], Err(SolveError::InvalidInput(_))));
+}

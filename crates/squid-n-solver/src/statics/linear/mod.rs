@@ -108,7 +108,7 @@ pub struct StaticOnce {
 }
 
 pub fn linear_static_once(model: &Model, lc: LoadCaseId) -> Result<StaticOnce, SolveError> {
-    faer::set_global_parallelism(faer::Par::Seq);
+    squid_n_math::parallelism::apply_to_faer();
     let lc_kind = model
         .load_cases
         .iter()

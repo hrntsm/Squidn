@@ -35,7 +35,7 @@ pub fn linear_hht_alpha_analysis(
     initial_vel: &[f64],
     use_kg: bool,
 ) -> Result<ResponseResult, SolveError> {
-    faer::set_global_parallelism(faer::Par::Seq);
+    squid_n_math::parallelism::apply_to_faer();
 
     let dt = if hht.dt > 0.0 { hht.dt } else { wave.dt };
     if dt <= 0.0 {

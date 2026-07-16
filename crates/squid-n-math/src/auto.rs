@@ -1,4 +1,4 @@
-use std::cell::RefCell;
+use std::sync::Mutex;
 
 use faer::sparse::SparseColMat;
 
@@ -35,7 +35,8 @@ struct PcgState {
     /// フォールバック用に保持する係数行列（非ゼロのみなので分解因子より小さい）。
     k: SparseColMat<usize, f64>,
     /// PCG 非収束時に遅延構築する直接法（複数 RHS で分解を再利用する）。
-    fallback: RefCell<Option<CholeskySolver>>,
+    /// 荷重ケース並列（batch API）から共有されるため `Mutex` で排他する。
+    fallback: Mutex<Option<CholeskySolver>>,
 }
 
 /// 直接法（疎 Cholesky）と反復法（Jacobi 前処理付き PCG）を自動選択するソルバ。
@@ -89,7 +90,7 @@ impl LinearSolver for AutoSolver {
             self.state = State::Pcg(Box::new(PcgState {
                 pcg,
                 k: k.clone(),
-                fallback: RefCell::new(None),
+                fallback: Mutex::new(None),
             }));
         } else {
             let mut chol = CholeskySolver::default();
@@ -106,7 +107,10 @@ impl LinearSolver for AutoSolver {
             State::Pcg(state) => match state.pcg.solve(rhs) {
                 Ok(x) => Ok(x),
                 Err(SolveError::NonConvergence(_)) => {
-                    let mut fb = state.fallback.borrow_mut();
+                    let mut fb = state
+                        .fallback
+                        .lock()
+                        .expect("フォールバック直接法のロックに失敗");
                     if fb.is_none() {
                         let mut chol = CholeskySolver::default();
                         chol.factorize(&state.k)?;

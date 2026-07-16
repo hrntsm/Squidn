@@ -217,6 +217,8 @@ pub struct AnalysisSettings {
     pub roughness: squid_n_load::wind::TerrainRoughness,
     /// 風荷重静的解析のパラペット高さ [mm]。
     pub parapet_mm: f64,
+    /// 解析の並列スレッド数（0=自動(全コア)、1=単一スレッド(結果の完全再現性を保証)、n=固定）。
+    pub threads: usize,
 }
 
 /// 時刻歴の入力方向選択（UI 用）。X・Y に加え、同一波形を両方向へ同時入力する
@@ -289,6 +291,7 @@ impl Default for AnalysisSettings {
             v0: 34.0,
             roughness: squid_n_load::wind::TerrainRoughness::III,
             parapet_mm: 0.0,
+            threads: 0,
         }
     }
 }

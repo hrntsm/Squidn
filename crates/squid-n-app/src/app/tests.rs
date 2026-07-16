@@ -1033,6 +1033,72 @@ fn test_combination_flow() {
     assert_eq!(app.last_static, Some(StaticKey::Combo(0)));
 }
 
+/// `run_all_combinations` は個別に `run_combination` を実行した場合と
+/// 同じ結果（combos の名前・変位）を与える（並列/一括経路と単発経路の一致確認）。
+/// 決定性のため `threads=1`（Deterministic）を明示する。
+#[test]
+fn test_run_all_combinations_matches_individual_runs() {
+    let combos = vec![
+        squid_n_core::model::LoadCombination {
+            name: "G+Kx".into(),
+            terms: vec![(LoadCaseId(0), 1.0), (LoadCaseId(1), 1.0)],
+        },
+        squid_n_core::model::LoadCombination {
+            name: "G-Kx".into(),
+            terms: vec![(LoadCaseId(0), 1.0), (LoadCaseId(1), -1.0)],
+        },
+    ];
+
+    let mut app_batch = App::default();
+    app_batch.load_model(crate::sample::portal_frame());
+    app_batch.analysis_cfg.threads = 1;
+    for combo in combos.clone() {
+        app_batch.undo.run(
+            &mut app_batch.model,
+            Box::new(squid_n_edit::AddCombination { combo }),
+        );
+    }
+    app_batch.run_all_combinations();
+    assert!(app_batch.last_error.is_none(), "{:?}", app_batch.last_error);
+
+    let mut app_each = App::default();
+    app_each.load_model(crate::sample::portal_frame());
+    app_each.analysis_cfg.threads = 1;
+    for combo in combos {
+        app_each.undo.run(
+            &mut app_each.model,
+            Box::new(squid_n_edit::AddCombination { combo }),
+        );
+    }
+    app_each.run_combination(0);
+    assert!(app_each.last_error.is_none(), "{:?}", app_each.last_error);
+    app_each.run_combination(1);
+    assert!(app_each.last_error.is_none(), "{:?}", app_each.last_error);
+
+    let bundle_batch = app_batch.results.as_ref().unwrap();
+    let bundle_each = app_each.results.as_ref().unwrap();
+    assert_eq!(bundle_batch.combos.len(), bundle_each.combos.len());
+    for ((name_b, res_b), (name_e, res_e)) in
+        bundle_batch.combos.iter().zip(bundle_each.combos.iter())
+    {
+        assert_eq!(name_b, name_e);
+        assert_eq!(res_b.disp, res_e.disp);
+    }
+    assert_eq!(app_batch.last_static, Some(StaticKey::Combo(1)));
+}
+
+/// 荷重組合せが 1 件も無い場合はエラーメッセージを設定し、結果は変更しない。
+#[test]
+fn test_run_all_combinations_no_combos_is_error() {
+    let mut app = App::default();
+    app.load_model(crate::sample::portal_frame());
+    assert!(app.model.combinations.is_empty());
+
+    app.run_all_combinations();
+    assert!(app.last_error.is_some());
+    assert!(app.results.is_none());
+}
+
 #[test]
 fn test_current_static_priority() {
     let mut app = App::default();

@@ -6,6 +6,7 @@ license = "MIT"
 
 [dependencies]
 faer      = { workspace = true }
+rayon     = { workspace = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]

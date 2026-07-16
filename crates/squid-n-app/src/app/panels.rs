@@ -331,6 +331,20 @@ impl App {
         }
         ui.separator();
 
+        // ── 並列計算設定 ──────────────────────────────────────────
+        ui.group(|ui| {
+            ui.strong("並列計算");
+            ui.horizontal(|ui| {
+                ui.label("並列スレッド数:");
+                ui.add(egui::DragValue::new(&mut self.analysis_cfg.threads).range(0..=256));
+            });
+            ui.colored_label(
+                crate::theme::GRAY_600,
+                "0=自動(全コア) / 1=単一スレッド(結果の完全再現) / n=固定",
+            );
+        });
+        ui.add_space(6.0);
+
         // ── 階の定義（地震系解析の前提） ──────────────────────────
         ui.group(|ui| {
             ui.strong("階の定義");
@@ -627,6 +641,18 @@ impl App {
                         .clicked()
                     {
                         self.run_combination(self.analysis_combo_idx);
+                        if self.last_error.is_none() {
+                            self.active_tab = Tab::Results;
+                        }
+                    }
+                    if ui
+                        .add_enabled(!running, egui::Button::new("▶▶ 全組合せ一括解析"))
+                        .on_hover_text(
+                            "全ての荷重組合せをまとめて解析します（並列スレッド数設定を使用）",
+                        )
+                        .clicked()
+                    {
+                        self.run_all_combinations();
                         if self.last_error.is_none() {
                             self.active_tab = Tab::Results;
                         }

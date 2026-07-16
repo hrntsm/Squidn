@@ -108,6 +108,15 @@ impl App {
         );
     }
 
+    /// `analysis_cfg.threads` を並列度設定（プロセスグローバル）へ反映する。
+    /// 各解析エントリの先頭で呼ぶ（バックグラウンドジョブは thread::spawn 前に
+    /// 呼べばよい。設定はプロセスグローバルのためジョブ側での再設定は不要）。
+    fn apply_parallelism_setting(&self) {
+        squid_n_math::parallelism::set_parallelism(
+            squid_n_math::parallelism::Parallelism::from_threads(self.analysis_cfg.threads),
+        );
+    }
+
     /// T3: 線形静的解析を実行し、結果を `self.results` に格納する。
     /// 指定した荷重ケースが存在しない場合はエラーメッセージをセット。
     ///
@@ -115,6 +124,7 @@ impl App {
     /// 自重を「自重(自動)」ケースへ同期する（照合レビュー：③梁自重・②壁荷重の
     /// CMoQ 経路を長期応力解析へ接続する）。
     pub fn run_linear_static(&mut self, lc: LoadCaseId) {
+        self.apply_parallelism_setting();
         self.last_error = None;
         self.sync_slab_loads_action();
         self.sync_self_weight_action();
@@ -145,6 +155,7 @@ impl App {
     /// 解析準備前にスラブ荷重を「床荷重(自動)」ケースへ、自重を「自重(自動)」
     /// ケースへ同期する（レビュー §1.1・照合レビュー）。
     pub fn run_combination(&mut self, index: usize) {
+        self.apply_parallelism_setting();
         self.last_error = None;
         self.sync_slab_loads_action();
         self.sync_self_weight_action();
@@ -191,6 +202,96 @@ impl App {
                 Err(e) => self.last_error = Some(format!("荷重組合せ解析エラー: {:?}", e)),
             },
             Err(e) => self.last_error = Some(format!("解析準備エラー: {:?}", e)),
+        }
+    }
+
+    /// 全荷重組合せを一括解析し、結果を `bundle.combos` へ格納する
+    /// （`run_combination` の全件版。`Analysis::prepare` を 1 回だけ行い、
+    /// `analysis_cfg.threads` の並列設定に応じて
+    /// `Analysis::linear_combination_batch` で組合せ単位に並列解析する）。
+    ///
+    /// 個別組合せの解析エラーは処理を止めず、件数と最初のエラー内容を
+    /// `last_error` にまとめる（他の組合せの結果は失わない）。荷重組合せが
+    /// 1 件も無い場合、および 1 件も解けなかった場合は既存の結果を変更せず、
+    /// 案内メッセージを `last_error` に設定して return する。
+    pub fn run_all_combinations(&mut self) {
+        self.apply_parallelism_setting();
+        self.last_error = None;
+        self.sync_slab_loads_action();
+        self.sync_self_weight_action();
+        if self.model.combinations.is_empty() {
+            self.last_error =
+                Some("荷重組合せがありません。荷重タブで作成してください。".to_string());
+            return;
+        }
+        self.apply_rigid_zones_for_analysis();
+        let analysis = match Analysis::prepare(&self.model) {
+            Ok(a) => a,
+            Err(e) => {
+                self.last_error = Some(format!("解析準備エラー: {:?}", e));
+                return;
+            }
+        };
+        let combos = self.model.combinations.clone();
+        let results = analysis.linear_combination_batch(&combos);
+
+        let mut bundle = self.results.take().unwrap_or_default();
+        let mut errors: Vec<String> = Vec::new();
+        let mut last_ok: Option<(usize, String)> = None;
+        for (combo, res) in combos.iter().zip(results) {
+            match res {
+                Ok(res) => {
+                    let member_forces = res.member_forces.clone();
+                    // StaticKey::Combo は bundle.combos 上の位置を指す規約
+                    // （run_combination と同じ「名前一致なら置換、なければ push」）。
+                    let pos = match bundle
+                        .combos
+                        .iter()
+                        .position(|(name, _)| *name == combo.name)
+                    {
+                        Some(pos) => {
+                            bundle.combos[pos].1 = res;
+                            pos
+                        }
+                        None => {
+                            bundle.combos.push((combo.name.clone(), res));
+                            bundle.combos.len() - 1
+                        }
+                    };
+                    bundle.member_forces = member_forces;
+                    last_ok = Some((pos, combo.name.clone()));
+                }
+                Err(e) => errors.push(format!("[{}] {:?}", combo.name, e)),
+            }
+        }
+
+        let Some((pos, last_name)) = last_ok else {
+            // 1件も解けなかった場合は結果を壊さない。
+            self.last_error = Some(format!(
+                "全組合せ解析エラー（{} 件すべて失敗）: {}",
+                errors.len(),
+                errors.first().cloned().unwrap_or_default()
+            ));
+            return;
+        };
+        self.results = Some(bundle);
+        self.last_static = Some(StaticKey::Combo(pos));
+        self.staleness.mark_fresh();
+        // 荷重継続性区分（長期/短期）は最後に成功した組合せの内容から自動判定する
+        // （令82条の荷重組合せ: G+P=長期、地震・積雪・風入り=短期）。
+        self.design_term = if squid_n_load::combo::is_short_term_combo(&last_name) {
+            LoadTerm::Short
+        } else {
+            LoadTerm::Long
+        };
+        self.run_design_check();
+
+        if !errors.is_empty() {
+            self.last_error = Some(format!(
+                "{} 件の組合せでエラー: {}",
+                errors.len(),
+                errors[0]
+            ));
         }
     }
 
@@ -659,6 +760,7 @@ impl App {
 
     /// T3: 固有値解析を実行し、結果を `self.results` に格納する。
     pub fn run_eigen(&mut self, n_modes: usize) {
+        self.apply_parallelism_setting();
         self.last_error = None;
         self.apply_rigid_zones_for_analysis();
         match Analysis::prepare(&self.model) {
@@ -708,6 +810,7 @@ impl App {
     /// 結果は `StaticCaseKey::Seismic(dir)` に格納するため、X/Y 双方の地震静的結果
     /// および任意のユーザー荷重ケースの結果と衝突せず共存できる。
     pub fn run_seismic(&mut self, dir: SeismicDir) {
+        self.apply_parallelism_setting();
         self.last_error = None;
         let cfg = squid_n_solver::analysis::SeismicCfg {
             dir,
@@ -741,6 +844,7 @@ impl App {
     /// （`run_seismic` と同じパターン。X/Y 双方の結果および他の静的結果と共存できる）。
     /// 基準風速・地表面粗度区分・パラペット高さは `analysis_cfg` を用いる。
     pub fn run_wind(&mut self, dir: SeismicDir) {
+        self.apply_parallelism_setting();
         self.last_error = None;
         let cfg = squid_n_solver::analysis::WindStaticCfg {
             dir,
@@ -916,6 +1020,7 @@ impl App {
     /// プッシュオーバー解析を実行する。モデルは複製の上で解析する
     /// （非線形状態の副作用を GUI 上のモデルへ残さないため）。
     pub fn run_pushover(&mut self) {
+        self.apply_parallelism_setting();
         self.last_error = None;
         let res = Self::compute_pushover(self.model.clone(), self.analysis_cfg);
         self.apply_pushover_result(res);
@@ -929,6 +1034,7 @@ impl App {
             self.last_error = Some("解析実行中です".to_string());
             return;
         }
+        self.apply_parallelism_setting();
         self.last_error = None;
         let model = self.model.clone();
         let cfg = self.analysis_cfg;
@@ -1125,6 +1231,7 @@ impl App {
     /// 線形時刻歴応答解析を実行する。減衰モデル・積分法は `analysis_cfg` に従う
     /// （剛性比例／Rayleigh、Newmark-β／HHT-α）。
     pub fn run_time_history(&mut self, wave: squid_n_solver::timehistory::GroundMotion) {
+        self.apply_parallelism_setting();
         self.last_error = None;
         let res = Self::compute_time_history(self.model.clone(), self.analysis_cfg, wave);
         self.apply_time_history_result(res);
@@ -1138,6 +1245,7 @@ impl App {
             self.last_error = Some("解析実行中です".to_string());
             return;
         }
+        self.apply_parallelism_setting();
         self.last_error = None;
         let model = self.model.clone();
         let cfg = self.analysis_cfg;
@@ -1221,6 +1329,7 @@ impl App {
 
     /// 正弦減衰のサンプル地震波を生成して時刻歴解析を実行する（同期）。
     pub fn run_time_history_sample(&mut self) {
+        self.apply_parallelism_setting();
         let wave = Self::sample_wave(&self.analysis_cfg);
         self.run_time_history(wave);
     }
