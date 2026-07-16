@@ -61,7 +61,7 @@ impl<'m> Analysis<'m> {
                     n_indep: 0,
                     n_free: 0,
                 },
-                solver: make_solver(SolverBackend::DirectSparseCholesky),
+                solver: make_solver(SolverBackend::Auto),
                 n_indep: 0,
             });
         }
@@ -71,7 +71,7 @@ impl<'m> Analysis<'m> {
         let n_indep = reducer.n_indep;
         let k_red = reducer.reduce_k(&k_free);
 
-        let mut solver = make_solver(SolverBackend::DirectSparseCholesky);
+        let mut solver = make_solver(SolverBackend::Auto);
         if n_indep > 0 {
             solver.factorize(&k_red).map_err(|e| match e {
                 SolveError::NotPositiveDefinite => {

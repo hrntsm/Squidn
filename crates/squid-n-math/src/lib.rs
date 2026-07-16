@@ -1,5 +1,6 @@
 #![allow(clippy::needless_range_loop)]
 
+pub mod auto;
 pub mod cholesky;
 pub mod lu;
 pub mod pcg;

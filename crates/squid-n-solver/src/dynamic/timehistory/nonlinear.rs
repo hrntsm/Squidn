@@ -292,7 +292,7 @@ pub fn nonlinear_time_history_analysis(
             // 有効剛性
             let k_eff = weighted_sum_csc(n_indep, &[(1.0, &k_t_red), (c2, c_cur), (c1, &m_red)]);
 
-            let mut solver = make_solver(SolverBackend::DirectSparseCholesky);
+            let mut solver = make_solver(SolverBackend::Auto);
             solver
                 .factorize(&k_eff)
                 .map_err(|e| SolveError::Backend(format!("factor: {:?}", e)))?;

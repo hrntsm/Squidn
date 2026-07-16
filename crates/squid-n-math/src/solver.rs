@@ -28,7 +28,13 @@ pub enum SolveError {
 pub enum SolverBackend {
     DirectSparseCholesky,
     DirectSparseLu,
-    IterativePcg { tol: f64, max_iter: usize },
+    IterativePcg {
+        tol: f64,
+        max_iter: usize,
+    },
+    /// 自由度数に応じて疎 Cholesky / PCG を自動選択する（対称正定値系向け）。
+    /// PCG が収束しない場合は疎 Cholesky へ自動フォールバックする。
+    Auto,
 }
 
 /// 因子分解済みソルバに単一 RHS 列を与えて解く共通処理。
@@ -56,5 +62,6 @@ pub fn make_solver(backend: SolverBackend) -> Box<dyn LinearSolver> {
             Box::new(crate::pcg::PcgSolver::new(tol, max_iter))
         }
         SolverBackend::DirectSparseLu => Box::new(crate::lu::LuSolver::default()),
+        SolverBackend::Auto => Box::new(crate::auto::AutoSolver::default()),
     }
 }

@@ -277,7 +277,7 @@ fn solve_once_inner(model: &Model, lc: LoadCaseId) -> Result<StaticOnce, SolveEr
     let f_red = reducer.reduce_f(&f_free);
     let n_indep = reducer.n_indep;
 
-    let mut solver = make_solver(SolverBackend::DirectSparseCholesky);
+    let mut solver = make_solver(SolverBackend::Auto);
     if n_indep > 0 {
         solver.factorize(&k_red)?;
         let u_indep = solver.solve(&f_red)?;

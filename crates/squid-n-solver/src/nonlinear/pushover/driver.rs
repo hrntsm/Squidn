@@ -174,7 +174,7 @@ pub fn pushover_analysis_recording(
                     break;
                 }
 
-                let mut solver = make_solver(SolverBackend::DirectSparseCholesky);
+                let mut solver = make_solver(SolverBackend::Auto);
                 solver
                     .factorize(&k_red)
                     .map_err(|e| format!("factor: {:?}", e))?;
@@ -312,7 +312,7 @@ pub fn pushover_analysis_recording(
                             break;
                         }
 
-                        let mut solver = make_solver(SolverBackend::DirectSparseCholesky);
+                        let mut solver = make_solver(SolverBackend::Auto);
                         solver.factorize(&k_red).map_err(|e| format!("{:?}", e))?;
                         let du_red = solver.solve(&r_red).map_err(|e| format!("{:?}", e))?;
                         let du_free = reducer.expand_u(&du_red);
@@ -400,6 +400,9 @@ pub fn pushover_analysis_recording(
             let k_free = assemble_k(model, dofmap, &behaviors, use_kg, None);
             let k_red = reducer.reduce_k(&k_free);
 
+            // ここは分解の失敗（正定値でない＝不安定化）を耐力喪失の終了判定に
+            // 使うため、factorize が失敗し得る直接法を明示する（Auto の PCG 経路は
+            // factorize では失敗しないので判定が効かなくなる）。
             let mut solver = make_solver(SolverBackend::DirectSparseCholesky);
             if solver.factorize(&k_red).is_err() {
                 model.restore(&snap, &mut behaviors);

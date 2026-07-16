@@ -54,6 +54,8 @@ pub fn solve_eigen(
     let k_free = assemble_global_k(model, dofmap);
     let k_red = reducer.reduce_k(&k_free);
 
+    // 部分空間反復では 1 回の分解を（部分空間サイズ×反復回数）回の求解で
+    // 再利用するため、直接法を明示する（反復法では再利用が効かない）。
     let mut solver = make_solver(SolverBackend::DirectSparseCholesky);
     solver.factorize(&k_red)?;
 

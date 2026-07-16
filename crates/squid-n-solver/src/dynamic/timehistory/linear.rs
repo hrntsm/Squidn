@@ -139,6 +139,8 @@ pub fn linear_time_history_with_state(
         &[(1.0, &k_red), (c2, &c_red), (c1, &m_red)],
     );
 
+    // 有効剛性は全ステップ共通で、1回の分解を全時刻ステップの求解で再利用する。
+    // 反復法（PCG）はステップごとに反復をやり直すため不利であり、直接法を明示する。
     let mut solver = make_solver(SolverBackend::DirectSparseCholesky);
     solver.factorize(&k_eff)?;
 
