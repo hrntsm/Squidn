@@ -26,6 +26,11 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: テスト実行
         run: cargo test --workspace
+      # mcp は非デフォルト feature のため --workspace では検証されない。
+      # 過去に rmcp API 追従漏れでコンパイル不能のまま放置された経緯があり
+      # （v_and_v/p8_review.md）、ここで明示的にビルド・テストして再発を防ぐ。
+      - name: MCP featureテスト実行
+        run: cargo test -p squid-n-mcp --features mcp
 
   clippy:
     name: Clippy静的解析
@@ -38,6 +43,9 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Clippy実行
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      # 非デフォルト feature の mcp（bin ターゲット含む）も静的解析の対象にする。
+      - name: Clippy実行（MCP feature）
+        run: cargo clippy -p squid-n-mcp --all-targets --features mcp --locked -- -D warnings
 
   fmt:
     name: フォーマットチェック

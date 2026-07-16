@@ -5,6 +5,7 @@
 # 概要
 
 - [アーキテクチャ](./architecture.md)
+- [MCP サーバ](./mcp_server.md)
 
 # 計算根拠（理論・出典）
 

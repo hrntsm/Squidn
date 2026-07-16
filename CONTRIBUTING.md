@@ -34,6 +34,20 @@ cargo build --workspace --release
 
 GPU や ML を無効化しても解析機能は CPU で動作する。
 
+非デフォルトの機能フラグは `--workspace` ビルドでは検証されないため、
+対象クレートを `-p` で指定して有効化する（ワークスペースルートで
+`cargo build -p squid-n-app --features mcp` のように**フラグを持たない
+クレートを指定するとエラーになる**ことに注意）。
+
+```bash
+# MCP サーバのビルド・テスト（bin ターゲット含む）
+cargo build -p squid-n-mcp --features mcp
+cargo test  -p squid-n-mcp --features mcp
+
+# MCP サーバの起動（stdio。使い方は docs/mcp_server.md を参照）
+cargo run -p squid-n-mcp --features mcp
+```
+
 ## テスト
 
 ```bash

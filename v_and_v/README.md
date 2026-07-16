@@ -90,6 +90,9 @@
 > P8（操作・連携）の監査結果は `v_and_v/p8_review.md` を参照。
 > #23: MCP は「実装」コミット済みだが `--features mcp` で **13 エラーでコンパイル不能**（rmcp 1.7 API
 > rot＋`ResultStore`/`EditCommand` が Send でない）。ツールも `model_query` が常に空を返す等スタブ。❌。
+> → その後 rmcp 1.7 API へ追従してコンパイル復旧・実ツール化（5ツール、実ストア込みのテスト17件）。
+> 起動バイナリ（`cargo run -p squid-n-mcp --features mcp`）と CI での feature 付きビルド検証を追加し
+> rot 再発を防止。利用方法は `docs/mcp_server.md` を参照。🔶（編集系ツール未公開のため）。
 > #24: ST-Bridge は当初 import/export とも未実装だったが、P8 検証で **2.0 subset の意味的往復を実装**
 > （節点・層・材料・断面・部材・節点荷重。export 冪等・再import安定をテスト）。断面は形鋼ライブラリ
 > 参照でなく物性直持ち（StbSecRaw）の subset のため 🔶。完全な他社相互運用は将来。
