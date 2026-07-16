@@ -273,6 +273,7 @@ impl App {
                 ("スラブ", ModelTab::Slabs),
                 ("壁属性", ModelTab::WallAttrs),
                 ("雑壁", ModelTab::MiscWalls),
+                ("部材付帯情報", ModelTab::MemberDetails),
             ];
             for (label, sub) in &subs {
                 let sel = self.model_tab == *sub;
@@ -299,6 +300,9 @@ impl App {
             ModelTab::Slabs => crate::tables::slabs::slabs_table(ui, self),
             ModelTab::WallAttrs => crate::tables::wall_attrs::wall_attrs_table(ui, self),
             ModelTab::MiscWalls => crate::tables::misc_walls::misc_walls_table(ui, self),
+            ModelTab::MemberDetails => {
+                crate::tables::member_details::member_details_table(ui, self)
+            }
         }
     }
 

@@ -1770,6 +1770,86 @@ fn test_set_damper_props_roundtrip() {
 }
 
 #[test]
+fn test_set_member_detail_attr_add_replace_and_remove_roundtrip() {
+    use squid_n_core::model::{Haunch, JointKind, MemberDetailAttr, MemberJoint};
+    let mut model = empty_model();
+    let mut stack = UndoStack::new();
+
+    let attr1 = MemberDetailAttr {
+        elem: ElemId(0),
+        haunch_i: Some(Haunch {
+            length: 700.0,
+            depth_increase: 200.0,
+            width_increase: 0.0,
+        }),
+        haunch_j: None,
+        joints: vec![],
+    };
+    stack.run(
+        &mut model,
+        Box::new(SetMemberDetailAttr {
+            attr: attr1.clone(),
+        }),
+    );
+    assert_eq!(model.member_detail_attrs, vec![attr1.clone()]);
+
+    stack.undo(&mut model);
+    assert!(model.member_detail_attrs.is_empty());
+
+    stack.redo(&mut model);
+    assert_eq!(model.member_detail_attrs, vec![attr1.clone()]);
+
+    // 既存エントリを置換
+    let attr2 = MemberDetailAttr {
+        elem: ElemId(0),
+        haunch_i: None,
+        haunch_j: Some(Haunch {
+            length: 500.0,
+            depth_increase: 150.0,
+            width_increase: 0.0,
+        }),
+        joints: vec![MemberJoint {
+            distance: 1000.0,
+            kind: JointKind::Shop,
+        }],
+    };
+    stack.run(
+        &mut model,
+        Box::new(SetMemberDetailAttr {
+            attr: attr2.clone(),
+        }),
+    );
+    assert_eq!(model.member_detail_attrs, vec![attr2.clone()]);
+
+    stack.undo(&mut model);
+    assert_eq!(model.member_detail_attrs, vec![attr1.clone()]);
+
+    // 削除
+    stack.run(
+        &mut model,
+        Box::new(RemoveMemberDetailAttr { elem: ElemId(0) }),
+    );
+    assert!(model.member_detail_attrs.is_empty());
+
+    stack.undo(&mut model);
+    assert_eq!(model.member_detail_attrs, vec![attr1]);
+}
+
+#[test]
+fn test_remove_member_detail_attr_missing_is_noop() {
+    let mut model = empty_model();
+    let mut stack = UndoStack::new();
+    stack.run(
+        &mut model,
+        Box::new(RemoveMemberDetailAttr { elem: ElemId(0) }),
+    );
+    assert!(model.member_detail_attrs.is_empty());
+    assert!(stack.can_undo());
+    stack.undo(&mut model);
+    assert!(model.member_detail_attrs.is_empty());
+}
+
+#[test]
 fn test_delete_member_shifts_and_restores_side_table_attrs() {
     use squid_n_core::model::{DamperProps, HysteresisModel};
     let mut model = two_member_model();
@@ -1807,4 +1887,42 @@ fn test_delete_member_shifts_and_restores_side_table_attrs() {
     stack.redo(&mut model);
     assert_eq!(model.damper_props(ElemId(0)), Some(props));
     assert_eq!(model.member_hysteresis(ElemId(0)), None);
+}
+
+/// `DeleteMember` が `member_detail_attrs`（ハンチ・継手位置）も
+/// `take_elem_attrs`/`restore_elem_attrs` 経由で退避・復元すること
+/// （`ElemAttrs.detail` の配線の検証）。
+#[test]
+fn test_delete_member_restores_member_detail_attr() {
+    use squid_n_core::model::{Haunch, MemberDetailAttr};
+    let mut model = two_member_model();
+    // 部材0にハンチ付帯情報を付与。
+    let attr = MemberDetailAttr {
+        elem: ElemId(0),
+        haunch_i: Some(Haunch {
+            length: 700.0,
+            depth_increase: 200.0,
+            width_increase: 0.0,
+        }),
+        haunch_j: None,
+        joints: vec![],
+    };
+    model.member_detail_attrs.push(attr.clone());
+    let before = model.clone();
+
+    let mut stack = UndoStack::new();
+    // 部材0を削除 → 付帯情報も連動して消える。
+    stack.run(&mut model, Box::new(DeleteMember { id: ElemId(0) }));
+    assert_eq!(model.elements.len(), 1);
+    assert!(model.member_detail(ElemId(0)).is_none());
+    assert!(model.validate().is_ok());
+
+    // undo で付帯情報も含め完全復元。
+    stack.undo(&mut model);
+    assert!(model.eq_ignoring_dofmap(&before));
+    assert_eq!(model.member_detail(ElemId(0)), Some(&attr));
+
+    // redo で再削除。
+    stack.redo(&mut model);
+    assert!(model.member_detail(ElemId(0)).is_none());
 }

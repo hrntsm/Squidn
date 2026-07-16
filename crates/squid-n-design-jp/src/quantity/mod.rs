@@ -622,8 +622,10 @@ fn build_notes(model: &Model) -> Vec<String> {
         "主筋は全長 1 断面（全断面）配筋として算定する（カットオフ筋の +15d は対象外）。".to_string(),
         "梁の腹筋・幅止筋は段数情報がモデルに無いため計上しない。".to_string(),
         "壁筋はせん断補強筋比 ps による等価換算（仮定径 D10・定着 S=35d）。開口部補強筋は考慮しない。".to_string(),
-        "基礎フーチング・ハンチはモデルに定義が無いため計上しない。".to_string(),
+        "基礎フーチングはモデルに定義が無いため計上しない。".to_string(),
+        "梁端ハンチは部材付帯情報（ハンチ長・せい増分・幅増分）から平均断面×ハンチ長で加算する（未入力の部材はハンチなし）。".to_string(),
         "鉄筋継手は個所数（圧接個所数）として集計する（梁 0.5 個所/本＋5m 毎 0.5、柱 1 個所/本＋7m 毎 1）。".to_string(),
+        "鉄骨継手（部材付帯情報の継手位置）は位置・種別の保持のみで、プレート・ボルト重量は計上しない。".to_string(),
     ];
     if !model.slabs.is_empty() {
         notes.push(format!(
@@ -892,9 +894,23 @@ fn beam_quantity(
             weight_t: vol_m3 * ctx.cfg.joist_stirrup_ratio * 7.85,
         });
     } else {
-        // 大梁・基礎梁。
-        let haunch_i: Option<Haunch> = None; // モデルにハンチ定義が無い。
-        let haunch_j: Option<Haunch> = None;
+        // 大梁・基礎梁。ハンチは部材付帯情報（`Model::member_detail_attrs`。
+        // 剛性には影響しない）から取得し、増分寸法（せい増分・幅増分）を
+        // ハンチ端の全幅 Bi・全せい Di へ換算して算定式へ渡す。
+        let to_haunch = |h: &squid_n_core::model::Haunch| Haunch {
+            b: b + h.width_increase.max(0.0),
+            d: d + h.depth_increase.max(0.0),
+            len: h.length,
+        };
+        let detail = model.member_detail(elem.id);
+        let haunch_i: Option<Haunch> = detail
+            .and_then(|dt| dt.haunch_i.as_ref())
+            .filter(|h| h.length > 0.0)
+            .map(to_haunch);
+        let haunch_j: Option<Haunch> = detail
+            .and_then(|dt| dt.haunch_j.as_ref())
+            .filter(|h| h.length > 0.0)
+            .map(to_haunch);
         let vol = member::girder_concrete_volume(b, d, lo, haunch_i, haunch_j);
         item.concrete_m3 = vol * 1e-9;
 

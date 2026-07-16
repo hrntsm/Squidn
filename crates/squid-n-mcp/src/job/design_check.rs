@@ -82,20 +82,34 @@ fn elem_geometric_length(elem: &squid_n_core::model::ElementData, model: &Model)
 /// `squid_n_element::beam::BeamElement::new` の `eval_sections` 算定と同じ規則
 /// （xi_i は \[0.0, 0.5) へ、xi_j は (0.5, 1.0\] へクランプ）で face_i/face_j から
 /// 求める。face=0（直交材が無い端）では節点芯（0.0/1.0）と一致する。
+/// 部材付帯情報（ハンチ・継手位置。剛性には影響しない）があれば、その追加検定
+/// 位置（`MemberDetailAttr::extra_check_positions`）も加え、ソートして 1e-9
+/// 以内の重複を除去する（`BeamElement::new` の `eval_sections` と同じ規則。
+/// この一致により応力の評価断面と検定位置が揃う）。
 /// squid-n-app の `design_positions`（app.rs）と同じロジック
 /// （squid-n-mcp は squid-n-app に依存しないため複製している）。
-fn design_positions(elem: &squid_n_core::model::ElementData, geom_len: f64) -> [f64; 3] {
-    if geom_len > 1e-12 {
+fn design_positions(
+    elem: &squid_n_core::model::ElementData,
+    model: &Model,
+    geom_len: f64,
+) -> Vec<f64> {
+    let mut xs = if geom_len > 1e-12 {
         let xi_i = (elem.rigid_zone.face_i / geom_len).clamp(0.0, 0.5 - 1e-9);
         let xi_j = (1.0 - elem.rigid_zone.face_j / geom_len).clamp(0.5 + 1e-9, 1.0);
-        [xi_i, 0.5, xi_j]
+        vec![xi_i, 0.5, xi_j]
     } else {
-        [0.0, 0.5, 1.0]
+        vec![0.0, 0.5, 1.0]
+    };
+    if let Some(detail) = model.member_detail(elem.id) {
+        xs.extend(detail.extra_check_positions(&elem.rigid_zone, geom_len));
     }
+    xs.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    xs.dedup_by(|a, b| (*a - *b).abs() < 1e-9);
+    xs
 }
 
 /// `pos` が `positions` のいずれかと 1e-6 以内で一致するか判定する。
-fn is_near_design_position(pos: f64, positions: &[f64; 3]) -> bool {
+fn is_near_design_position(pos: f64, positions: &[f64]) -> bool {
     positions.iter().any(|p| (p - pos).abs() < 1e-6)
 }
 
@@ -227,7 +241,7 @@ pub(crate) fn compute_design_check_job(
         // 危険断面位置（§6.2.3、既定は柱フェイスと中央）の内力のみ検定する。
         // 節点芯は剛域が有る場合は検定対象外（app.rs の run_design_check と同じ規則）。
         let geom_len = elem_geometric_length(elem, model);
-        let positions = design_positions(elem, geom_len);
+        let positions = design_positions(elem, model, geom_len);
         for (pos, forces) in &mf.at {
             if !is_near_design_position(*pos, &positions) {
                 continue;

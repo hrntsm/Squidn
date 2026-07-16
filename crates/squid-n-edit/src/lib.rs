@@ -89,11 +89,13 @@ pub fn push_edit_command(model: &mut Model, stack: &mut UndoStack, cmd: Box<dyn 
 }
 
 mod load_case;
+mod member_detail;
 mod node_member;
 mod section_material;
 mod wall_misc;
 
 pub use load_case::*;
+pub use member_detail::*;
 pub use node_member::*;
 pub use section_material::*;
 pub use wall_misc::*;

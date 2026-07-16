@@ -17,6 +17,7 @@ pub struct ElemAttrs {
     pub isolator: Option<IsolatorAttr>,
     pub hysteresis: Option<MemberHysteresisAttr>,
     pub damper: Option<DamperAttr>,
+    pub detail: Option<MemberDetailAttr>,
 }
 
 #[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
@@ -76,6 +77,11 @@ pub struct Model {
     /// 制振ダンパー要素（`ElementKind::Damper`）の特性（各制振部材の力学モデル）。
     #[serde(default)]
     pub damper_attrs: Vec<DamperAttr>,
+    /// 部材の付帯情報（端部ハンチ・継手位置）。剛性・応力解析には影響しない
+    /// （設計書 §6.2。剛性は基準断面のまま）。断面算定の検定位置の追加
+    /// （ハンチ端・継手位置、§6.2.3）と数量拾いに用いる。
+    #[serde(default)]
+    pub member_detail_attrs: Vec<MemberDetailAttr>,
     /// 一本部材の指定（断面検定の採用応力。一本部材指定時の採用応力の扱い）。
     /// 各エントリは**軸方向に連続する梁要素の ID を並び順**で持ち、
     /// 断面検定の採用応力（端部・中央モーメント、部材長、内法長、せん断スパン比
@@ -241,6 +247,7 @@ impl Model {
             && self.isolator_attrs == other.isolator_attrs
             && self.member_hysteresis_attrs == other.member_hysteresis_attrs
             && self.damper_attrs == other.damper_attrs
+            && self.member_detail_attrs == other.member_detail_attrs
     }
 
     /// ダンパー要素の特性を返す（`Model::damper_attrs` から要素 ID で検索）。
@@ -291,6 +298,9 @@ impl Model {
         for a in &mut self.damper_attrs {
             f(&mut a.elem);
         }
+        for a in &mut self.member_detail_attrs {
+            f(&mut a.elem);
+        }
     }
 
     /// 指定要素に紐づく全ての側テーブル属性を取り外して返す（要素削除時の退避用）。
@@ -309,6 +319,7 @@ impl Model {
             isolator: take_first(&mut self.isolator_attrs, |a| a.elem, elem),
             hysteresis: take_first(&mut self.member_hysteresis_attrs, |a| a.elem, elem),
             damper: take_first(&mut self.damper_attrs, |a| a.elem, elem),
+            detail: take_first(&mut self.member_detail_attrs, |a| a.elem, elem),
         }
     }
 
@@ -343,6 +354,15 @@ impl Model {
             a.elem = elem;
             self.damper_attrs.push(a);
         }
+        if let Some(mut a) = attrs.detail {
+            a.elem = elem;
+            self.member_detail_attrs.push(a);
+        }
+    }
+
+    /// 部材の付帯情報（ハンチ・継手位置）を返す（未指定は `None`）。
+    pub fn member_detail(&self, elem: ElemId) -> Option<&MemberDetailAttr> {
+        self.member_detail_attrs.iter().find(|a| a.elem == elem)
     }
 
     /// 部材に指定された履歴則を返す（未指定は `None`＝既定に従う）。

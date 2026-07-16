@@ -481,4 +481,58 @@ mod tests {
         assert!(model.eq_ignoring_dofmap(&back));
         let _ = std::fs::remove_file(&path);
     }
+
+    /// 部材付帯情報（ハンチ・継手位置）: `Model::member_detail_attrs`
+    /// （両端ハンチあり・片端のみハンチ・継手複数（`JointKind::Shop` を含む））
+    /// を持つモデルが保存→読込で完全一致すること。
+    #[test]
+    fn test_roundtrip_preserves_member_detail_attrs() {
+        let mut model = make_3node_model();
+        model.member_detail_attrs = vec![
+            // 両端ハンチあり + 継手複数（現場・工場混在）
+            MemberDetailAttr {
+                elem: ElemId(0),
+                haunch_i: Some(Haunch {
+                    length: 700.0,
+                    depth_increase: 200.0,
+                    width_increase: 50.0,
+                }),
+                haunch_j: Some(Haunch {
+                    length: 500.0,
+                    depth_increase: 150.0,
+                    width_increase: 0.0,
+                }),
+                joints: vec![
+                    MemberJoint {
+                        distance: 1000.0,
+                        kind: JointKind::Site,
+                    },
+                    MemberJoint {
+                        distance: 3000.0,
+                        kind: JointKind::Shop,
+                    },
+                ],
+            },
+            // 片端のみハンチ（i 端のみ）、継手なし
+            MemberDetailAttr {
+                elem: ElemId(1),
+                haunch_i: Some(Haunch {
+                    length: 400.0,
+                    depth_increase: 100.0,
+                    width_increase: 0.0,
+                }),
+                haunch_j: None,
+                joints: Vec::new(),
+            },
+        ];
+
+        let dir = std::env::temp_dir();
+        let path = dir.join("p_member_detail_roundtrip.scz");
+        save_scz(&path, &model).unwrap();
+        let back = load_scz(&path).unwrap();
+
+        assert_eq!(back.member_detail_attrs, model.member_detail_attrs);
+        assert!(model.eq_ignoring_dofmap(&back));
+        let _ = std::fs::remove_file(&path);
+    }
 }

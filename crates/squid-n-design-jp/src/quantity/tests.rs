@@ -472,3 +472,83 @@ fn test_totals_aggregation() {
     let by_cat = q.totals_by_category();
     assert_eq!(by_cat.len(), 3);
 }
+
+#[test]
+fn test_girder_haunch_from_member_detail() {
+    use squid_n_core::model::{Haunch as CoreHaunch, MemberDetailAttr};
+
+    // 大梁（ElemId(2)）の i 端にハンチ: 長さ 1000、せい増分 200、幅増分 200。
+    let mut model = rc_portal_model();
+    model.member_detail_attrs.push(MemberDetailAttr {
+        elem: ElemId(2),
+        haunch_i: Some(CoreHaunch {
+            length: 1_000.0,
+            depth_increase: 200.0,
+            width_increase: 200.0,
+        }),
+        haunch_j: None,
+        joints: vec![],
+    });
+    let q = compute_quantity_takeoff(&model, &QuantityCfg::default());
+    let g = q
+        .items
+        .iter()
+        .find(|i| i.category == MemberCategory::Girder)
+        .unwrap();
+
+    // 体積: 基準 0.4×0.8×5.3 に平均断面 (400+600)(800+1000)/4×1000 を加算。
+    let base_m3 = 0.4 * 0.8 * 5.3;
+    let haunch_m3 = (400.0 + 600.0) * (800.0 + 1_000.0) / 4.0 * 1_000.0 * 1e-9;
+    assert!((g.concrete_m3 - (base_m3 + haunch_m3)).abs() < 1e-9);
+
+    // 型枠（スラブなし）: 基準 (0.8×2+0.4)×5.3 に側面 (Di−D)/2×Li×2 と
+    // 底面 (Bi−B)/2×Li を加算。
+    let base_m2 = (0.8 * 2.0 + 0.4) * 5.3;
+    let haunch_m2 =
+        ((1_000.0 - 800.0) / 2.0 * 1_000.0 * 2.0 + (600.0 - 400.0) / 2.0 * 1_000.0) * 1e-6;
+    assert!((g.formwork_m2 - (base_m2 + haunch_m2)).abs() < 1e-9);
+
+    // 付帯情報を持たない基礎梁は従来どおり（ハンチなし）。
+    let fg = q
+        .items
+        .iter()
+        .find(|i| i.category == MemberCategory::FoundationGirder)
+        .unwrap();
+    assert!((fg.formwork_m2 - 1.2 * 5.3).abs() < 1e-9);
+}
+
+#[test]
+fn test_foundation_girder_haunch_from_member_detail() {
+    use squid_n_core::model::{Haunch as CoreHaunch, MemberDetailAttr};
+
+    // 基礎梁（ElemId(3)）の両端にハンチ: 長さ 800、せい増分 300（幅増分なし）。
+    let mut model = rc_portal_model();
+    let haunch = CoreHaunch {
+        length: 800.0,
+        depth_increase: 300.0,
+        width_increase: 0.0,
+    };
+    model.member_detail_attrs.push(MemberDetailAttr {
+        elem: ElemId(3),
+        haunch_i: Some(haunch),
+        haunch_j: Some(haunch),
+        joints: vec![],
+    });
+    let q = compute_quantity_takeoff(&model, &QuantityCfg::default());
+    let fg = q
+        .items
+        .iter()
+        .find(|i| i.category == MemberCategory::FoundationGirder)
+        .unwrap();
+
+    // 体積: 基準 0.4×0.8×5.3 に (400+400)(800+1100)/4×800 を両端分加算。
+    let base_m3 = 0.4 * 0.8 * 5.3;
+    let haunch_m3 = (400.0 + 400.0) * (800.0 + 1_100.0) / 4.0 * 800.0 * 2.0 * 1e-9;
+    assert!((fg.concrete_m3 - (base_m3 + haunch_m3)).abs() < 1e-9);
+
+    // 型枠: 側面 1 面＋底面 (0.8+0.4)×5.3 に側面 (Di−D)/2×Li を両端分加算
+    // （幅増分 0 のため底面の加算なし）。
+    let base_m2 = 1.2 * 5.3;
+    let haunch_m2 = (1_100.0 - 800.0) / 2.0 * 800.0 * 2.0 * 1e-6;
+    assert!((fg.formwork_m2 - (base_m2 + haunch_m2)).abs() < 1e-9);
+}

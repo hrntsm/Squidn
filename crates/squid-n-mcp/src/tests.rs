@@ -1,6 +1,9 @@
 use super::*;
 use squid_n_core::ids::{ElemId, MaterialId, NodeId, SectionId};
-use squid_n_core::model::{ElementData, ElementKind, LocalAxis, Node, Section};
+use squid_n_core::model::{
+    ElementData, ElementKind, Haunch, JointKind, LocalAxis, MemberDetailAttr, MemberJoint, Node,
+    Section,
+};
 
 fn sample_model() -> Model {
     Model {
@@ -87,6 +90,42 @@ fn test_query_model_filter() {
 fn test_query_model_unknown_kind() {
     let m = sample_model();
     assert!(query_model(&m, "bogus", None).is_empty());
+}
+
+/// 部材付帯情報（ハンチ・継手位置）が登録された部材は、`query_model` の
+/// member/elements 出力に `haunch_i`/`haunch_j`/`joints` が含まれる。
+/// 付帯情報が無い部材（本テストには含めない）は従来どおりのフィールドのみとなる
+/// （`test_query_model_elements_and_sections` で確認済み）。
+#[test]
+fn test_query_model_elements_with_member_detail() {
+    let mut m = sample_model();
+    m.member_detail_attrs.push(MemberDetailAttr {
+        elem: ElemId(0),
+        haunch_i: Some(Haunch {
+            length: 700.0,
+            depth_increase: 200.0,
+            width_increase: 0.0,
+        }),
+        haunch_j: Some(Haunch {
+            length: 500.0,
+            depth_increase: 150.0,
+            width_increase: 50.0,
+        }),
+        joints: vec![MemberJoint {
+            distance: 1000.0,
+            kind: JointKind::Shop,
+        }],
+    });
+    let items = query_model(&m, "elements", None);
+    assert_eq!(items.len(), 1);
+    let e = &items[0];
+    assert_eq!(e["haunch_i"]["length"], 700.0);
+    assert_eq!(e["haunch_i"]["depth_increase"], 200.0);
+    assert_eq!(e["haunch_j"]["width_increase"], 50.0);
+    let joints = e["joints"].as_array().expect("joints 配列");
+    assert_eq!(joints.len(), 1);
+    assert_eq!(joints[0]["distance"], 1000.0);
+    assert_eq!(joints[0]["kind"], "Shop");
 }
 
 /// RC 矩形の片持ち柱モデル（終局検定ジョブ用）。長期荷重ケース 1 つ。
@@ -198,6 +237,58 @@ fn test_compute_ultimate_check_job() {
             assert!(summary["cft_members"].is_array());
         }
         _ => panic!("expected UltimateCheck outcome"),
+    }
+}
+
+/// DesignCheck ジョブは既定では危険断面位置（柱フェイス [face=0 につき節点芯]・
+/// 中央）の 3 断面のみを検定する（付帯情報なし）。
+#[test]
+fn test_compute_design_check_job_default_positions() {
+    let model = rc_column_model();
+    let outcome = compute_job(&model, JobKind::DesignCheck, &JobParams::default())
+        .expect("断面検定ジョブは成功するはず");
+    match outcome {
+        JobOutcome::DesignCheck { summary, .. } => {
+            assert_eq!(summary["kind"], "DesignCheck");
+            assert_eq!(summary["n_checks"], 3);
+        }
+        _ => panic!("expected DesignCheck outcome"),
+    }
+}
+
+/// 部材付帯情報（継手位置）が登録された部材は、継手位置でも断面力が評価され
+/// （squid-n-element の `eval_sections` 拡張）、DesignCheck の検定位置にも
+/// 継手位置が加わる（既定 3 断面 + 継手 1 = 4 検定）。
+#[test]
+fn test_compute_design_check_job_member_detail_joint() {
+    let mut model = rc_column_model();
+    // 節点間距離 3000mm の柱に、始端から 1000mm（正規化 1/3）の現場継手を追加する。
+    model.member_detail_attrs.push(MemberDetailAttr {
+        elem: ElemId(0),
+        haunch_i: None,
+        haunch_j: None,
+        joints: vec![MemberJoint {
+            distance: 1000.0,
+            kind: JointKind::Site,
+        }],
+    });
+    let outcome = compute_job(&model, JobKind::DesignCheck, &JobParams::default())
+        .expect("断面検定ジョブは成功するはず");
+    match outcome {
+        JobOutcome::DesignCheck {
+            member_force_rows,
+            summary,
+            ..
+        } => {
+            assert_eq!(summary["kind"], "DesignCheck");
+            // 継手位置 1000/3000 の断面力行が追加されている。
+            assert!(member_force_rows
+                .iter()
+                .any(|(_, pos, _)| (pos - 1000.0 / 3000.0).abs() < 1e-6));
+            // 継手位置分だけ検定数が増える（3 -> 4）。
+            assert_eq!(summary["n_checks"], 4);
+        }
+        _ => panic!("expected DesignCheck outcome"),
     }
 }
 

@@ -1,6 +1,7 @@
 pub mod load_cfg;
 pub mod loads;
 pub mod materials;
+pub mod member_details;
 pub mod members;
 pub mod misc_walls;
 pub mod nodes;

@@ -341,6 +341,56 @@ fn test_run_design_check_filters_to_design_positions() {
     );
 }
 
+/// 部材付帯情報（`MemberDetailAttr`）を持つ部材で設計検定を実行すると、
+/// ハンチ端・継手位置の検定結果が `checks` に含まれること
+/// （`design_positions` が `Model::member_detail` の追加検定位置を
+/// 取り込んでいるかの確認。§6.2.3「位置はユーザが追加・変更可能」）。
+#[test]
+fn test_run_design_check_includes_member_detail_positions() {
+    use squid_n_core::model::{Haunch, JointKind, MemberDetailAttr, MemberJoint};
+
+    let mut model = aligned_portal_frame();
+    // 梁(id=1, i端-j端: node1-node2, 全長4000mm)にハンチ(i端)と継手を追加する。
+    // i端は柱と直交(face_i=150、自動剛域算定後)のため、ハンチ端位置は
+    // (150+700)/4000 = 0.2125、継手位置は 1000/4000 = 0.25 になる。
+    model.member_detail_attrs.push(MemberDetailAttr {
+        elem: ElemId(1),
+        haunch_i: Some(Haunch {
+            length: 700.0,
+            depth_increase: 100.0,
+            width_increase: 0.0,
+        }),
+        haunch_j: None,
+        joints: vec![MemberJoint {
+            distance: 1000.0,
+            kind: JointKind::Site,
+        }],
+    });
+
+    let mut app = App::default();
+    app.load_model(model);
+    app.run_linear_static(LoadCaseId(0));
+    assert!(app.last_error.is_none(), "{:?}", app.last_error);
+
+    let checks = &app.results.as_ref().unwrap().checks;
+    let beam_positions: Vec<f64> = checks
+        .iter()
+        .filter(|(id, _, _)| *id == ElemId(1))
+        .map(|(_, pos, _)| *pos)
+        .collect();
+
+    assert!(
+        beam_positions.iter().any(|p| (*p - 0.2125).abs() < 1e-6),
+        "ハンチ端の検定位置が抜けている: {:?}",
+        beam_positions
+    );
+    assert!(
+        beam_positions.iter().any(|p| (*p - 0.25).abs() < 1e-6),
+        "継手位置の検定位置が抜けている: {:?}",
+        beam_positions
+    );
+}
+
 #[test]
 fn test_staleness_mark_edited_marks_downstream() {
     let mut s = Staleness::default();

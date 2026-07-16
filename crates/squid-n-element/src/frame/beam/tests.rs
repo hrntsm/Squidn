@@ -884,6 +884,43 @@ fn test_eval_sections_from_face_distance() {
     model_zero.elements[0].rigid_zone = RigidZone::default();
     let beam_zero = BeamElement::new(&model_zero.elements[0], &model_zero);
     assert_eq!(beam_zero.eval_sections, vec![0.0, 0.5, 1.0]);
+
+    // 部材付帯情報（ハンチ・継手位置）があれば、ハンチ端・継手位置も評価断面に
+    // 加わる（§6.2.3 の追加検定位置。剛性には影響しない）。
+    use squid_n_core::model::{Haunch, JointKind, MemberDetailAttr, MemberJoint};
+    let mut model_detail = model.clone();
+    model_detail.member_detail_attrs.push(MemberDetailAttr {
+        elem: ElemId(0),
+        haunch_i: Some(Haunch {
+            length: 700.0,
+            depth_increase: 200.0,
+            width_increase: 0.0,
+        }),
+        haunch_j: None,
+        joints: vec![MemberJoint {
+            distance: 3000.0,
+            kind: JointKind::Site,
+        }],
+    });
+    let beam_detail = BeamElement::new(&model_detail.elements[0], &model_detail);
+    // face_i=300, ハンチ長 700 → (300+700)/4000 = 0.25、継手 3000/4000 = 0.75
+    let expected_detail = [0.0, 0.075, 0.25, 0.5, 0.75, 0.9375, 1.0];
+    assert_eq!(beam_detail.eval_sections.len(), expected_detail.len());
+    for (a, b) in beam_detail.eval_sections.iter().zip(expected_detail.iter()) {
+        assert!(
+            (a - b).abs() < 1e-9,
+            "eval_sections={:?}",
+            beam_detail.eval_sections
+        );
+    }
+
+    // 付帯情報を付けても剛性行列は不変（剛性には影響しない）。
+    let beam_base = BeamElement::new(&model.elements[0], &model);
+    assert_eq!(
+        beam_base.local_stiffness().data,
+        beam_detail.local_stiffness().data,
+        "付帯情報の有無で剛性行列が変わってはならない"
+    );
 }
 
 /// 剛域算定用の RC 配筋（本数・径は最小限のダミー値。断面性能の絶対値は無関係）。

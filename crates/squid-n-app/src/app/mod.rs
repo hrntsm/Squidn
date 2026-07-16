@@ -31,6 +31,8 @@ pub enum ModelTab {
     WallAttrs,
     /// フレーム外雑壁
     MiscWalls,
+    /// 部材付帯情報（ハンチ・継手位置）
+    MemberDetails,
 }
 
 /// 結果タブ内の切替（3D 各種図・時刻歴グラフ・プッシュオーバー曲線）。
@@ -456,6 +458,9 @@ pub struct App {
     /// 荷重タブ「荷重計算条件」フォームのドラフト状態
     #[cfg(feature = "gui")]
     pub load_cfg_draft: crate::tables::load_cfg::LoadCfgDraft,
+    /// モデルタブ「部材付帯情報」フォームのドラフト状態
+    #[cfg(feature = "gui")]
+    pub member_detail_draft: crate::tables::member_details::MemberDetailDraft,
     /// 設計タブ「数量積算」ビューの状態（集計単位の切替）
     #[cfg(feature = "gui")]
     pub quantity_view: crate::quantity_view::QuantityViewState,
@@ -558,6 +563,8 @@ impl Default for App {
             misc_wall_draft: crate::tables::misc_walls::MiscWallDraft::default(),
             #[cfg(feature = "gui")]
             load_cfg_draft: crate::tables::load_cfg::LoadCfgDraft::default(),
+            #[cfg(feature = "gui")]
+            member_detail_draft: crate::tables::member_details::MemberDetailDraft::default(),
             #[cfg(feature = "gui")]
             quantity_view: crate::quantity_view::QuantityViewState::default(),
         }
@@ -1143,18 +1150,34 @@ fn beam_group_overrides(
 /// `squid_n_element::beam::BeamElement::new` の `eval_sections` 算定と同じ規則
 /// （xi_i は \[0.0, 0.5) へ、xi_j は (0.5, 1.0\] へクランプ）で face_i/face_j から
 /// 求める。face=0（直交材が無い端）では節点芯（0.0/1.0）と一致する。
-fn design_positions(elem: &squid_n_core::model::ElementData, geom_len: f64) -> [f64; 3] {
-    if geom_len > 1e-12 {
+///
+/// `detail`（`Model::member_detail(elem.id)`）が付帯情報を持つ場合は、その
+/// 追加検定位置（ハンチ端・継手位置。`MemberDetailAttr::extra_check_positions`）
+/// も含める（剛性には影響しない。§6.2.3「位置はユーザが追加・変更可能」）。
+/// `squid_n_element::beam::BeamElement::new` の `eval_sections` と同じ実装を
+/// 使うため、両者の位置一致判定（1e-6）が保証される。
+fn design_positions(
+    elem: &squid_n_core::model::ElementData,
+    geom_len: f64,
+    detail: Option<&squid_n_core::model::MemberDetailAttr>,
+) -> Vec<f64> {
+    let mut xs = if geom_len > 1e-12 {
         let xi_i = (elem.rigid_zone.face_i / geom_len).clamp(0.0, 0.5 - 1e-9);
         let xi_j = (1.0 - elem.rigid_zone.face_j / geom_len).clamp(0.5 + 1e-9, 1.0);
-        [xi_i, 0.5, xi_j]
+        vec![xi_i, 0.5, xi_j]
     } else {
-        [0.0, 0.5, 1.0]
+        vec![0.0, 0.5, 1.0]
+    };
+    if let Some(detail) = detail {
+        xs.extend(detail.extra_check_positions(&elem.rigid_zone, geom_len));
     }
+    xs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    xs.dedup_by(|a, b| (*a - *b).abs() < 1e-9);
+    xs
 }
 
 /// `pos` が `positions` のいずれかと 1e-6 以内で一致するか判定する。
-fn is_near_design_position(pos: f64, positions: &[f64; 3]) -> bool {
+fn is_near_design_position(pos: f64, positions: &[f64]) -> bool {
     positions.iter().any(|p| (p - pos).abs() < 1e-6)
 }
 

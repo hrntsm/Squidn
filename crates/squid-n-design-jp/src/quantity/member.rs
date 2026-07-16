@@ -15,8 +15,9 @@
 
 /// 梁端ハンチの寸法（ハンチ端の全幅 Bi・全せい Di とハンチ長さ Li）[mm]。
 ///
-/// 現状のモデル（`SectionShape`）はハンチを保持しないため走査側からは
-/// 常に `None` が渡されるが、算定式はハンチ付きに対応する。
+/// 寸法は部材付帯情報（`Model::member_detail_attrs` のハンチ長・せい増分・
+/// 幅増分。剛性には影響しない）から、走査側（`super::compute_quantity_takeoff`）
+/// が基準断面 B×D への増分を全幅・全せいへ換算して渡す（未入力は `None`）。
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Haunch {
     /// ハンチ端の幅 Bi [mm]。

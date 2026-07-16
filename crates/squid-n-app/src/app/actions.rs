@@ -1434,7 +1434,8 @@ impl App {
                 _ => Box::new(RcDesign),
             };
 
-            let positions = design_positions(elem, length);
+            let detail = self.model.member_detail(*elem_id);
+            let positions = design_positions(elem, length, detail);
 
             for (pos, forces) in &mf.at {
                 if !is_near_design_position(*pos, &positions) {

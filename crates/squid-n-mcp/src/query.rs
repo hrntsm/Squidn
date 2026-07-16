@@ -9,6 +9,10 @@ pub fn get_model_json(state: &ServerState) -> String {
 /// `model.query` の中核ロジック（feature 非依存・テスト可能）。
 ///
 /// `kind` で `node`/`member`(=element)/`section` を選び、各要素を JSON 化して返す。
+/// `member`/`elements` では、`Model::member_detail` に付帯情報（ハンチ・継手位置。
+/// 剛性には影響しない）が登録されている部材について `haunch_i`/`haunch_j`
+/// （`length`/`depth_increase`/`width_increase`）と `joints`（`distance`/`kind`）
+/// を追加で含める（付帯情報が無い部材は従来どおりのフィールドのみ）。
 /// `filter` が与えられたときは、各 JSON を文字列化した中に部分一致するものだけを残す
 /// （簡易フィルタ。名前・ID 等での絞り込み用）。MCP ツール `model_query` はこれを呼ぶ。
 pub fn query_model(model: &Model, kind: &str, filter: Option<&str>) -> Vec<serde_json::Value> {
@@ -29,13 +33,45 @@ pub fn query_model(model: &Model, kind: &str, filter: Option<&str>) -> Vec<serde
             .elements
             .iter()
             .map(|e| {
-                json!({
+                let mut v = json!({
                     "id": e.id.0,
                     "kind": format!("{:?}", e.kind),
                     "nodes": e.nodes.iter().map(|n| n.0).collect::<Vec<_>>(),
                     "section": e.section.map(|s| s.0),
                     "material": e.material.map(|m| m.0),
-                })
+                });
+                // 付帯情報（ハンチ・継手位置。剛性には影響しない）があれば併記する
+                // （側テーブルが無い/空の部材は従来どおりのフィールドのみ）。
+                if let Some(detail) = model.member_detail(e.id) {
+                    let haunch_json = |h: &squid_n_core::model::Haunch| {
+                        json!({
+                            "length": h.length,
+                            "depth_increase": h.depth_increase,
+                            "width_increase": h.width_increase,
+                        })
+                    };
+                    let obj = v.as_object_mut().expect("json!({...}) is always an object");
+                    if let Some(h) = &detail.haunch_i {
+                        obj.insert("haunch_i".to_string(), haunch_json(h));
+                    }
+                    if let Some(h) = &detail.haunch_j {
+                        obj.insert("haunch_j".to_string(), haunch_json(h));
+                    }
+                    if !detail.joints.is_empty() {
+                        obj.insert(
+                            "joints".to_string(),
+                            json!(detail
+                                .joints
+                                .iter()
+                                .map(|j| json!({
+                                    "distance": j.distance,
+                                    "kind": format!("{:?}", j.kind),
+                                }))
+                                .collect::<Vec<_>>()),
+                        );
+                    }
+                }
+                v
             })
             .collect(),
         "section" | "sections" => model
