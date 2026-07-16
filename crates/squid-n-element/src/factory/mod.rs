@@ -72,8 +72,8 @@ pub fn build_behavior(data: &ElementData, model: &Model) -> (Box<dyn ElementBeha
             Box::new(crate::shell::ShellElement::new(data, model)),
             ElemState::default(),
         ),
-        ElementKind::Ms => (
-            Box::new(crate::ms::MsElement::new(data, model)),
+        ElementKind::MultiSpring => (
+            Box::new(crate::multi_spring::MultiSpringElement::new(data, model)),
             ElemState::default(),
         ),
         // Fiber 要素：将来 FiberBeam が実装されるまでの暫定 BeamElement
@@ -191,8 +191,8 @@ pub fn build_nonlinear_behavior(
         },
         ElementKind::Fiber => (Box::new(build_fiber(data, model)), ElemState::default()),
         // MS 要素: 端部バネ断面 + 中央弾性の非線形要素（P5.5 §3）
-        ElementKind::Ms => (
-            Box::new(crate::ms::MsElement::new(data, model)),
+        ElementKind::MultiSpring => (
+            Box::new(crate::multi_spring::MultiSpringElement::new(data, model)),
             ElemState::default(),
         ),
         // 一般ブレース(弾塑性): E·A/L の弾性トラス要素（材料力学）。引張専用ブレースの

@@ -17,7 +17,7 @@ use super::regime::is_vertical_member;
 /// ファイバー梁の生成。既定で塑性化域考慮モデル（端部 Lp 区間にファイバー断面、
 /// 中央弾性）とし、Lp は `plastic_zone` 指定値、未指定なら断面せいの 0.5 倍
 /// （MS 要素と同じ既定。0.5D は既往検討で標準的に用いられる値）。
-pub(super) fn build_fiber(data: &ElementData, model: &Model) -> crate::fiber_elem::FiberBeam {
+pub(super) fn build_fiber(data: &ElementData, model: &Model) -> crate::fiber::FiberBeam {
     let depth = data
         .section
         .and_then(|sid| model.sections.get(sid.index()))
@@ -25,7 +25,7 @@ pub(super) fn build_fiber(data: &ElementData, model: &Model) -> crate::fiber_ele
         .filter(|d| *d > 0.0)
         .unwrap_or(200.0);
     let lp = data.plastic_zone.unwrap_or(0.5 * depth);
-    crate::fiber_elem::FiberBeam::with_plastic_zone(data, model, lp)
+    crate::fiber::FiberBeam::with_plastic_zone(data, model, lp)
 }
 
 /// 部材の曲げ終局（降伏）モーメント My [N·mm]（技術基準解説書の曲げ終局強度）。

@@ -1,5 +1,5 @@
 use crate::behavior::{Ctx, ElemState, ElementBehavior, LocalMat, LocalVec, MassOption};
-use crate::fiber_elem::FiberBeam;
+use crate::fiber::FiberBeam;
 use smallvec::SmallVec;
 use squid_n_core::dof::DofMap;
 use squid_n_core::ids::MaterialId;
@@ -26,7 +26,7 @@ pub struct AxialSpring {
 ///
 /// 注: 旧実装の1次元バネ配置（y 軸上 10 本）は一軸曲げ専用だったため、
 /// 2次元配置（2列×5段）へ一般化した。
-pub struct MsElement {
+pub struct MultiSpringElement {
     /// 軸バネ配置（両端共通。断面内座標と負担面積は `inner` の端部断面が保持）
     pub springs: Vec<AxialSpring>,
     /// 実体: 端部バネ断面 + 中央弾性 + せん断バネ
@@ -37,7 +37,7 @@ pub struct MsElement {
 const MS_NW: usize = 2;
 const MS_ND: usize = 5;
 
-impl MsElement {
+impl MultiSpringElement {
     pub fn new(data: &squid_n_core::model::ElementData, model: &Model) -> Self {
         // 塑性化領域長さ: 入力があればそれを、なければ断面せいの 0.5 倍
         let depth = data
@@ -67,11 +67,11 @@ impl MsElement {
             })
             .unwrap_or_default();
 
-        MsElement { springs, inner }
+        MultiSpringElement { springs, inner }
     }
 }
 
-impl ElementBehavior for MsElement {
+impl ElementBehavior for MultiSpringElement {
     fn n_dof(&self) -> usize {
         self.inner.n_dof()
     }
@@ -165,7 +165,7 @@ mod tests {
             ],
             elements: vec![ElementData {
                 id: ElemId(0),
-                kind: ElementKind::Ms,
+                kind: ElementKind::MultiSpring,
                 nodes: smallvec::smallvec![NodeId(0), NodeId(1)],
                 section: Some(SectionId(0)),
                 material: Some(MaterialId(0)),
@@ -211,7 +211,7 @@ mod tests {
     #[test]
     fn test_ms_has_2d_spring_layout() {
         let model = make_model(Some(295.0), None);
-        let elem = MsElement::new(&model.elements[0], &model);
+        let elem = MultiSpringElement::new(&model.elements[0], &model);
         assert_eq!(elem.springs.len(), 10);
         // 2次元配置: y も z も複数の異なる座標を持つ（一軸曲げ専用でない）
         let mut ys: Vec<i64> = elem.springs.iter().map(|s| s.y as i64).collect();
@@ -237,7 +237,7 @@ mod tests {
         let theta = kappa * 3000.0 / 4.0;
 
         // ケース1: 純曲げ
-        let mut elem1 = MsElement::new(&model.elements[0], &model);
+        let mut elem1 = MultiSpringElement::new(&model.elements[0], &model);
         let du1 = LocalVec {
             data: smallvec::smallvec![0.0, 0.0, 0.0, 0.0, theta, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
         };
@@ -248,7 +248,7 @@ mod tests {
         // ケース2: 同じ回転 + 軸ひずみ −5εy（中立軸シフト → N/Npl ≈ 0.5 相当）。
         // 軸バネと曲げが非連成のモデルなら軸変位は DOF4 のモーメントに一切影響しない
         // ため、m2 < m1 が N-M 連成の直接の証拠になる。
-        let mut elem2 = MsElement::new(&model.elements[0], &model);
+        let mut elem2 = MultiSpringElement::new(&model.elements[0], &model);
         let u_axial = -5.0 * eps_y * 3000.0;
         let du2 = LocalVec {
             data: smallvec::smallvec![
@@ -271,7 +271,7 @@ mod tests {
     fn test_ms_commit_revert_roundtrip() {
         let model = make_model(Some(295.0), None);
         let ctx = Ctx { model: &model };
-        let mut elem = MsElement::new(&model.elements[0], &model);
+        let mut elem = MultiSpringElement::new(&model.elements[0], &model);
 
         // 降伏させてコミット
         let du = LocalVec {
@@ -307,14 +307,14 @@ mod tests {
     fn test_ms_checkpoint_roundtrip() {
         let model = make_model(Some(295.0), None);
         let ctx = Ctx { model: &model };
-        let mut elem = MsElement::new(&model.elements[0], &model);
+        let mut elem = MultiSpringElement::new(&model.elements[0], &model);
         let du = LocalVec {
             data: smallvec::smallvec![0.0, 0.0, 0.0, 0.0, 0.02, 0.0, -0.5, 0.0, 0.0, 0.0, 0.0, 0.0],
         };
         elem.update_state(&du, true, &ctx);
         let cp = elem.serialize_checkpoint();
 
-        let mut elem2 = MsElement::new(&model.elements[0], &model);
+        let mut elem2 = MultiSpringElement::new(&model.elements[0], &model);
         elem2.deserialize_checkpoint(&cp).unwrap();
         // 復元後、同じ増分に対する応答が一致する
         let du2 = LocalVec {

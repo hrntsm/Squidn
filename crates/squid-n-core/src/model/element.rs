@@ -14,8 +14,10 @@ use super::*;
 pub enum ElementKind {
     Beam,
     Shell,
+    /// ファイバー梁要素（積分点断面のファイバー分割による分布塑性モデル）。
     Fiber,
-    Ms,
+    /// マルチスプリング梁要素（端部塑性化域を軸ばね群で置換したモデル）。
+    MultiSpring,
     Wall,
     PanelZone,
     /// 一般ブレース（軸材。軸剛性のみのトラス要素。材料力学）。

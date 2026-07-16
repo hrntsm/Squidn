@@ -5,7 +5,7 @@
 //! 要素の種類ごとにモジュールを階層化している:
 //!
 //! - [`common`] —  要素共通の基盤（振る舞いトレイト・局所行列/ベクトル・座標変換）
-//! - [`frame`] —   線材要素（梁・トラス・集中ばね梁・ファイバー・MS・部材荷重）
+//! - [`frame`] —   線材要素（梁・トラス・材端集中ばね梁・ファイバー・マルチスプリング・部材荷重）
 //! - [`springs`] — ばね・パネル要素
 //! - [`wall`] —    壁要素
 //! - [`shell`] —   シェル要素
@@ -25,7 +25,7 @@ pub mod shell;
 // 階層化後も従来のモジュールパス（例: `squid_n_element::beam` や
 // クレート内部の `crate::behavior`）を維持するための再エクスポート。
 pub use common::{behavior, transform};
-pub use frame::{beam, concentrated, fiber_elem, member_load, ms, truss};
+pub use frame::{beam, concentrated, fiber, member_load, multi_spring, truss};
 pub use springs::{damper, isolator, panel, shear_spring, spring};
 pub use wall::{misc_wall, side_column, wall_panel};
 
