@@ -78,6 +78,10 @@ struct PendingMember {
     n_j: u32,
     section: Option<u32>,
     material: Option<u32>,
+    /// `id_material` 属性がファイルに存在したか。存在する（=-1 含む）場合は部材が材料を
+    /// 明示しているとみなし、断面材料の伝播を行わない（往復で None→Some 化を防ぐ）。
+    /// 属性が無い（実 ST-Bridge 相当）ときのみ断面材料を伝播する。
+    has_material_attr: bool,
     ref_vec: [f64; 3],
 }
 
@@ -169,6 +173,7 @@ impl ImportReport {
 /// ST-Bridge の要素のうち Squid-N が未対応で、取り込み時に警告対象とするもの
 /// （構造ラッパ等は対象外。実データを欠落させる部材・断面のみ列挙する）。
 const UNSUPPORTED_ELEMENTS: &[&str] = &[
+    // 部材（面要素・基礎・開口）
     "StbSlab",
     "StbWall",
     "StbFooting",
@@ -176,13 +181,21 @@ const UNSUPPORTED_ELEMENTS: &[&str] = &[
     "StbFoundationColumn",
     "StbStripFooting",
     "StbParapet",
+    "StbOpen",
+    // 断面（壁・スラブ・基礎・開口。鋼ブレース断面 StbSecBrace_S は対応済み）
     "StbSecWall_RC",
     "StbSecSlab_RC",
-    "StbSecBrace_S",
+    "StbSecSlab_S",
+    "StbSecSlabDeck",
     "StbSecFoundation_RC",
+    "StbSecFoundationColumn_RC",
+    "StbSecFoundationColumn_SRC",
+    "StbSecFoundationColumn_CFT",
     "StbSecPile_RC",
     "StbSecPile_S",
+    "StbSecPile_PC",
     "StbSecParapet_RC",
+    "StbSecOpen_RC",
 ];
 
 /// ST-Bridge 2.0 XML を内部モデルへ取り込む（欠落の報告は破棄する）。
@@ -283,8 +296,8 @@ pub fn import_stbridge_with_report(xml: &str) -> Result<(Model, ImportReport), S
                             mat: None,
                         });
                     }
-                    // --- 断面: 標準要素（鋼） ---
-                    "StbSecColumn_S" | "StbSecBeam_S" => {
+                    // --- 断面: 標準要素（鋼。柱・梁・ブレース） ---
+                    "StbSecColumn_S" | "StbSecBeam_S" | "StbSecBrace_S" => {
                         cur = CurSec::Steel {
                             file_id: get_u32(&a, "id")?,
                             name: a.get("name").cloned().unwrap_or_default(),
@@ -296,7 +309,8 @@ pub fn import_stbridge_with_report(xml: &str) -> Result<(Model, ImportReport), S
                     // 鋼／CFT／SRC 断面の図形参照（`*_Same` / `*_Straight`）。`shape` 系属性から
                     // 形鋼名を、`strength_main` から鋼種を取り、現在の断面種別へ格納する。
                     tag if tag.starts_with("StbSecSteelColumn_")
-                        || tag.starts_with("StbSecSteelBeam_") =>
+                        || tag.starts_with("StbSecSteelBeam_")
+                        || tag.starts_with("StbSecSteelBrace_") =>
                     {
                         let sname = a
                             .get("shape")
@@ -440,10 +454,18 @@ pub fn import_stbridge_with_report(xml: &str) -> Result<(Model, ImportReport), S
                         let top = get_u32(&a, "id_node_top")?;
                         pending_members.push(make_member(&a, bot, top, PendingMemberKind::Beam)?);
                     }
-                    "StbGirder" | "StbBeam" | "StbPost" => {
+                    "StbGirder" | "StbBeam" => {
                         let st = get_u32(&a, "id_node_start")?;
                         let en = get_u32(&a, "id_node_end")?;
                         pending_members.push(make_member(&a, st, en, PendingMemberKind::Beam)?);
+                    }
+                    // 間柱（鉛直材）は柱と同じく bottom/top を持つ（start/end も許容）。
+                    "StbPost" => {
+                        let bot = get_u32(&a, "id_node_bottom")
+                            .or_else(|_| get_u32(&a, "id_node_start"))?;
+                        let top =
+                            get_u32(&a, "id_node_top").or_else(|_| get_u32(&a, "id_node_end"))?;
+                        pending_members.push(make_member(&a, bot, top, PendingMemberKind::Beam)?);
                     }
                     "StbBrace" => {
                         let st = get_u32(&a, "id_node_start")?;
@@ -493,7 +515,7 @@ pub fn import_stbridge_with_report(xml: &str) -> Result<(Model, ImportReport), S
                 let name = e.name();
                 let tag = String::from_utf8_lossy(name.as_ref()).to_string();
                 match tag.as_str() {
-                    "StbSecColumn_S" | "StbSecBeam_S" => {
+                    "StbSecColumn_S" | "StbSecBeam_S" | "StbSecBrace_S" => {
                         if let CurSec::Steel {
                             file_id,
                             name,
@@ -676,22 +698,38 @@ pub fn import_stbridge_with_report(xml: &str) -> Result<(Model, ImportReport), S
     // 部材を格納する（節点・断面・材料の参照を正規化後の index に張り替える）。
     // 参照先が存在しない部材はスキップし、断面/材料の欠落は None にしてダングリングを防ぐ。
     let mut skipped_members = 0u32;
+    let mut dangling_section = 0u32;
+    let mut dangling_material = 0u32;
     for m in pending_members {
         let (Some(&ni), Some(&nj)) = (node_index.get(&m.n_i), node_index.get(&m.n_j)) else {
             skipped_members += 1;
             continue;
         };
-        let section = m
-            .section
-            .and_then(|fid| section_index.get(&fid).copied())
-            .map(SectionId);
-        // 材料は部材自身の id_material を優先し、無ければ参照する断面の材料を伝播する。
-        let material = m
-            .material
-            .and_then(|fid| material_index.get(&fid).copied())
+        // 断面参照: 実在しない id を指していれば警告して None にする（ダングリング防止）。
+        let section = m.section.and_then(|fid| match section_index.get(&fid) {
+            Some(&idx) => Some(SectionId(idx)),
+            None => {
+                dangling_section += 1;
+                None
+            }
+        });
+        // 材料は部材自身の id_material を優先。id_material 属性が無い（実 ST-Bridge 相当の）
+        // ときのみ断面の材料を伝播する（属性がある部材の None を上書きしない）。
+        let own_material = m.material.and_then(|fid| match material_index.get(&fid) {
+            Some(&idx) => Some(idx),
+            None => {
+                dangling_material += 1;
+                None
+            }
+        });
+        let material = own_material
             .or_else(|| {
-                m.section
-                    .and_then(|sfid| section_material.get(&sfid).copied())
+                if m.has_material_attr {
+                    None
+                } else {
+                    m.section
+                        .and_then(|sfid| section_material.get(&sfid).copied())
+                }
             })
             .map(MaterialId);
         let id = ElemId(model.elements.len() as u32);
@@ -727,6 +765,16 @@ pub fn import_stbridge_with_report(xml: &str) -> Result<(Model, ImportReport), S
     if skipped_members > 0 {
         warnings.push(format!(
             "存在しない節点を参照する部材を {skipped_members} 件スキップしました"
+        ));
+    }
+    if dangling_section > 0 {
+        warnings.push(format!(
+            "存在しない断面を参照する部材が {dangling_section} 件あり、断面リンクを外しました"
+        ));
+    }
+    if dangling_material > 0 {
+        warnings.push(format!(
+            "存在しない材料を参照する部材が {dangling_material} 件あり、材料リンクを外しました"
         ));
     }
 
@@ -879,7 +927,7 @@ fn build_sections(
                 grade,
             } => {
                 // 内蔵鉄骨（H 形鋼）の寸法を解決する。未解決なら 0 とし、形状は保持する。
-                let (sh, sw, sweb, sfl) = steel_name
+                let steel_dims = steel_name
                     .and_then(|nm| steel_lib.get(&nm).cloned())
                     .and_then(|s| match s {
                         SectionShape::SteelH {
@@ -889,8 +937,14 @@ fn build_sections(
                             flange_thick,
                         } => Some((height, width, web_thick, flange_thick)),
                         _ => None,
-                    })
-                    .unwrap_or((0.0, 0.0, 0.0, 0.0));
+                    });
+                if steel_dims.is_none() {
+                    warnings.push(format!(
+                        "SRC 断面 (name=\"{}\") の内蔵鉄骨参照を解決できず鉄骨寸法ゼロで取り込みました",
+                        ps.name
+                    ));
+                }
+                let (sh, sw, sweb, sfl) = steel_dims.unwrap_or((0.0, 0.0, 0.0, 0.0));
                 SectionShape::SrcRect {
                     b,
                     d,
@@ -1117,6 +1171,7 @@ fn make_member(
         Some(s) if s >= 0 => Some(s as u32),
         _ => None,
     };
+    let has_material_attr = a.contains_key("id_material");
     let material = match get_i64(a, "id_material") {
         Some(m) if m >= 0 => Some(m as u32),
         _ => None,
@@ -1132,6 +1187,7 @@ fn make_member(
         n_j,
         section,
         material,
+        has_material_attr,
         ref_vec,
     })
 }

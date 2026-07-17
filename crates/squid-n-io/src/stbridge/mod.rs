@@ -1274,4 +1274,196 @@ mod tests {
             report.warnings
         );
     }
+
+    // ===== レビュー指摘の回帰テスト =====
+
+    /// [高] StbPost（間柱, bottom/top）を含むファイルが取り込みエラーで中断しない。
+    #[test]
+    fn test_import_stbpost_bottom_top() {
+        let xml = r#"<?xml version="1.0"?>
+<ST_BRIDGE version="2.0.0"><StbModel>
+  <StbNodes>
+    <StbNode id="0" X="0" Y="0" Z="0"/>
+    <StbNode id="1" X="0" Y="0" Z="3000"/>
+  </StbNodes>
+  <StbMembers><StbPost id="0" id_node_bottom="0" id_node_top="1"/></StbMembers>
+</StbModel></ST_BRIDGE>"#;
+        let m = import_stbridge(xml).expect("StbPost で中断しない");
+        assert_eq!(m.elements.len(), 1);
+        assert_eq!(m.elements[0].nodes.as_slice(), &[NodeId(0), NodeId(1)]);
+    }
+
+    /// [高] SRC 内蔵鉄骨の参照が未解決なら警告する（無言のゼロ鉄骨を防ぐ）。
+    #[test]
+    fn test_import_report_warns_unresolved_src_steel() {
+        let xml = r#"<?xml version="1.0"?>
+<ST_BRIDGE version="2.0.0"><StbModel>
+  <StbSections>
+    <StbSecColumn_SRC id="0" name="SC" strength_steel="SN490B">
+      <StbSecFigureColumn_SRC><StbSecColumn_SRC_Rect width_X="800" width_Y="800"/></StbSecFigureColumn_SRC>
+      <StbSecSteelFigureColumn_SRC><StbSecSteelColumn_SRC_Same shape="MISSING_H"/></StbSecSteelFigureColumn_SRC>
+    </StbSecColumn_SRC>
+  </StbSections>
+</StbModel></ST_BRIDGE>"#;
+        let (_m, report) = import_stbridge_with_report(xml).expect("import");
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|w| w.contains("内蔵鉄骨参照を解決できず")),
+            "SRC 内蔵鉄骨の未解決を報告: {:?}",
+            report.warnings
+        );
+    }
+
+    /// [中] id_material を明示（-1 含む）する部材の material=None は、断面材料で上書きしない。
+    #[test]
+    fn test_material_none_member_not_overwritten_by_section() {
+        let mut m = frame_nodes(); // 材料0="SN400B"
+        let h = SectionShape::SteelH {
+            height: 300.0,
+            width: 150.0,
+            web_thick: 6.5,
+            flange_thick: 9.0,
+        };
+        m.sections.push(h.to_section(SectionId(0), "S".into()));
+        let mut col = member(0, true, 0);
+        col.material = Some(MaterialId(0));
+        let mut beam = member(1, false, 0);
+        beam.material = None;
+        m.elements.push(col);
+        m.elements.push(beam);
+
+        let back = import_stbridge(&export_stbridge_with(&m, SectionExportMode::Standard).unwrap())
+            .expect("import");
+        assert_eq!(back.elements[0].material, Some(MaterialId(0)), "柱の材料");
+        assert_eq!(back.elements[1].material, None, "梁の材料は None のまま");
+    }
+
+    /// [中] 柱・梁で異なる材料が同一断面を共有する場合、分割後の各断面に正しい材料を書き出す。
+    #[test]
+    fn test_shared_section_role_material() {
+        let mut m = frame_nodes();
+        m.materials.push(Material {
+            concrete_class: Default::default(),
+            id: MaterialId(1),
+            name: "SN490B".into(),
+            young: 205000.0,
+            poisson: 0.3,
+            density: 7.85e-9,
+            shear: None,
+            fc: None,
+            fy: Some(325.0),
+        });
+        let h = SectionShape::SteelH {
+            height: 300.0,
+            width: 150.0,
+            web_thick: 6.5,
+            flange_thick: 9.0,
+        };
+        m.sections.push(h.to_section(SectionId(0), "S".into()));
+        let mut col = member(0, true, 0);
+        col.material = Some(MaterialId(0));
+        let mut beam = member(1, false, 0);
+        beam.material = Some(MaterialId(1));
+        m.elements.push(col);
+        m.elements.push(beam);
+
+        let xml = export_stbridge_with(&m, SectionExportMode::Standard).unwrap();
+        assert!(
+            xml.contains("<StbSecColumn_S ") && xml.contains("strength_main=\"SN400B\""),
+            "柱断面に SN400B: {xml}"
+        );
+        assert!(
+            xml.contains("<StbSecBeam_S ") && xml.contains("strength_main=\"SN490B\""),
+            "梁断面に SN490B: {xml}"
+        );
+    }
+
+    /// [中] 存在しない断面を参照する部材は、リンクを外しつつ警告する。
+    #[test]
+    fn test_import_report_warns_dangling_section_ref() {
+        let xml = r#"<?xml version="1.0"?>
+<ST_BRIDGE version="2.0.0"><StbModel>
+  <StbNodes>
+    <StbNode id="0" X="0" Y="0" Z="0"/>
+    <StbNode id="1" X="0" Y="0" Z="3000"/>
+  </StbNodes>
+  <StbMembers><StbColumn id="0" id_node_bottom="0" id_node_top="1" id_section="99"/></StbMembers>
+</StbModel></ST_BRIDGE>"#;
+        let (m, report) = import_stbridge_with_report(xml).expect("import");
+        assert_eq!(m.elements[0].section, None);
+        assert!(
+            report.warnings.iter().any(|w| w.contains("存在しない断面")),
+            "ダングリング断面参照を報告: {:?}",
+            report.warnings
+        );
+    }
+
+    /// [低] 鋼ブレース断面 StbSecBrace_S を取り込み、ブレースが断面を持つ。
+    #[test]
+    fn test_import_stbsecbrace_s() {
+        let xml = r#"<?xml version="1.0"?>
+<ST_BRIDGE version="2.0.0"><StbModel>
+  <StbNodes>
+    <StbNode id="0" X="0" Y="0" Z="0"/>
+    <StbNode id="1" X="6000" Y="0" Z="3000"/>
+  </StbNodes>
+  <StbSections>
+    <StbSecBrace_S id="0" name="BR"><StbSecSteelFigureBrace_S><StbSecSteelBrace_S_Same shape="P1"/></StbSecSteelFigureBrace_S></StbSecBrace_S>
+    <StbSecSteel><StbSecPipe name="P1" D="100" t="5"/></StbSecSteel>
+  </StbSections>
+  <StbMembers><StbBrace id="0" id_node_start="0" id_node_end="1" id_section="0" tension_only="true"/></StbMembers>
+</StbModel></ST_BRIDGE>"#;
+        let (m, report) = import_stbridge_with_report(xml).expect("import");
+        assert!(m.validate().is_ok(), "{:?}", m.validate());
+        assert_eq!(
+            m.elements[0].section,
+            Some(SectionId(0)),
+            "ブレースが断面を持つ"
+        );
+        assert!(
+            matches!(m.sections[0].shape, Some(SectionShape::SteelPipe { .. })),
+            "ブレース断面が鋼管として復元"
+        );
+        assert!(
+            report.is_clean(),
+            "StbSecBrace_S は未対応ではない: {:?}",
+            report.warnings
+        );
+    }
+
+    /// [低] esc は XML 1.0 で表現できない制御文字（例: form feed）を除去する。
+    #[test]
+    fn test_export_strips_illegal_control_chars() {
+        let mut m = frame_nodes();
+        let mut sec = SectionShape::SteelH {
+            height: 300.0,
+            width: 150.0,
+            web_thick: 6.5,
+            flange_thick: 9.0,
+        }
+        .to_section(SectionId(0), "S".into());
+        sec.name = "A\u{0C}B".into(); // form feed を含む名前
+        m.sections.push(sec);
+        m.elements.push(member(0, true, 0));
+        let xml = export_stbridge_with(&m, SectionExportMode::Standard).unwrap();
+        assert!(!xml.contains('\u{0C}'), "不正な制御文字が出力に残らない");
+        assert!(import_stbridge(&xml).is_ok(), "出力は XML として読み戻せる");
+    }
+
+    /// [低] 未対応要素リストに StbOpen（開口）が含まれ、欠落が報告される。
+    #[test]
+    fn test_import_report_lists_stbopen() {
+        let xml = r#"<?xml version="1.0"?>
+<ST_BRIDGE version="2.0.0"><StbModel>
+  <StbMembers><StbOpen id="0" id_wall="1"/></StbMembers>
+</StbModel></ST_BRIDGE>"#;
+        let (_m, report) = import_stbridge_with_report(xml).expect("import");
+        assert!(
+            report.warnings.iter().any(|w| w.contains("StbOpen")),
+            "StbOpen の欠落を報告: {:?}",
+            report.warnings
+        );
+    }
 }

@@ -209,10 +209,17 @@ fn opt(x: Option<f64>) -> String {
 }
 
 pub(super) fn esc(s: &str) -> String {
+    // XML 1.0 で表現できない C0 制御文字（タブ/改行/CR 以外の #x00-#x1F）は文字参照でも
+    // 表せないため除去する。これをしないと不正な XML を出力してしまう。
+    let cleaned: String = s
+        .chars()
+        .filter(|&c| c == '\t' || c == '\n' || c == '\r' || (c as u32) >= 0x20)
+        .collect();
     // & を最初に置換した後で制御空白を文字参照化する（後段で `&` を再エスケープしないため安全）。
     // タブ/改行/CR を文字参照にしないと、XML 属性値正規化（読込側 normalized_value）で
     // 空白 (#x20) に潰れ、属性値（例: 断面名・帯筋グレード）が往復で変化してしまう。
-    s.replace('&', "&amp;")
+    cleaned
+        .replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")
         .replace('"', "&quot;")
