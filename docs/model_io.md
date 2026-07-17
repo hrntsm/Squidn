@@ -153,6 +153,7 @@ let model = load_scz(Path::new("model.scz"))?;
 
 - ST-Bridge では断面が柱用（`StbSecColumn_*`）と梁用（`StbSecBeam_*`）に型分けされる。内部モデルで 1 つの断面を柱と梁の両方が共有している場合、書き出し時に柱用・梁用の 2 要素へ分割し、梁用へ新しい断面 id を割り当てる（各部材の断面参照は自動で張り替える）。読み戻すとこの分割がそのまま 2 断面になる。
 - 読み込み時は、形鋼名（`StbSecRoll-H` 等）から H形鋼・角形鋼管・鋼管・山形鋼・溝形鋼・T形鋼を、`StbSecColumn_RC_Rect`/`_Circle`・`StbSecBeam_RC_Straight` から RC 矩形・円形を復元し、`StbSecBarArrangement*` から配筋を復元する。node/material/story/section/element/荷重ケースの id が 1 始まりや歯抜けでも 0 始まり連番へ正規化し、全参照を張り替える。
+- 材料は ST-Bridge の慣習に合わせ断面側にも付す（鋼は形鋼参照の `strength_main`＝材料名、RC/CFT/SRC は `id_material`）。読み込み時、部材が `id_material` を持たない他社ファイルでは、断面の材料を部材へ伝播する。
 
 ### ライブラリからの利用
 

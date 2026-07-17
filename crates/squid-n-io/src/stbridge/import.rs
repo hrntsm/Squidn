@@ -21,11 +21,21 @@ use squid_n_core::model::{
 use squid_n_core::section_shape::{BarSet, RcRebar, SectionShape, ShearBar};
 use std::collections::HashMap;
 
+/// 断面が持つ材料参照（ST-Bridge は材料を断面側に持つ）。
+/// 数値 id（RC/CFT/SRC の `id_material`）または材料名（鋼の `strength_main` グレード）。
+#[derive(Clone)]
+enum SecMatRef {
+    Id(u32),
+    Grade(String),
+}
+
 /// 取り込み途中の断面（id 整列・形鋼名解決の前）。
 struct PendingSec {
     file_id: u32,
     name: String,
     kind: PendingSecKind,
+    /// 断面側に付いた材料参照（部材が id_material を持たないとき部材へ伝播する）。
+    mat: Option<SecMatRef>,
 }
 
 enum PendingSecKind {
@@ -116,17 +126,20 @@ enum CurSec {
         file_id: u32,
         name: String,
         shape_name: Option<String>,
+        grade: Option<String>,
     },
     Rc {
         file_id: u32,
         name: String,
         geom: Option<RcGeom>,
         rebar: Option<RcRebar>,
+        mat_id: Option<u32>,
     },
     Cft {
         file_id: u32,
         name: String,
         steel_name: Option<String>,
+        mat_id: Option<u32>,
     },
     Src {
         file_id: u32,
@@ -135,6 +148,7 @@ enum CurSec {
         rebar: Option<RcRebar>,
         steel_name: Option<String>,
         grade: String,
+        mat_id: Option<u32>,
     },
 }
 
@@ -225,6 +239,7 @@ pub fn import_stbridge(xml: &str) -> Result<Model, StbError> {
                                 depth: get_f64(&a, "depth").unwrap_or(0.0),
                                 width: get_f64(&a, "width").unwrap_or(0.0),
                             },
+                            mat: None,
                         });
                     }
                     // --- 断面: 標準要素（鋼） ---
@@ -233,10 +248,12 @@ pub fn import_stbridge(xml: &str) -> Result<Model, StbError> {
                             file_id: get_u32(&a, "id")?,
                             name: a.get("name").cloned().unwrap_or_default(),
                             shape_name: None,
+                            // 鋼種は形鋼参照（下）に付くことが多いが、要素側にあれば拾う。
+                            grade: a.get("strength_main").cloned(),
                         };
                     }
                     // 鋼／CFT／SRC 断面の図形参照（`*_Same` / `*_Straight`）。`shape` 系属性から
-                    // 形鋼名を取り、現在の断面種別（Steel/Cft/Src）へ格納する。
+                    // 形鋼名を、`strength_main` から鋼種を取り、現在の断面種別へ格納する。
                     tag if tag.starts_with("StbSecSteelColumn_")
                         || tag.starts_with("StbSecSteelBeam_") =>
                     {
@@ -246,9 +263,17 @@ pub fn import_stbridge(xml: &str) -> Result<Model, StbError> {
                             .or_else(|| a.get("shape_center"))
                             .or_else(|| a.get("shape_main"))
                             .cloned();
+                        let gr = a.get("strength_main").cloned();
                         match &mut cur {
-                            CurSec::Steel { shape_name, .. } if shape_name.is_none() => {
-                                *shape_name = sname
+                            CurSec::Steel {
+                                shape_name, grade, ..
+                            } => {
+                                if shape_name.is_none() {
+                                    *shape_name = sname;
+                                }
+                                if grade.is_none() {
+                                    *grade = gr;
+                                }
                             }
                             CurSec::Cft { steel_name, .. } if steel_name.is_none() => {
                                 *steel_name = sname
@@ -266,6 +291,7 @@ pub fn import_stbridge(xml: &str) -> Result<Model, StbError> {
                             name: a.get("name").cloned().unwrap_or_default(),
                             geom: None,
                             rebar: None,
+                            mat_id: mat_id_of(&a),
                         };
                     }
                     "StbSecColumn_RC_Rect" => {
@@ -303,6 +329,7 @@ pub fn import_stbridge(xml: &str) -> Result<Model, StbError> {
                             file_id: get_u32(&a, "id")?,
                             name: a.get("name").cloned().unwrap_or_default(),
                             steel_name: None,
+                            mat_id: mat_id_of(&a),
                         };
                     }
                     // --- 断面: 標準要素（SRC） ---
@@ -318,6 +345,7 @@ pub fn import_stbridge(xml: &str) -> Result<Model, StbError> {
                                 .or_else(|| a.get("strength_main_S"))
                                 .cloned()
                                 .unwrap_or_default(),
+                            mat_id: mat_id_of(&a),
                         };
                     }
                     "StbSecColumn_SRC_Rect" => {
@@ -424,12 +452,14 @@ pub fn import_stbridge(xml: &str) -> Result<Model, StbError> {
                             file_id,
                             name,
                             shape_name,
+                            grade,
                         } = std::mem::replace(&mut cur, CurSec::None)
                         {
                             pending_secs.push(PendingSec {
                                 file_id,
                                 name,
                                 kind: PendingSecKind::SteelRef(shape_name),
+                                mat: grade.map(SecMatRef::Grade),
                             });
                         }
                     }
@@ -439,6 +469,7 @@ pub fn import_stbridge(xml: &str) -> Result<Model, StbError> {
                             name,
                             geom: Some(geom),
                             rebar,
+                            mat_id,
                         } = std::mem::replace(&mut cur, CurSec::None)
                         {
                             // 配筋が無い（幾何のみの）ファイルは無筋相当の既定配筋で補う。
@@ -451,6 +482,7 @@ pub fn import_stbridge(xml: &str) -> Result<Model, StbError> {
                                 file_id,
                                 name,
                                 kind: PendingSecKind::Shape(shape),
+                                mat: mat_id.map(SecMatRef::Id),
                             });
                         }
                     }
@@ -459,12 +491,14 @@ pub fn import_stbridge(xml: &str) -> Result<Model, StbError> {
                             file_id,
                             name,
                             steel_name,
+                            mat_id,
                         } = std::mem::replace(&mut cur, CurSec::None)
                         {
                             pending_secs.push(PendingSec {
                                 file_id,
                                 name,
                                 kind: PendingSecKind::CftRef(steel_name),
+                                mat: mat_id.map(SecMatRef::Id),
                             });
                         }
                     }
@@ -476,11 +510,13 @@ pub fn import_stbridge(xml: &str) -> Result<Model, StbError> {
                             rebar,
                             steel_name,
                             grade,
+                            mat_id,
                         } = std::mem::replace(&mut cur, CurSec::None)
                         {
                             pending_secs.push(PendingSec {
                                 file_id,
                                 name,
+                                mat: mat_id.map(SecMatRef::Id),
                                 kind: PendingSecKind::SrcRef {
                                     b,
                                     d,
@@ -555,6 +591,25 @@ pub fn import_stbridge(xml: &str) -> Result<Model, StbError> {
         });
     }
 
+    // 断面側の材料参照を、部材への伝播用に file id → 正規化後 material index へ解決する。
+    // ST-Bridge は材料を断面に持つため、部材が id_material を持たない（実 STB 相当の）
+    // 場合に断面の材料を部材へ伝播する。数値 id は material_index、鋼のグレード名は
+    // 同名の材料へ突き合わせる（同名複数は最初の一致）。
+    let mut name_to_mat: HashMap<&str, u32> = HashMap::new();
+    for mat in &model.materials {
+        name_to_mat.entry(mat.name.as_str()).or_insert(mat.id.0);
+    }
+    let section_material: HashMap<u32, u32> = pending_secs
+        .iter()
+        .filter_map(|p| {
+            let idx = match p.mat.as_ref()? {
+                SecMatRef::Id(mid) => material_index.get(mid).copied(),
+                SecMatRef::Grade(name) => name_to_mat.get(name.as_str()).copied(),
+            };
+            idx.map(|i| (p.file_id, i))
+        })
+        .collect();
+
     // 断面 id を整列・連番へ再割当てし、形鋼名を解決してモデルへ格納する。
     let section_index = build_sections(&mut model, pending_secs, &steel_lib);
 
@@ -568,9 +623,14 @@ pub fn import_stbridge(xml: &str) -> Result<Model, StbError> {
             .section
             .and_then(|fid| section_index.get(&fid).copied())
             .map(SectionId);
+        // 材料は部材自身の id_material を優先し、無ければ参照する断面の材料を伝播する。
         let material = m
             .material
             .and_then(|fid| material_index.get(&fid).copied())
+            .or_else(|| {
+                m.section
+                    .and_then(|sfid| section_material.get(&sfid).copied())
+            })
             .map(MaterialId);
         let id = ElemId(model.elements.len() as u32);
         // ブレースは軸材なので両端ピン、梁・柱は既定で剛接合とする（ST-Bridge は端部
@@ -933,6 +993,15 @@ fn parse_rebar(a: &HashMap<String, String>) -> RcRebar {
                 .cloned(),
         },
     }
+}
+
+/// 断面要素に付いた材料 id（`id_material` / `id_material_concrete` / `id_material_rc`）。
+fn mat_id_of(a: &HashMap<String, String>) -> Option<u32> {
+    get_i64(a, "id_material")
+        .or_else(|| get_i64(a, "id_material_concrete"))
+        .or_else(|| get_i64(a, "id_material_rc"))
+        .filter(|v| *v >= 0)
+        .map(|v| v as u32)
 }
 
 fn make_member(

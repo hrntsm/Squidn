@@ -1120,4 +1120,90 @@ mod tests {
             assert_eq!(back.elements[0].material, Some(MaterialId(0)));
         }
     }
+
+    /// Standard 書き出しは断面側にも材料を付す（鋼は strength_main、RC は id_material）。
+    #[test]
+    fn test_standard_writes_section_material() {
+        // 鋼柱: strength_main に材料名。
+        let mut m = frame_nodes(); // 材料 0 = "SN400B"
+        let h = SectionShape::SteelH {
+            height: 300.0,
+            width: 150.0,
+            web_thick: 6.5,
+            flange_thick: 9.0,
+        };
+        m.sections.push(h.to_section(SectionId(0), "C".into()));
+        m.elements.push(member(0, true, 0));
+        let xml = export_stbridge_with(&m, SectionExportMode::Standard).unwrap();
+        assert!(
+            xml.contains("strength_main=\"SN400B\""),
+            "鋼断面に材料名（strength_main）を付す: {xml}"
+        );
+
+        // RC 柱: id_material に材料 id。
+        let mut m2 = frame_nodes();
+        let rc = SectionShape::RcRect {
+            b: 500.0,
+            d: 500.0,
+            rebar: rebar(),
+        };
+        m2.sections.push(rc.to_section(SectionId(0), "C".into()));
+        m2.elements.push(member(0, true, 0));
+        let xml2 = export_stbridge_with(&m2, SectionExportMode::Standard).unwrap();
+        assert!(
+            xml2.contains("<StbSecColumn_RC id=\"0\" name=\"C\" id_material=\"0\""),
+            "RC 断面に材料 id を付す: {xml2}"
+        );
+    }
+
+    /// 実 STB 相当: 部材が id_material を持たず断面が鋼種（strength_main）を持つファイルで、
+    /// 断面の材料を部材へ伝播する（材料名で突き合わせ）。
+    #[test]
+    fn test_import_propagates_steel_grade_material_to_member() {
+        let xml = r#"<?xml version="1.0"?>
+<ST_BRIDGE version="2.0.0"><StbModel>
+  <StbNodes>
+    <StbNode id="0" X="0" Y="0" Z="0"/>
+    <StbNode id="1" X="0" Y="0" Z="3000"/>
+  </StbNodes>
+  <StbMaterials><StbMaterial id="0" name="SN400B" young="205000" poisson="0.3" density="0"/></StbMaterials>
+  <StbSections>
+    <StbSecColumn_S id="0" name="C"><StbSecSteelFigureColumn_S><StbSecSteelColumn_S_Same shape="H1" strength_main="SN400B"/></StbSecSteelFigureColumn_S></StbSecColumn_S>
+    <StbSecSteel><StbSecRoll-H name="H1" type="H" A="300" B="150" t1="6.5" t2="9" r="0"/></StbSecSteel>
+  </StbSections>
+  <StbMembers><StbColumn id="0" id_node_bottom="0" id_node_top="1" id_section="0"/></StbMembers>
+</StbModel></ST_BRIDGE>"#;
+        let m = import_stbridge(xml).expect("import");
+        assert!(m.validate().is_ok(), "{:?}", m.validate());
+        assert_eq!(
+            m.elements[0].material,
+            Some(MaterialId(0)),
+            "部材が id_material を持たなくても断面の鋼種から材料が伝播する"
+        );
+    }
+
+    /// 実 STB 相当: RC 断面の id_material を（id_material 無しの）部材へ伝播する。
+    #[test]
+    fn test_import_propagates_rc_material_to_member() {
+        let xml = r#"<?xml version="1.0"?>
+<ST_BRIDGE version="2.0.0"><StbModel>
+  <StbNodes>
+    <StbNode id="0" X="0" Y="0" Z="0"/>
+    <StbNode id="1" X="0" Y="0" Z="3000"/>
+  </StbNodes>
+  <StbMaterials><StbMaterial id="5" name="Fc24" young="21000" poisson="0.2" density="0"/></StbMaterials>
+  <StbSections>
+    <StbSecColumn_RC id="0" name="C" id_material="5"><StbSecFigureColumn_RC><StbSecColumn_RC_Rect width_X="500" width_Y="500"/></StbSecFigureColumn_RC></StbSecColumn_RC>
+  </StbSections>
+  <StbMembers><StbColumn id="0" id_node_bottom="0" id_node_top="1" id_section="0"/></StbMembers>
+</StbModel></ST_BRIDGE>"#;
+        let m = import_stbridge(xml).expect("import");
+        assert!(m.validate().is_ok(), "{:?}", m.validate());
+        // 材料 id=5 は正規化で index 0 になる。
+        assert_eq!(
+            m.elements[0].material,
+            Some(MaterialId(0)),
+            "断面の id_material が部材へ伝播する"
+        );
+    }
 }

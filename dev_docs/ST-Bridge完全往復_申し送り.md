@@ -86,8 +86,13 @@ RcRect / RcCircle / SrcRect / CftBox / CftPipe / RcWall`。
    内蔵鉄骨・鋼種とも完全一致で往復（テスト済み）。
    - 残課題: CFT 梁（ST-Bridge に定義が無い）、SRC 円形・充腹/非充腹の別、実 STB の配筋
      スキーマ準拠（③-1 と同様）。
-3. **材料参照の往復**: 断面と材料の関連（鋼断面の `strength_main`、RC の `id_material`）を
-   ST-Bridge の形で書く／読む。現状 import は断面へ材料を結び付けていない。
+3. **材料参照の往復**: ✅ **実装済み**（本 PR）。ST-Bridge は材料を断面側に持つため、
+   Standard 書き出しで断面要素へ材料を付す（鋼は形鋼参照の `strength_main`＝材料名、
+   RC/CFT/SRC は要素の `id_material`＝材料 id。断面の代表材料は最初に参照する部材の材料）。
+   import は、部材が `id_material` を持たない（実 STB 相当の）場合に断面の材料を部材へ伝播する
+   （数値 id は id 正規化で、鋼種名は同名材料へ突き合わせ）。
+   - 残: 材料の種別（鋼/コンクリ/鉄筋）区別や `StbCommon` 配下への配置（バケット2＋③-5）。
+     RC の主筋材料（`id_material_bar`）は未対応（コンクリート材料のみ）。
 4. **ブレース・壁・スラブ**: ブレースは ✅ **実装済み**（本 PR）。`ElementKind::Brace`
    （`tension_only` 含む）を `StbBrace` として往復（Raw/Standard 両モード。斜材の断面参照は
    柱/梁いずれの役割マップからも解決、取り込み時は両端ピンを既定）。`StbPost`（間柱）は
