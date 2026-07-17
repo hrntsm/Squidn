@@ -627,6 +627,45 @@ mod tests {
         assert_eq!(back.sections[0].area, m.sections[0].area);
     }
 
+    /// 他社ファイルでよくある 1 始まり・非連番の id（node/material/section/member）を
+    /// 0 始まり連番へ正規化し、参照を張り替えて検証を通す。
+    #[test]
+    fn test_import_normalizes_noncontiguous_ids() {
+        let xml = r#"<?xml version="1.0"?>
+<ST_BRIDGE version="2.0.0"><StbModel>
+  <StbNodes>
+    <StbNode id="11" X="0" Y="0" Z="0"/>
+    <StbNode id="12" X="0" Y="0" Z="3000"/>
+  </StbNodes>
+  <StbMaterials><StbMaterial id="5" name="SN400B" young="205000" poisson="0.3" density="0"/></StbMaterials>
+  <StbSections>
+    <StbSecColumn_S id="9" name="C1"><StbSecSteelFigureColumn_S><StbSecSteelColumn_S_Same shape="H1"/></StbSecSteelFigureColumn_S></StbSecColumn_S>
+    <StbSecSteel><StbSecRoll-H name="H1" type="H" A="300" B="150" t1="6.5" t2="9" r="0"/></StbSecSteel>
+  </StbSections>
+  <StbMembers><StbColumn id="7" id_node_bottom="11" id_node_top="12" id_section="9" id_material="5" rx="0" ry="1" rz="0"/></StbMembers>
+</StbModel></ST_BRIDGE>"#;
+        let m = import_stbridge(xml).expect("import");
+        assert!(
+            m.validate().is_ok(),
+            "非連番 id を正規化して検証を通る: {:?}",
+            m.validate()
+        );
+        assert_eq!(m.nodes.len(), 2);
+        assert_eq!(m.nodes[0].id, NodeId(0));
+        assert_eq!(m.nodes[1].id, NodeId(1));
+        assert_eq!(m.materials[0].id, MaterialId(0));
+        assert_eq!(m.sections[0].id, SectionId(0));
+        assert_eq!(m.elements[0].id, ElemId(0));
+        // 参照が正規化後の index に張り替わっている。
+        assert_eq!(m.elements[0].nodes.as_slice(), &[NodeId(0), NodeId(1)]);
+        assert_eq!(m.elements[0].section, Some(SectionId(0)));
+        assert_eq!(m.elements[0].material, Some(MaterialId(0)));
+        assert!(matches!(
+            m.sections[0].shape,
+            Some(SectionShape::SteelH { .. })
+        ));
+    }
+
     /// ST-Bridge 標準の属性名（大文字 X/Y/Z 座標）の節点も読める。
     #[test]
     fn test_import_accepts_uppercase_coordinate_attrs() {

@@ -44,14 +44,45 @@ enum PendingSecKind {
     SteelRef(Option<String>),
 }
 
-/// 取り込み途中の部材（断面 id の再割当て前）。
+/// 取り込み途中の部材（id 正規化前。参照はすべて file id）。
 struct PendingMember {
-    id: u32,
     n_i: u32,
     n_j: u32,
     section: Option<u32>,
     material: Option<u32>,
     ref_vec: [f64; 3],
+}
+
+/// 取り込み途中の節点（id 正規化前）。
+struct RawNode {
+    file_id: u32,
+    coord: [f64; 3],
+    story: Option<u32>,
+}
+
+/// 取り込み途中の層（id 正規化前）。
+struct RawStory {
+    file_id: u32,
+    name: String,
+    elevation: f64,
+}
+
+/// 取り込み途中の材料（id 正規化前）。
+struct RawMaterial {
+    file_id: u32,
+    name: String,
+    young: f64,
+    poisson: f64,
+    density: f64,
+    shear: Option<f64>,
+    fc: Option<f64>,
+    fy: Option<f64>,
+}
+
+/// 取り込み途中の荷重ケース（節点参照は file id）。
+struct RawLoadCase {
+    name: String,
+    nodal: Vec<(u32, [f64; 6])>,
 }
 
 /// 現在パース中の標準断面要素（子の図形要素を集める）。
@@ -77,11 +108,14 @@ pub fn import_stbridge(xml: &str) -> Result<Model, StbError> {
     let mut reader = Reader::from_str(xml);
     reader.config_mut().trim_text(true);
 
-    let mut model = Model::default();
-    let mut load_cases: Vec<LoadCase> = Vec::new();
     let mut version_ok = false;
 
-    // 断面・部材・形鋼ライブラリは全パース後にまとめて解決する。
+    // 全要素を一旦 file id 付きの中間表現へ集め、パース後に id を 0 始まり連番へ
+    // 正規化して参照を張り替える（他社ファイルの 1 始まり・歯抜け id に対応）。
+    let mut raw_nodes: Vec<RawNode> = Vec::new();
+    let mut raw_stories: Vec<RawStory> = Vec::new();
+    let mut raw_materials: Vec<RawMaterial> = Vec::new();
+    let mut raw_load_cases: Vec<RawLoadCase> = Vec::new();
     let mut pending_secs: Vec<PendingSec> = Vec::new();
     let mut pending_members: Vec<PendingMember> = Vec::new();
     let mut steel_lib: HashMap<String, SectionShape> = HashMap::new();
@@ -107,38 +141,30 @@ pub fn import_stbridge(xml: &str) -> Result<Model, StbError> {
                     }
                     "StbNode" => {
                         let story = match get_i64(&a, "story") {
-                            Some(s) if s >= 0 => Some(StoryId(s as u32)),
+                            Some(s) if s >= 0 => Some(s as u32),
                             _ => None,
                         };
-                        model.nodes.push(Node {
-                            id: NodeId(get_u32(&a, "id")?),
+                        raw_nodes.push(RawNode {
+                            file_id: get_u32(&a, "id")?,
                             // 座標属性は Squid-N 方言（小文字）と ST-Bridge 標準（大文字）の双方を許容。
                             coord: [
                                 get_f64_any(&a, &["x", "X"])?,
                                 get_f64_any(&a, &["y", "Y"])?,
                                 get_f64_any(&a, &["z", "Z"])?,
                             ],
-                            restraint: squid_n_core::dof::Dof6Mask::FREE,
-                            mass: None,
                             story,
                         });
                     }
                     "StbStory" => {
-                        model.stories.push(Story {
-                            level_kind: Default::default(),
-                            structure: Default::default(),
-                            id: StoryId(get_u32(&a, "id")?),
+                        raw_stories.push(RawStory {
+                            file_id: get_u32(&a, "id")?,
                             name: a.get("name").cloned().unwrap_or_default(),
                             elevation: get_f64_any(&a, &["height", "Z"])?,
-                            node_ids: vec![],
-                            diaphragms: vec![],
-                            seismic_weight: None,
                         });
                     }
                     "StbMaterial" => {
-                        model.materials.push(Material {
-                            concrete_class: Default::default(),
-                            id: MaterialId(get_u32(&a, "id")?),
+                        raw_materials.push(RawMaterial {
+                            file_id: get_u32(&a, "id")?,
                             name: a.get("name").cloned().unwrap_or_default(),
                             young: get_f64(&a, "young")?,
                             poisson: get_f64(&a, "poisson")?,
@@ -249,28 +275,23 @@ pub fn import_stbridge(xml: &str) -> Result<Model, StbError> {
                         pending_members.push(make_member(&a, st, en)?);
                     }
                     "StbLoadCase" => {
-                        load_cases.push(LoadCase {
-                            kind: Default::default(),
-                            id: LoadCaseId(get_u32(&a, "id")?),
+                        raw_load_cases.push(RawLoadCase {
                             name: a.get("name").cloned().unwrap_or_default(),
                             nodal: vec![],
-                            member: vec![],
                         });
                     }
                     "StbNodalLoad" => {
-                        let nl = NodalLoad {
-                            node: NodeId(get_u32(&a, "id_node")?),
-                            values: [
-                                get_f64(&a, "fx").unwrap_or(0.0),
-                                get_f64(&a, "fy").unwrap_or(0.0),
-                                get_f64(&a, "fz").unwrap_or(0.0),
-                                get_f64(&a, "mx").unwrap_or(0.0),
-                                get_f64(&a, "my").unwrap_or(0.0),
-                                get_f64(&a, "mz").unwrap_or(0.0),
-                            ],
-                        };
-                        if let Some(lc) = load_cases.last_mut() {
-                            lc.nodal.push(nl);
+                        let node = get_u32(&a, "id_node")?;
+                        let values = [
+                            get_f64(&a, "fx").unwrap_or(0.0),
+                            get_f64(&a, "fy").unwrap_or(0.0),
+                            get_f64(&a, "fz").unwrap_or(0.0),
+                            get_f64(&a, "mx").unwrap_or(0.0),
+                            get_f64(&a, "my").unwrap_or(0.0),
+                            get_f64(&a, "mz").unwrap_or(0.0),
+                        ];
+                        if let Some(lc) = raw_load_cases.last_mut() {
+                            lc.nodal.push((node, values));
                         } else {
                             return Err(StbError::Parse("StbNodalLoad outside StbLoadCase".into()));
                         }
@@ -323,21 +344,81 @@ pub fn import_stbridge(xml: &str) -> Result<Model, StbError> {
         ));
     }
 
+    let mut model = Model::default();
+
+    // 各 id 空間を file id 昇順の 0 始まり連番へ正規化する（内部モデルの不変条件
+    // 「配列添字 == id.index()」を満たすため）。返り値は file id → 新 index。
+    let node_index = build_index(raw_nodes.iter().map(|n| n.file_id));
+    let story_index = build_index(raw_stories.iter().map(|s| s.file_id));
+    let material_index = build_index(raw_materials.iter().map(|m| m.file_id));
+
+    raw_stories.sort_by_key(|s| s.file_id);
+    for s in raw_stories {
+        model.stories.push(Story {
+            level_kind: Default::default(),
+            structure: Default::default(),
+            id: StoryId(story_index[&s.file_id]),
+            name: s.name,
+            elevation: s.elevation,
+            node_ids: vec![],
+            diaphragms: vec![],
+            seismic_weight: None,
+        });
+    }
+
+    raw_nodes.sort_by_key(|n| n.file_id);
+    for n in raw_nodes {
+        model.nodes.push(Node {
+            id: NodeId(node_index[&n.file_id]),
+            coord: n.coord,
+            restraint: squid_n_core::dof::Dof6Mask::FREE,
+            mass: None,
+            story: n
+                .story
+                .and_then(|s| story_index.get(&s).copied())
+                .map(StoryId),
+        });
+    }
+
+    raw_materials.sort_by_key(|m| m.file_id);
+    for m in raw_materials {
+        model.materials.push(Material {
+            concrete_class: Default::default(),
+            id: MaterialId(material_index[&m.file_id]),
+            name: m.name,
+            young: m.young,
+            poisson: m.poisson,
+            density: m.density,
+            shear: m.shear,
+            fc: m.fc,
+            fy: m.fy,
+        });
+    }
+
     // 断面 id を整列・連番へ再割当てし、形鋼名を解決してモデルへ格納する。
     let section_index = build_sections(&mut model, pending_secs, &steel_lib);
 
-    // 部材を格納する（断面参照は再割当て後の index に張り替える）。
+    // 部材を格納する（節点・断面・材料の参照を正規化後の index に張り替える）。
+    // 参照先が存在しない部材はスキップし、断面/材料の欠落は None にしてダングリングを防ぐ。
     for m in pending_members {
+        let (Some(&ni), Some(&nj)) = (node_index.get(&m.n_i), node_index.get(&m.n_j)) else {
+            continue;
+        };
         let section = m
             .section
             .and_then(|fid| section_index.get(&fid).copied())
             .map(SectionId);
+        let material = m
+            .material
+            .and_then(|fid| material_index.get(&fid).copied())
+            .map(MaterialId);
+        let id = ElemId(model.elements.len() as u32);
         model.elements.push(ElementData {
-            id: ElemId(m.id),
+            id,
             kind: ElementKind::Beam,
-            nodes: smallvec::smallvec![NodeId(m.n_i), NodeId(m.n_j)],
+            nodes: smallvec::smallvec![NodeId(ni), NodeId(nj)],
             section,
-            material: m.material.map(MaterialId),
+            material,
             local_axis: LocalAxis {
                 ref_vector: m.ref_vec,
             },
@@ -349,8 +430,40 @@ pub fn import_stbridge(xml: &str) -> Result<Model, StbError> {
         });
     }
 
-    model.load_cases = load_cases;
+    // 荷重ケース（節点参照を正規化。存在しない節点への荷重は破棄）。
+    for (i, lc) in raw_load_cases.into_iter().enumerate() {
+        let nodal = lc
+            .nodal
+            .into_iter()
+            .filter_map(|(fid, values)| {
+                node_index.get(&fid).map(|&ni| NodalLoad {
+                    node: NodeId(ni),
+                    values,
+                })
+            })
+            .collect();
+        model.load_cases.push(LoadCase {
+            kind: Default::default(),
+            id: LoadCaseId(i as u32),
+            name: lc.name,
+            nodal,
+            member: vec![],
+        });
+    }
+
     Ok(model)
+}
+
+/// file id の集合を昇順・重複排除して 0 始まり連番へ写像する（file id → 新 index）。
+fn build_index(ids: impl Iterator<Item = u32>) -> HashMap<u32, u32> {
+    let mut sorted: Vec<u32> = ids.collect();
+    sorted.sort_unstable();
+    sorted.dedup();
+    sorted
+        .into_iter()
+        .enumerate()
+        .map(|(i, id)| (id, i as u32))
+        .collect()
 }
 
 /// 保留していた断面を id 昇順に整列・連番へ再割当てし、形鋼名を解決して
@@ -502,7 +615,6 @@ fn make_member(a: &HashMap<String, String>, n_i: u32, n_j: u32) -> Result<Pendin
         get_f64(a, "rz").unwrap_or(1.0),
     ];
     Ok(PendingMember {
-        id: get_u32(a, "id")?,
         n_i,
         n_j,
         section,
