@@ -88,8 +88,13 @@ RcRect / RcCircle / SrcRect / CftBox / CftPipe / RcWall`。
      スキーマ準拠（③-1 と同様）。
 3. **材料参照の往復**: 断面と材料の関連（鋼断面の `strength_main`、RC の `id_material`）を
    ST-Bridge の形で書く／読む。現状 import は断面へ材料を結び付けていない。
-4. **ブレース・壁・スラブ**: `StbBrace_S` ↔ `ElementKind::Brace`、`StbWall_RC` ↔ 壁、
-   `StbSlab_RC` ↔ `slabs`。モデルは持っているのでマッピングのみ。
+4. **ブレース・壁・スラブ**: ブレースは ✅ **実装済み**（本 PR）。`ElementKind::Brace`
+   （`tension_only` 含む）を `StbBrace` として往復（Raw/Standard 両モード。斜材の断面参照は
+   柱/梁いずれの役割マップからも解決、取り込み時は両端ピンを既定）。`StbPost`（間柱）は
+   梁として取り込む。
+   - 残: **壁 `StbWall_RC` ↔ 壁要素**、**スラブ `StbSlab_RC` ↔ `slabs`**。これらは節点の
+     多角形（面）で定義され、`StbNodeIdList` や開口の表現が要るため、ブレースより大きい。
+     モデルは壁/スラブを持つのでパーサ側の面要素シリアライズが主作業。
 5. **実 ST-Bridge 構造への準拠**: 現状は自社方言（`StbMaterials` を `StbModel` 直下、
    `StbNode` に `story` 属性、`StbSecRaw` 独自要素）。他社完全互換には
    標準構造（材料は `StbCommon` 配下、node-story は `StbStory` の `StbNodeIdList` 経由、

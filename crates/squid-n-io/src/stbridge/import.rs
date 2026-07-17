@@ -55,8 +55,15 @@ enum PendingSecKind {
     },
 }
 
+/// 取り込み途中の部材の種別。
+enum PendingMemberKind {
+    Beam,
+    Brace { tension_only: bool },
+}
+
 /// 取り込み途中の部材（id 正規化前。参照はすべて file id）。
 struct PendingMember {
+    kind: PendingMemberKind,
     n_i: u32,
     n_j: u32,
     section: Option<u32>,
@@ -362,12 +369,26 @@ pub fn import_stbridge(xml: &str) -> Result<Model, StbError> {
                     "StbColumn" => {
                         let bot = get_u32(&a, "id_node_bottom")?;
                         let top = get_u32(&a, "id_node_top")?;
-                        pending_members.push(make_member(&a, bot, top)?);
+                        pending_members.push(make_member(&a, bot, top, PendingMemberKind::Beam)?);
                     }
-                    "StbGirder" | "StbBeam" => {
+                    "StbGirder" | "StbBeam" | "StbPost" => {
                         let st = get_u32(&a, "id_node_start")?;
                         let en = get_u32(&a, "id_node_end")?;
-                        pending_members.push(make_member(&a, st, en)?);
+                        pending_members.push(make_member(&a, st, en, PendingMemberKind::Beam)?);
+                    }
+                    "StbBrace" => {
+                        let st = get_u32(&a, "id_node_start")?;
+                        let en = get_u32(&a, "id_node_end")?;
+                        let tension_only = a
+                            .get("tension_only")
+                            .map(|v| v == "true" || v == "1")
+                            .unwrap_or(false);
+                        pending_members.push(make_member(
+                            &a,
+                            st,
+                            en,
+                            PendingMemberKind::Brace { tension_only },
+                        )?);
                     }
                     "StbLoadCase" => {
                         raw_load_cases.push(RawLoadCase {
@@ -552,16 +573,28 @@ pub fn import_stbridge(xml: &str) -> Result<Model, StbError> {
             .and_then(|fid| material_index.get(&fid).copied())
             .map(MaterialId);
         let id = ElemId(model.elements.len() as u32);
+        // ブレースは軸材なので両端ピン、梁・柱は既定で剛接合とする（ST-Bridge は端部
+        // 接合条件を持たないため取り込み後の既定値）。
+        let (kind, end_cond) = match m.kind {
+            PendingMemberKind::Beam => (
+                ElementKind::Beam,
+                [EndCondition::Fixed, EndCondition::Fixed],
+            ),
+            PendingMemberKind::Brace { tension_only } => (
+                ElementKind::Brace { tension_only },
+                [EndCondition::Pinned, EndCondition::Pinned],
+            ),
+        };
         model.elements.push(ElementData {
             id,
-            kind: ElementKind::Beam,
+            kind,
             nodes: smallvec::smallvec![NodeId(ni), NodeId(nj)],
             section,
             material,
             local_axis: LocalAxis {
                 ref_vector: m.ref_vec,
             },
-            end_cond: [EndCondition::Fixed, EndCondition::Fixed],
+            end_cond,
             force_regime: ForceRegime::Auto,
             rigid_zone: Default::default(),
             plastic_zone: None,
@@ -902,7 +935,12 @@ fn parse_rebar(a: &HashMap<String, String>) -> RcRebar {
     }
 }
 
-fn make_member(a: &HashMap<String, String>, n_i: u32, n_j: u32) -> Result<PendingMember, StbError> {
+fn make_member(
+    a: &HashMap<String, String>,
+    n_i: u32,
+    n_j: u32,
+    kind: PendingMemberKind,
+) -> Result<PendingMember, StbError> {
     let section = match get_i64(a, "id_section") {
         Some(s) if s >= 0 => Some(s as u32),
         _ => None,
@@ -917,6 +955,7 @@ fn make_member(a: &HashMap<String, String>, n_i: u32, n_j: u32) -> Result<Pendin
         get_f64(a, "rz").unwrap_or(1.0),
     ];
     Ok(PendingMember {
+        kind,
         n_i,
         n_j,
         section,

@@ -14,7 +14,8 @@
 //!   真実とする方針）。BIM/他ソフト向けに標準要素で書き出す `Standard` モードは下記
 //!   「断面書き出しモード」を参照。import は `StbSecRaw` と標準断面要素（`StbSecColumn_S` 等）の
 //!   双方を読み取れる。
-//! - 床・ブレース・剛域・端部接合等の詳細。
+//! - **部材**は柱（鉛直）・大梁（水平）・ブレース（斜材、`StbBrace`）を往復する。
+//!   床（スラブ）・壁・剛域・端部接合等の詳細は未対応。
 //!
 //! 一次資料: ST-Bridge 公式スキーマ（XML 2.0 系）。要素・属性名はこれに準拠（subset）。
 //!
@@ -1069,5 +1070,54 @@ mod tests {
         let m = import_stbridge(xml).expect("import");
         assert_eq!(m.nodes.len(), 1);
         assert_eq!(m.nodes[0].coord, [1000.0, 2000.0, 3000.0]);
+    }
+
+    /// ブレース（斜材）が `StbBrace` として往復する（Raw / Standard 両モード）。
+    #[test]
+    fn test_roundtrip_brace() {
+        let mut m = frame_nodes();
+        let pipe = SectionShape::SteelPipe {
+            outer_dia: 100.0,
+            thick: 5.0,
+        };
+        m.sections.push(pipe.to_section(SectionId(0), "BR".into()));
+        // 節点0→3 の斜材（引張専用）。
+        m.elements.push(ElementData {
+            id: ElemId(0),
+            kind: ElementKind::Brace { tension_only: true },
+            nodes: smallvec![NodeId(0), NodeId(3)],
+            section: Some(SectionId(0)),
+            material: Some(MaterialId(0)),
+            local_axis: LocalAxis {
+                ref_vector: [0.0, 1.0, 0.0],
+            },
+            end_cond: [EndCondition::Pinned, EndCondition::Pinned],
+            force_regime: ForceRegime::Auto,
+            rigid_zone: Default::default(),
+            plastic_zone: None,
+            spring: None,
+        });
+
+        let raw_xml = export_stbridge(&m).unwrap();
+        assert!(
+            raw_xml.contains("<StbBrace "),
+            "ブレースは StbBrace で書き出される"
+        );
+        for xml in [
+            raw_xml,
+            export_stbridge_with(&m, SectionExportMode::Standard).unwrap(),
+        ] {
+            let back = import_stbridge(&xml).expect("import");
+            assert!(back.validate().is_ok(), "{:?}", back.validate());
+            assert_eq!(back.elements.len(), 1);
+            assert_eq!(
+                back.elements[0].kind,
+                ElementKind::Brace { tension_only: true },
+                "ブレース種別（tension_only 含む）が往復する"
+            );
+            assert_eq!(back.elements[0].nodes.as_slice(), &[NodeId(0), NodeId(3)]);
+            assert_eq!(back.elements[0].section, Some(SectionId(0)));
+            assert_eq!(back.elements[0].material, Some(MaterialId(0)));
+        }
     }
 }

@@ -86,44 +86,66 @@ pub fn export_stbridge_with(model: &Model, mode: SectionExportMode) -> Result<St
     s.push_str(&sections_body);
     s.push_str("    </StbSections>\n");
 
-    // 部材（柱＝鉛直／大梁＝水平）
+    // 部材（柱＝鉛直／大梁＝水平／ブレース＝斜材）
     s.push_str("    <StbMembers>\n");
     for e in &model.elements {
-        if e.kind != ElementKind::Beam || e.nodes.len() != 2 {
+        if e.nodes.len() != 2 {
             continue;
         }
         let n0 = &model.nodes[e.nodes[0].index()];
         let n1 = &model.nodes[e.nodes[1].index()];
-        let dz = (n1.coord[2] - n0.coord[2]).abs();
-        let dx = n1.coord[0] - n0.coord[0];
-        let dy = n1.coord[1] - n0.coord[1];
-        let len = (dx * dx + dy * dy + dz * dz).sqrt();
-        let is_col = len > 1e-12 && dz / len > 0.707;
-        // 断面 id は柱／梁で分割され得るため、役割ごとの張り替えマップを引く
-        // （見つからなければ内部 id をそのまま使う）。
-        let role_map = if is_col { &col_map } else { &beam_map };
-        let sec = e
-            .section
-            .map(|s| role_map.get(&s.0).copied().unwrap_or(s.0) as i64)
-            .unwrap_or(-1);
         let mat = e.material.map(|m| m.0 as i64).unwrap_or(-1);
         let r = e.local_axis.ref_vector;
-        if is_col {
-            // 下端→上端で揃える
-            let (bot, top) = if n0.coord[2] <= n1.coord[2] {
-                (e.nodes[0], e.nodes[1])
-            } else {
-                (e.nodes[1], e.nodes[0])
-            };
-            s.push_str(&format!(
-                "      <StbColumn id=\"{}\" id_node_bottom=\"{}\" id_node_top=\"{}\" id_section=\"{}\" id_material=\"{}\" rx=\"{}\" ry=\"{}\" rz=\"{}\"/>\n",
-                e.id.0, bot.0, top.0, sec, mat, fmt(r[0]), fmt(r[1]), fmt(r[2])
-            ));
-        } else {
-            s.push_str(&format!(
-                "      <StbGirder id=\"{}\" id_node_start=\"{}\" id_node_end=\"{}\" id_section=\"{}\" id_material=\"{}\" rx=\"{}\" ry=\"{}\" rz=\"{}\"/>\n",
-                e.id.0, e.nodes[0].0, e.nodes[1].0, sec, mat, fmt(r[0]), fmt(r[1]), fmt(r[2])
-            ));
+        match e.kind {
+            ElementKind::Beam => {
+                let dz = (n1.coord[2] - n0.coord[2]).abs();
+                let dx = n1.coord[0] - n0.coord[0];
+                let dy = n1.coord[1] - n0.coord[1];
+                let len = (dx * dx + dy * dy + dz * dz).sqrt();
+                let is_col = len > 1e-12 && dz / len > 0.707;
+                // 断面 id は柱／梁で分割され得るため、役割ごとの張り替えマップを引く
+                // （見つからなければ内部 id をそのまま使う）。
+                let role_map = if is_col { &col_map } else { &beam_map };
+                let sec = e
+                    .section
+                    .map(|s| role_map.get(&s.0).copied().unwrap_or(s.0) as i64)
+                    .unwrap_or(-1);
+                if is_col {
+                    // 下端→上端で揃える
+                    let (bot, top) = if n0.coord[2] <= n1.coord[2] {
+                        (e.nodes[0], e.nodes[1])
+                    } else {
+                        (e.nodes[1], e.nodes[0])
+                    };
+                    s.push_str(&format!(
+                        "      <StbColumn id=\"{}\" id_node_bottom=\"{}\" id_node_top=\"{}\" id_section=\"{}\" id_material=\"{}\" rx=\"{}\" ry=\"{}\" rz=\"{}\"/>\n",
+                        e.id.0, bot.0, top.0, sec, mat, fmt(r[0]), fmt(r[1]), fmt(r[2])
+                    ));
+                } else {
+                    s.push_str(&format!(
+                        "      <StbGirder id=\"{}\" id_node_start=\"{}\" id_node_end=\"{}\" id_section=\"{}\" id_material=\"{}\" rx=\"{}\" ry=\"{}\" rz=\"{}\"/>\n",
+                        e.id.0, e.nodes[0].0, e.nodes[1].0, sec, mat, fmt(r[0]), fmt(r[1]), fmt(r[2])
+                    ));
+                }
+            }
+            ElementKind::Brace { tension_only } => {
+                // ブレースの断面は柱/梁いずれの役割マップにも載り得るため両方を引く。
+                let sec = e
+                    .section
+                    .map(|s| {
+                        col_map
+                            .get(&s.0)
+                            .or_else(|| beam_map.get(&s.0))
+                            .copied()
+                            .unwrap_or(s.0) as i64
+                    })
+                    .unwrap_or(-1);
+                s.push_str(&format!(
+                    "      <StbBrace id=\"{}\" id_node_start=\"{}\" id_node_end=\"{}\" id_section=\"{}\" id_material=\"{}\" tension_only=\"{}\" rx=\"{}\" ry=\"{}\" rz=\"{}\"/>\n",
+                    e.id.0, e.nodes[0].0, e.nodes[1].0, sec, mat, tension_only, fmt(r[0]), fmt(r[1]), fmt(r[2])
+                ));
+            }
+            _ => continue,
         }
     }
     s.push_str("    </StbMembers>\n");
