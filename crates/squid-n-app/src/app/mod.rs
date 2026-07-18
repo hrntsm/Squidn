@@ -635,6 +635,12 @@ pub const SLAB_AUTO_LOAD_CASE_NAME: &str = "床荷重(自動)";
 /// （長期骨組解析用。令85条1項）。
 pub const SLAB_LIVE_AUTO_LOAD_CASE_NAME: &str = "床積載(自動)";
 
+/// `sync_slab_loads_action` が地震用積載荷重（LL・地震用）の同期先とする専用
+/// 荷重ケース名（kind=LiveSeismic）。スラブ用途から令別表第1 の**地震用**積載を
+/// 分配する。地震用重量の集計（`gravity_cases_for_seismic_weight` が
+/// LiveSeismic を優先採用）に用いる（令85条1項・令88条）。
+pub const SLAB_LIVE_SEISMIC_AUTO_LOAD_CASE_NAME: &str = "床地震用積載(自動)";
+
 /// `sync_self_weight_action` が同期先とする専用荷重ケース名。
 /// `squid_n_load::self_weight` の定数を単一ソースオブトゥルースとして再公開する。
 pub const SELF_WEIGHT_AUTO_LOAD_CASE_NAME: &str =

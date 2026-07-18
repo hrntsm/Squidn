@@ -1804,6 +1804,18 @@ impl App {
             ll_nodal,
             ll_member,
         );
+
+        // LL（積載荷重・地震用）: スラブ用途から令別表第1 の地震用積載を分配。
+        // gravity_cases_for_seismic_weight が LiveSeismic を優先採用するため、
+        // 地震用重量にはこの（骨組用より小さい）地震用値が算入される（令85条1項）。
+        let ls_beam_loads = self.slab_beam_loads(|slab| slab.live_intensity(LoadPurpose::Seismic));
+        let (ls_nodal, ls_member) = self.slab_load_case_content(&ls_beam_loads);
+        self.sync_one_slab_case(
+            SLAB_LIVE_SEISMIC_AUTO_LOAD_CASE_NAME,
+            LoadCaseKind::LiveSeismic,
+            ls_nodal,
+            ls_member,
+        );
     }
 
     /// 名前付き荷重ケースを指定の `kind`・内容へ冪等に同期する

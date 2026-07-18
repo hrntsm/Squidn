@@ -2211,6 +2211,82 @@ fn test_sync_slab_loads_action_separates_dead_and_live() {
     );
 }
 
+/// 床 Phase A-3: 用途を設定したスラブは地震用積載（LiveSeismic）ケースも同期され、
+/// 地震用重量の重力ケース選択（`gravity_cases_for_seismic_weight`）が
+/// 骨組用 Live ではなく地震用 LiveSeismic を採用することを確認する
+/// （令85条1項の地震用値〔事務室=800 N/m²〕を地震用重量に用いる）。
+#[test]
+fn test_sync_slab_loads_action_seismic_live_case() {
+    use squid_n_core::model::{LoadCaseKind, MemberLoadKind, SlabUsage};
+
+    let mut model = make_square_slab_test_model();
+    model.slabs[0].usage = Some(SlabUsage::Office);
+    model
+        .validate()
+        .expect("テストモデルは validate を通るはず");
+    let mut app = App {
+        model,
+        ..App::default()
+    };
+    app.sync_slab_loads_action();
+
+    let sum_vertical = |name: &str| -> f64 {
+        app.model
+            .load_cases
+            .iter()
+            .find(|lc| lc.name == name)
+            .map(|c| {
+                c.member
+                    .iter()
+                    .map(|m| match m.kind {
+                        MemberLoadKind::Distributed { a, b, w1, w2 } => (w1 + w2) / 2.0 * (b - a),
+                        MemberLoadKind::Point { p, .. } => p,
+                    })
+                    .sum()
+            })
+            .unwrap_or(0.0)
+    };
+
+    let area = 4000.0 * 4000.0;
+    // 地震用積載ケース: 地震用値 800 N/m² = 8e-4 N/mm²。
+    let ls = app
+        .model
+        .load_cases
+        .iter()
+        .find(|lc| lc.name == SLAB_LIVE_SEISMIC_AUTO_LOAD_CASE_NAME)
+        .expect("床地震用積載(自動)ケースが作られるはず");
+    assert_eq!(ls.kind, LoadCaseKind::LiveSeismic);
+    assert!((sum_vertical(SLAB_LIVE_SEISMIC_AUTO_LOAD_CASE_NAME) - 8e-4 * area).abs() < 1e-6);
+
+    // 地震用重量の重力ケース: DL(床荷重) と LiveSeismic(床地震用積載) を含み、
+    // 骨組用 Live(床積載) は含まない（LiveSeismic 優先）。
+    let dl_id = app
+        .model
+        .load_cases
+        .iter()
+        .find(|lc| lc.name == SLAB_AUTO_LOAD_CASE_NAME)
+        .unwrap()
+        .id;
+    let live_id = app
+        .model
+        .load_cases
+        .iter()
+        .find(|lc| lc.name == SLAB_LIVE_AUTO_LOAD_CASE_NAME)
+        .unwrap()
+        .id;
+    let ls_id = ls.id;
+    let gravity = gravity_cases_for_seismic_weight(&app.model);
+    assert!(gravity.contains(&dl_id), "DL(床荷重)は地震用重量に含むはず");
+    assert!(
+        gravity.contains(&ls_id),
+        "LiveSeismic(床地震用積載)は地震用重量に含むはず"
+    );
+    assert!(
+        !gravity.contains(&live_id),
+        "骨組用 Live(床積載)は地震用重量に含めないはず（LiveSeismic 優先）"
+    );
+}
+
 /// レビュー §1.7: 地震用重量に使う荷重ケースの選択が、並び順ではなく
 /// `LoadCaseKind` に基づくことを確認する（Dead+LiveSeismic 優先、
 /// LiveSeismic が無ければ Dead+Live、種別が一つも設定されていなければ
