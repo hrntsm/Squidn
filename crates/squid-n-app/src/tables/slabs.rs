@@ -479,6 +479,46 @@ fn joists_section(ui: &mut egui::Ui, app: &mut App) {
         }
     }
 
+    // 小梁の実部材化（実 Beam 要素を生成し、応力解析・断面検定の対象にする）。
+    if !joists.is_empty() {
+        // 実 Beam が未生成の小梁本数を数える。
+        let beam_exists = |a: NodeId, b: NodeId| -> bool {
+            app.model.elements.iter().any(|e| {
+                e.kind == squid_n_core::model::ElementKind::Beam
+                    && e.nodes.len() == 2
+                    && ((e.nodes[0] == a && e.nodes[1] == b)
+                        || (e.nodes[0] == b && e.nodes[1] == a))
+            })
+        };
+        let unmaterialized = joists
+            .iter()
+            .filter(|j| j.support[0] != j.support[1] && !beam_exists(j.support[0], j.support[1]))
+            .count();
+        ui.horizontal(|ui| {
+            if ui
+                .add_enabled(
+                    unmaterialized > 0,
+                    egui::Button::new("小梁を実部材化"),
+                )
+                .on_hover_text(
+                    "各小梁の支持2節点に実 Beam 要素を生成します。実部材化した小梁には床荷重が等分布荷重として載り、応力解析・断面検定の対象になります。",
+                )
+                .clicked()
+            {
+                app.undo.run(
+                    &mut app.model,
+                    Box::new(squid_n_edit::MaterializeSlabJoists { slab: target }),
+                );
+                app.staleness.mark_edited();
+            }
+            ui.label(if unmaterialized > 0 {
+                format!("未実部材化: {unmaterialized}本")
+            } else {
+                "すべて実部材化済み".to_string()
+            });
+        });
+    }
+
     // 小梁の追加フォーム。
     let node_ids: Vec<NodeId> = app.model.nodes.iter().map(|n| n.id).collect();
     ui.horizontal(|ui| {

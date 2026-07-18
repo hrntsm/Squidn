@@ -39,10 +39,15 @@ pub struct Cmq {
 ///   境界辺数 4 を必ず超えるこの値により誤って辺荷重として処理されることを防ぐ）。
 ///   `squid-n-app::refresh_beam_loads` は現状 `target` を解釈しないため、`Node` 荷重を
 ///   実際に構造モデルへ反映する対応は後続タスク（app 側）で行う。
+/// - `Span([n0, n1])`: 実部材化された小梁（`n0`↔`n1` を両端に持つ実 `Beam` 要素）への
+///   等分布荷重。小梁が実部材として存在する場合、点反力ではなくこの分布荷重を小梁自身へ
+///   載せ、小梁が FEM で支持へ伝達する（`elem` は番兵 `ElemId(u32::MAX)`。app 側が
+///   節点対から実 `ElemId` を解決する）。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LoadTarget {
     Edge(usize),
     Node(NodeId),
+    Span([NodeId; 2]),
 }
 
 #[derive(Clone, Copy, Debug)]

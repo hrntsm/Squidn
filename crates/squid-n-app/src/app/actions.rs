@@ -1649,6 +1649,19 @@ impl App {
             if n < 3 {
                 continue;
             }
+            // 節点対 (n0,n1) を両端に持つ実 Beam 要素の ElemId を引く（ノード順不問）。
+            let find_beam = |n0: NodeId, n1: NodeId| -> Option<ElemId> {
+                self.model
+                    .elements
+                    .iter()
+                    .find(|e| {
+                        e.kind == squid_n_core::model::ElementKind::Beam
+                            && e.nodes.len() == 2
+                            && ((e.nodes[0] == n0 && e.nodes[1] == n1)
+                                || (e.nodes[0] == n1 && e.nodes[1] == n0))
+                    })
+                    .map(|e| e.id)
+            };
             let w = w_of(slab);
             for mut bl in squid_n_load::floor::distribute_slab_w(&self.model, slab, w) {
                 match bl.target {
@@ -1661,14 +1674,18 @@ impl App {
                         }
                         let n0 = slab.boundary[k];
                         let n1 = slab.boundary[(k + 1) % n];
-                        let found = self.model.elements.iter().find(|e| {
-                            e.kind == squid_n_core::model::ElementKind::Beam
-                                && e.nodes.len() == 2
-                                && ((e.nodes[0] == n0 && e.nodes[1] == n1)
-                                    || (e.nodes[0] == n1 && e.nodes[1] == n0))
-                        });
-                        let Some(elem) = found else { continue };
-                        bl.elem = elem.id;
+                        let Some(elem) = find_beam(n0, n1) else {
+                            continue;
+                        };
+                        bl.elem = elem;
+                        beam_loads.push(bl);
+                    }
+                    // 実部材化された小梁: 節点対から実 Beam の ElemId を解決して載せる。
+                    squid_n_load::floor::LoadTarget::Span([n0, n1]) => {
+                        let Some(elem) = find_beam(n0, n1) else {
+                            continue;
+                        };
+                        bl.elem = elem;
                         beam_loads.push(bl);
                     }
                 }
@@ -1730,7 +1747,9 @@ impl App {
                         values: [0.0, 0.0, -p, 0.0, 0.0, 0.0],
                     });
                 }
-                LoadTarget::Edge(_) => {
+                // Edge（境界大梁）と Span（実部材化小梁）はいずれも実部材への
+                // 分布/集中荷重として同一に扱う（bl.elem に解決済みの ElemId が入る）。
+                LoadTarget::Edge(_) | LoadTarget::Span(_) => {
                     let Some(elem) = self.model.elements.iter().find(|e| e.id == bl.elem) else {
                         continue;
                     };

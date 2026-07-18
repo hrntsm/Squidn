@@ -4,12 +4,22 @@
 //! - [`distribute_one_way_dir`] — 一方向スラブの伝達方向指定に基づく分配
 //! - [`distribute_rect_with_joists`] — 小梁による二段階伝達（矩形スラブ）
 
-use squid_n_core::ids::ElemId;
-use squid_n_core::model::{DistributionMethod, Model, OneWayDir, Slab};
+use squid_n_core::ids::{ElemId, NodeId};
+use squid_n_core::model::{DistributionMethod, ElementKind, Model, OneWayDir, Slab};
 
 use super::fem::{fem_trapezoid, fem_triangle, fem_uniform};
 use super::geometry::{dist3, edge_len};
 use super::types::{push_edge, BeamLoad, Cmq, LoadShape, LoadTarget};
+
+/// 節点 `a`↔`b` を両端に持つ実 `Beam` 要素がモデルに存在するか
+/// （小梁が実部材化されているかの判定。ノード順は不問）。
+fn beam_between(model: &Model, a: NodeId, b: NodeId) -> bool {
+    model.elements.iter().any(|e| {
+        e.kind == ElementKind::Beam
+            && e.nodes.len() == 2
+            && ((e.nodes[0] == a && e.nodes[1] == b) || (e.nodes[0] == b && e.nodes[1] == a))
+    })
+}
 
 fn edge_dir2(coords: &[[f64; 3]], i: usize) -> [f64; 2] {
     let n = coords.len();
@@ -190,29 +200,42 @@ pub(crate) fn distribute_rect_with_joists(
             continue;
         };
         let l_joist = dist3(n0.coord, n1.coord);
-        let r = w * j.spacing * l_joist / 2.0;
-        loads.push(BeamLoad {
-            elem: ElemId(u32::MAX),
-            target: LoadTarget::Node(j.support[0]),
-            shape: LoadShape::Point { p: r, x: 0.0 },
-            cmq: Cmq {
-                c_i: 0.0,
-                c_j: 0.0,
-                q_i: r,
-                q_j: 0.0,
-            },
-        });
-        loads.push(BeamLoad {
-            elem: ElemId(u32::MAX),
-            target: LoadTarget::Node(j.support[1]),
-            shape: LoadShape::Point { p: r, x: 0.0 },
-            cmq: Cmq {
-                c_i: 0.0,
-                c_j: 0.0,
-                q_i: r,
-                q_j: 0.0,
-            },
-        });
+        if beam_between(model, j.support[0], j.support[1]) {
+            // 実部材化された小梁: トリビュタリ等分布荷重 w·spacing を小梁自身へ載せ、
+            // 小梁が FEM で両端支持へ伝達する（点反力は用いない＝二重計上しない）。
+            let w_udl = w * j.spacing;
+            loads.push(BeamLoad {
+                elem: ElemId(u32::MAX),
+                target: LoadTarget::Span([j.support[0], j.support[1]]),
+                shape: LoadShape::Uniform { w: w_udl },
+                cmq: fem_uniform(w_udl, l_joist),
+            });
+        } else {
+            // 仮想小梁: 単純梁反力 R=w·spacing·L/2 を両端節点へ集中荷重として伝達する。
+            let r = w * j.spacing * l_joist / 2.0;
+            loads.push(BeamLoad {
+                elem: ElemId(u32::MAX),
+                target: LoadTarget::Node(j.support[0]),
+                shape: LoadShape::Point { p: r, x: 0.0 },
+                cmq: Cmq {
+                    c_i: 0.0,
+                    c_j: 0.0,
+                    q_i: r,
+                    q_j: 0.0,
+                },
+            });
+            loads.push(BeamLoad {
+                elem: ElemId(u32::MAX),
+                target: LoadTarget::Node(j.support[1]),
+                shape: LoadShape::Point { p: r, x: 0.0 },
+                cmq: Cmq {
+                    c_i: 0.0,
+                    c_j: 0.0,
+                    q_i: r,
+                    q_j: 0.0,
+                },
+            });
+        }
         spacing_sum += j.spacing;
     }
 

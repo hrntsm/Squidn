@@ -311,6 +311,7 @@ fn test_polygon_pentagon_conservation() {
         match l.target {
             LoadTarget::Edge(e) => assert!(e < 5),
             LoadTarget::Node(_) => panic!("polygon path should not emit node targets"),
+            LoadTarget::Span(_) => panic!("polygon path should not emit span targets"),
         }
     }
 
@@ -490,6 +491,110 @@ fn test_joist_two_stage_transfer_conservation() {
             assert!((wl - expected_wl).abs() / expected_wl < 1e-9, "wl={}", wl);
         } else {
             panic!("expected uniform load");
+        }
+    }
+}
+
+/// 実部材化された小梁（支持2節点を両端に持つ実 Beam が存在）は、点反力ではなく
+/// 小梁自身への等分布荷重（`LoadTarget::Span`）として分配される（床 Phase B-2）。
+/// 総和は保存し、Node 点反力は生じない。
+#[test]
+fn test_materialized_joist_uses_span_distributed_load() {
+    use squid_n_core::ids::{ElemId, NodeId, SlabId};
+    use squid_n_core::model::{
+        AreaLoad, ElementData, ElementKind, EndCondition, ForceRegime, JoistLine, LocalAxis,
+    };
+    let (lx, ly) = (9000.0_f64, 4000.0_f64);
+    let w = 0.0035_f64;
+    let spacing = 3000.0_f64;
+    let nodes = vec![
+        mk_node(0, 0.0, 0.0),
+        mk_node(1, lx, 0.0),
+        mk_node(2, lx, ly),
+        mk_node(3, 0.0, ly),
+        mk_node(4, 3000.0, 0.0),
+        mk_node(5, 3000.0, ly),
+        mk_node(6, 6000.0, 0.0),
+        mk_node(7, 6000.0, ly),
+    ];
+    // 小梁2本を実 Beam として生成（N4-N5, N6-N7）。
+    let mk_beam = |id: u32, a: u32, b: u32| ElementData {
+        id: ElemId(id),
+        kind: ElementKind::Beam,
+        nodes: [NodeId(a), NodeId(b)].into_iter().collect(),
+        section: None,
+        material: None,
+        local_axis: LocalAxis {
+            ref_vector: [0.0, 0.0, 1.0],
+        },
+        end_cond: [EndCondition::Pinned, EndCondition::Pinned],
+        force_regime: ForceRegime::Auto,
+        rigid_zone: Default::default(),
+        plastic_zone: None,
+        spring: None,
+    };
+    let model = Model {
+        nodes,
+        elements: vec![mk_beam(0, 4, 5), mk_beam(1, 6, 7)],
+        ..Default::default()
+    };
+    let joists = vec![
+        JoistLine {
+            dir: [0.0, 1.0],
+            spacing,
+            support: [NodeId(4), NodeId(5)],
+        },
+        JoistLine {
+            dir: [0.0, 1.0],
+            spacing,
+            support: [NodeId(6), NodeId(7)],
+        },
+    ];
+    let slab = Slab {
+        usage: None,
+        edge_supported: None,
+        thickness: None,
+        kind: Default::default(),
+        one_way: None,
+        id: SlabId(0),
+        boundary: vec![NodeId(0), NodeId(1), NodeId(2), NodeId(3)],
+        joists,
+        loads: vec![AreaLoad {
+            kind: "DL".into(),
+            value: w,
+        }],
+        method: DistributionMethod::TriTrapezoid,
+    };
+    let loads = distribute_slab(&model, &slab);
+
+    // 総和保存。
+    let expected_total = w * lx * ly;
+    assert!(
+        (total_load(&loads) - expected_total).abs() / expected_total < 1e-9,
+        "総和={} expected={}",
+        total_load(&loads),
+        expected_total
+    );
+
+    // 実部材化されたので Node 点反力は無く、Span 等分布が2本分できる。
+    assert!(
+        !loads
+            .iter()
+            .any(|l| matches!(l.target, LoadTarget::Node(_))),
+        "実部材化した小梁は点反力を生じない"
+    );
+    let span_entries: Vec<_> = loads
+        .iter()
+        .filter(|l| matches!(l.target, LoadTarget::Span(_)))
+        .collect();
+    assert_eq!(span_entries.len(), 2, "小梁2本が Span 分布になる");
+    for l in &span_entries {
+        // 各小梁の等分布荷重は w*spacing（トリビュタリ幅）。
+        if let LoadShape::Uniform { w: wl } = l.shape {
+            let expected = w * spacing;
+            assert!((wl - expected).abs() / expected < 1e-9, "wl={wl}");
+        } else {
+            panic!("expected uniform span load");
         }
     }
 }
@@ -787,6 +892,9 @@ fn test_cantilever_edge_supported_three_of_four_conservation() {
             LoadTarget::Edge(e) => assert!(e == 0 || e == 1 || e == 3),
             LoadTarget::Node(_) => {
                 panic!("edge-supported cantilever should not emit node targets")
+            }
+            LoadTarget::Span(_) => {
+                panic!("edge-supported cantilever should not emit span targets")
             }
         }
     }
