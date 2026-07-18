@@ -127,6 +127,21 @@ pub fn build_slab_grillage(model: &Model, slab: &Slab, w: f64) -> Option<SlabGri
         });
     }
 
+    // 斜め小梁（軸非平行）は支点の主曲げ解放を単一の全体回転軸に丸めるため部分固定
+    // となり、設計曲げを過小評価しうる（非保守）。安全のため全小梁が軸平行（直交格子）
+    // でない場合は格子解析を行わず `None` を返し、単純梁設計（各小梁 M=wL²/8。交点の
+    // 中間支持を無視するぶん安全側）へフォールバックする。斜め小梁の正確な支点条件
+    // （任意方向の主曲げ解放＋ねじり拘束）は要素端条件が全回転一括のため表現できない。
+    for j in &js {
+        let dx = (j.b[0] - j.a[0]).abs();
+        let dy = (j.b[1] - j.a[1]).abs();
+        let maxc = dx.max(dy);
+        // 許容 tan≈0.02（約1.1°）。maxc≈0 は幾何無効（呼び出し前提で通常起きない）。
+        if maxc <= 1e-9 || dx.min(dy) > 0.02 * maxc {
+            return None;
+        }
+    }
+
     let mut reg = NodeRegistry { coords: Vec::new() };
     // 端点は原節点座標で登録し、原節点 id を覚える（支点＝大梁接続点）。
     // 小梁が端点を共有する場合の重複は排除する（反力の二重計上を防ぐ）。
@@ -184,7 +199,13 @@ pub fn build_slab_grillage(model: &Model, slab: &Slab, w: f64) -> Option<SlabGri
                     0.0
                 };
                 // i が k にピン接合（架け）なら i 用の別節点を作り Uz 結合。
-                let node_i = if slab.joists[js[i].idx].pinned_onto == Some(js[k].idx) {
+                // 相互ピン（i→k かつ k→i）の場合は両側が別節点を持つと共有節点が
+                // どの部材にも接続されず特異になるため、原インデックスの小さい側だけを
+                // 架け（別節点）とし、他方は共有節点を使う受け梁として破綻を防ぐ。
+                let i_pins_k = slab.joists[js[i].idx].pinned_onto == Some(js[k].idx);
+                let k_pins_i = slab.joists[js[k].idx].pinned_onto == Some(js[i].idx);
+                let i_is_carried = i_pins_k && (!k_pins_i || js[i].idx < js[k].idx);
+                let node_i = if i_is_carried {
                     let fresh = reg.add_distinct(p);
                     uz_links.push((shared, fresh));
                     fresh
@@ -874,6 +895,133 @@ mod tests {
         assert!(
             (sum_pin - total).abs() / total < 1e-6,
             "ピン時の支点反力総和={sum_pin} 全載荷={total}"
+        );
+    }
+
+    /// 斜め小梁（軸非平行）を含む床は格子解析を行わず None（安全側の単純梁へ）。
+    #[test]
+    fn test_skew_joist_falls_back_to_none() {
+        use squid_n_core::ids::SlabId;
+        use squid_n_core::model::{DistributionMethod, JoistLine, Slab};
+
+        let mk = |id: u32, x: f64, y: f64| Node {
+            id: NodeId(id),
+            coord: [x, y, 0.0],
+            restraint: Dof6Mask::FREE,
+            mass: None,
+            story: None,
+        };
+        let model = Model {
+            nodes: vec![
+                mk(0, 0.0, 0.0),
+                mk(1, 4000.0, 0.0),
+                mk(2, 4000.0, 4000.0),
+                mk(3, 0.0, 4000.0),
+                mk(4, 2000.0, 0.0),
+                mk(5, 2000.0, 4000.0),
+            ],
+            sections: vec![beam_section(0)],
+            slabs: vec![Slab {
+                id: SlabId(0),
+                boundary: vec![NodeId(0), NodeId(1), NodeId(2), NodeId(3)],
+                joists: vec![
+                    JoistLine {
+                        dir: [0.0, 1.0],
+                        spacing: 2000.0,
+                        support: [NodeId(4), NodeId(5)], // 縦
+                        section: Some(SectionId(0)),
+                        pinned_onto: None,
+                    },
+                    JoistLine {
+                        dir: [1.0, 1.0],
+                        spacing: 2000.0,
+                        support: [NodeId(0), NodeId(2)], // 斜め（対角）
+                        section: Some(SectionId(0)),
+                        pinned_onto: None,
+                    },
+                ],
+                loads: vec![],
+                method: DistributionMethod::TriTrapezoid,
+                kind: Default::default(),
+                one_way: None,
+                edge_supported: None,
+                usage: None,
+                thickness: None,
+            }],
+            ..Default::default()
+        };
+        assert!(
+            build_slab_grillage(&model, &model.slabs[0], 0.005).is_none(),
+            "斜め小梁があるのに格子を構築した（過小評価の恐れ）"
+        );
+    }
+
+    /// 相互ピン（i→k かつ k→i）でも特異にならず解ける（低インデックス側だけ架け）。
+    #[test]
+    fn test_mutual_pin_does_not_singular() {
+        use squid_n_core::ids::SlabId;
+        use squid_n_core::model::{DistributionMethod, JoistLine, Slab};
+
+        let mk = |id: u32, x: f64, y: f64| Node {
+            id: NodeId(id),
+            coord: [x, y, 0.0],
+            restraint: Dof6Mask::FREE,
+            mass: None,
+            story: None,
+        };
+        let model = Model {
+            nodes: vec![
+                mk(0, 0.0, 0.0),
+                mk(1, 4000.0, 0.0),
+                mk(2, 4000.0, 4000.0),
+                mk(3, 0.0, 4000.0),
+                mk(4, 2000.0, 0.0),
+                mk(5, 2000.0, 4000.0),
+                mk(6, 0.0, 2000.0),
+                mk(7, 4000.0, 2000.0),
+            ],
+            sections: vec![beam_section(0)],
+            slabs: vec![Slab {
+                id: SlabId(0),
+                boundary: vec![NodeId(0), NodeId(1), NodeId(2), NodeId(3)],
+                joists: vec![
+                    JoistLine {
+                        dir: [0.0, 1.0],
+                        spacing: 2000.0,
+                        support: [NodeId(4), NodeId(5)],
+                        section: Some(SectionId(0)),
+                        pinned_onto: Some(1), // 相互ピン
+                    },
+                    JoistLine {
+                        dir: [1.0, 0.0],
+                        spacing: 2000.0,
+                        support: [NodeId(6), NodeId(7)],
+                        section: Some(SectionId(0)),
+                        pinned_onto: Some(0), // 相互ピン
+                    },
+                ],
+                loads: vec![],
+                method: DistributionMethod::TriTrapezoid,
+                kind: Default::default(),
+                one_way: None,
+                edge_supported: None,
+                usage: None,
+                thickness: None,
+            }],
+            ..Default::default()
+        };
+        let w = 0.005_f64;
+        let g = build_slab_grillage(&model, &model.slabs[0], w).expect("相互ピンでも構築");
+        let sol = solve_grillage(&g.model, LoadCaseId(0)).expect("相互ピンでも特異にならず解ける");
+        let total = w * 2000.0 * 4000.0 * 2.0;
+        let sum: f64 = g
+            .support_origin
+            .iter()
+            .map(|(n, _)| sol.reactions[*n][2])
+            .sum();
+        assert!(
+            (sum - total).abs() / total < 1e-6,
+            "支点反力総和={sum} 全載荷={total}"
         );
     }
 }
