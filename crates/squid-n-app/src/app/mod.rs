@@ -626,8 +626,14 @@ pub fn install_japanese_fonts(ctx: &egui::Context) {
     eprintln!("[info] 日本語フォントを読み込みました: {path}");
 }
 
-/// `sync_slab_loads_action` が同期先とする専用荷重ケース名（レビュー §1.1）。
+/// `sync_slab_loads_action` が固定荷重（DL）の同期先とする専用荷重ケース名
+/// （レビュー §1.1）。スラブの `loads`（仕上げ等の固定荷重）を分配する。
 pub const SLAB_AUTO_LOAD_CASE_NAME: &str = "床荷重(自動)";
+
+/// `sync_slab_loads_action` が積載荷重（LL・骨組用）の同期先とする専用荷重
+/// ケース名。スラブ用途（`SlabUsage`）から令別表第1 の骨組用積載を分配する
+/// （長期骨組解析用。令85条1項）。
+pub const SLAB_LIVE_AUTO_LOAD_CASE_NAME: &str = "床積載(自動)";
 
 /// `sync_self_weight_action` が同期先とする専用荷重ケース名。
 /// `squid_n_load::self_weight` の定数を単一ソースオブトゥルースとして再公開する。

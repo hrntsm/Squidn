@@ -858,6 +858,7 @@ fn test_add_delete_slab_roundtrip() {
             joists: vec![],
             loads: vec![],
             method: DistributionMethod::TriTrapezoid,
+            usage: None,
         }),
     );
     assert_eq!(model.slabs.len(), 1);
@@ -872,6 +873,7 @@ fn test_add_delete_slab_roundtrip() {
             joists: vec![],
             loads: vec![],
             method: DistributionMethod::OneWay,
+            usage: None,
         }),
     );
     assert_eq!(model.slabs.len(), 2);
@@ -902,6 +904,7 @@ fn test_delete_slab_middle_renumbers_and_roundtrips() {
                     value: 1.0,
                 }],
                 method: DistributionMethod::TributaryArea,
+                usage: None,
             }),
         );
     }
@@ -1203,6 +1206,7 @@ fn test_sync_slab_loads_to_case_creates_new_case() {
         &mut model,
         Box::new(SyncSlabLoadsToCase {
             name: "床荷重(自動)".into(),
+            kind: LoadCaseKind::Dead,
             nodal: nodal.clone(),
             member: member.clone(),
         }),
@@ -1269,6 +1273,7 @@ fn test_sync_slab_loads_to_case_replaces_existing_case() {
         &mut model,
         Box::new(SyncSlabLoadsToCase {
             name: "床荷重(自動)".into(),
+            kind: LoadCaseKind::Dead,
             nodal: Vec::new(),
             member: new_member.clone(),
         }),
@@ -1283,6 +1288,7 @@ fn test_sync_slab_loads_to_case_replaces_existing_case() {
         &mut model,
         Box::new(SyncSlabLoadsToCase {
             name: "床荷重(自動)".into(),
+            kind: LoadCaseKind::Dead,
             nodal: Vec::new(),
             member: new_member.clone(),
         }),
@@ -1531,6 +1537,7 @@ fn test_set_slab_kind_and_one_way_roundtrip() {
             joists: vec![],
             loads: vec![],
             method: DistributionMethod::TriTrapezoid,
+            usage: None,
         }),
     );
     assert_eq!(model.slabs[0].kind, SlabKind::Interior);

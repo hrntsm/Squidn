@@ -58,28 +58,32 @@ impl EditCommand for SetLoadCaseKind {
 /// スラブ荷重を専用の荷重ケースへ全置換で同期する（レビュー §1.1: 面荷重→大梁
 /// 分配の結果を応力解析の荷重ケースへ接続する）。
 ///
-/// `name` で既存ケースを探し、見つかれば `kind` を `Dead` に固定した上で
+/// `name` で既存ケースを探し、見つかれば `kind` を指定値に固定した上で
 /// `nodal`/`member` を丸ごと置き換える（逆操作は置換前の `LoadCase` 全体の
 /// 復元、[`RestoreLoadCaseContent`]）。見つからなければ [`AddLoadCase`] と同じ
 /// 「末尾に `LoadCaseId(len)`」の規則で新規ケースを追加する（逆操作は
 /// 既存の [`DeleteLoadCase`] をそのまま再利用できる）。
+///
+/// `kind` は同期先ケースの種別を指定する（床固定荷重・自重は `Dead`、
+/// 床積載荷重は `Live` など。令85条1項の DL/LL 分離に用いる）。
 ///
 /// 呼び出し側（`squid-n-app::App::sync_slab_loads_action`）は、計算結果が
 /// 既存ケースの内容と変わらない場合はこのコマンドを発行しない（undo 履歴を
 /// 汚さないための冪等性は呼び出し側の責務）。
 pub struct SyncSlabLoadsToCase {
     pub name: String,
+    pub kind: squid_n_core::model::LoadCaseKind,
     pub nodal: Vec<squid_n_core::model::NodalLoad>,
     pub member: Vec<squid_n_core::model::MemberLoad>,
 }
 
 impl EditCommand for SyncSlabLoadsToCase {
     fn apply(&self, model: &mut Model) -> Box<dyn EditCommand> {
-        use squid_n_core::model::{LoadCase, LoadCaseKind};
+        use squid_n_core::model::LoadCase;
 
         if let Some(idx) = model.load_cases.iter().position(|lc| lc.name == self.name) {
             let old = model.load_cases[idx].clone();
-            model.load_cases[idx].kind = LoadCaseKind::Dead;
+            model.load_cases[idx].kind = self.kind;
             model.load_cases[idx].nodal = self.nodal.clone();
             model.load_cases[idx].member = self.member.clone();
             Box::new(RestoreLoadCaseContent { old })
@@ -88,7 +92,7 @@ impl EditCommand for SyncSlabLoadsToCase {
             model.load_cases.push(LoadCase {
                 id: new_id,
                 name: self.name.clone(),
-                kind: LoadCaseKind::Dead,
+                kind: self.kind,
                 nodal: self.nodal.clone(),
                 member: self.member.clone(),
             });
@@ -402,5 +406,31 @@ impl EditCommand for SetSlabOneWay {
 
     fn label(&self) -> &str {
         "スラブ伝達方向変更"
+    }
+}
+
+/// スラブの用途（`usage`。積載荷重プリセット）変更。逆操作は変更前の値への復元。
+/// 存在しない `SlabId` は Noop。
+pub struct SetSlabUsage {
+    pub id: SlabId,
+    pub usage: Option<squid_n_core::model::SlabUsage>,
+}
+
+impl EditCommand for SetSlabUsage {
+    fn apply(&self, model: &mut Model) -> Box<dyn EditCommand> {
+        let idx = self.id.index();
+        if idx >= model.slabs.len() || model.slabs[idx].id != self.id {
+            return Box::new(Noop);
+        }
+        let old = model.slabs[idx].usage;
+        model.slabs[idx].usage = self.usage;
+        Box::new(SetSlabUsage {
+            id: self.id,
+            usage: old,
+        })
+    }
+
+    fn label(&self) -> &str {
+        "スラブ用途変更"
     }
 }

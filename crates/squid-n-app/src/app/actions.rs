@@ -1631,13 +1631,26 @@ impl App {
     /// `NodalLoad` へ変換する。CMQ 図描画側は `elem` で梁を引くため、この番兵は
     /// 単に描画対象外になるだけで安全）。
     pub fn refresh_beam_loads(&mut self) {
+        // CMQ 図表示・従来互換のため `self.beam_loads` には固定荷重（DL）分配を格納する。
+        self.beam_loads = self.slab_beam_loads(|slab| slab.dead_intensity());
+    }
+
+    /// 各スラブについて面荷重強度 `w_of(slab)`（N/mm²）を境界へ分配し、
+    /// `LoadTarget::Edge` を実 `ElemId` に対応付けた `BeamLoad` 列を返す。
+    /// 対応する梁が無い辺の荷重は捨てる。`refresh_beam_loads`（DL）と
+    /// `sync_slab_loads_action`（LL）の共通経路（令85条1項の DL/LL 分離）。
+    fn slab_beam_loads(
+        &self,
+        w_of: impl Fn(&squid_n_core::model::Slab) -> f64,
+    ) -> Vec<squid_n_load::floor::BeamLoad> {
         let mut beam_loads = Vec::new();
         for slab in &self.model.slabs {
             let n = slab.boundary.len();
             if n < 3 {
                 continue;
             }
-            for mut bl in squid_n_load::floor::distribute_slab(&self.model, slab) {
+            let w = w_of(slab);
+            for mut bl in squid_n_load::floor::distribute_slab_w(&self.model, slab, w) {
                 match bl.target {
                     squid_n_load::floor::LoadTarget::Node(_) => {
                         beam_loads.push(bl);
@@ -1661,7 +1674,7 @@ impl App {
                 }
             }
         }
-        self.beam_loads = beam_loads;
+        beam_loads
     }
 
     /// `self.beam_loads`（`refresh_beam_loads` 適用後の値）を荷重ケースへ書き込める
@@ -1683,6 +1696,7 @@ impl App {
     /// 設計検定側の `clear_span` とは別物）。
     fn slab_load_case_content(
         &self,
+        beam_loads: &[squid_n_load::floor::BeamLoad],
     ) -> (
         Vec<squid_n_core::model::NodalLoad>,
         Vec<squid_n_core::model::MemberLoad>,
@@ -1705,7 +1719,7 @@ impl App {
             });
         }
 
-        for bl in &self.beam_loads {
+        for bl in beam_loads {
             match bl.target {
                 LoadTarget::Node(n) => {
                     let LoadShape::Point { p, .. } = bl.shape else {
@@ -1753,33 +1767,59 @@ impl App {
         (nodal, member)
     }
 
-    /// スラブ荷重を専用の荷重ケース「床荷重(自動)」（kind=Dead）へ同期する
-    /// （レビュー §1.1: 面荷重→大梁分配の結果を応力解析へ接続する最重要修正）。
+    /// スラブ荷重を専用の 2 荷重ケースへ同期する（レビュー §1.1: 面荷重→大梁分配の
+    /// 結果を応力解析へ接続する最重要修正／床 Phase A-2: 令85条1項の DL/LL 分離）。
     ///
-    /// `refresh_beam_loads` → `slab_load_case_content` で現在のスラブ荷重を
-    /// 計算し、既存の「床荷重(自動)」ケースの内容と一致するなら何もしない
-    /// （undo 履歴・stale フラグを汚さない）。差分があれば
+    /// - 「床荷重(自動)」（kind=Dead）: スラブの `loads`（仕上げ等の固定荷重 DL）を分配。
+    /// - 「床積載(自動)」（kind=Live）: スラブ用途（`SlabUsage`）から令別表第1 の
+    ///   **骨組用**積載（LL）を分配（長期骨組解析用。用途未設定のスラブは寄与 0）。
+    ///
+    /// 各ケースについて現在のスラブ荷重を計算し、既存ケースの内容と一致するなら
+    /// 何もしない（undo 履歴・stale フラグを汚さない）。差分があれば
     /// `SyncSlabLoadsToCase`（全置換、undo 対応）を発行する。
     /// スラブが無く既存ケースも無い場合は空ケースを作らない。
     ///
     /// 解析実行系（`run_linear_static`/`run_combination`）・`generate_stories_action`
     /// の入口で毎回呼ぶことを想定した冪等な同期アクション。
     pub fn sync_slab_loads_action(&mut self) {
+        use squid_n_core::model::{LoadCaseKind, LoadPurpose};
         self.refresh_beam_loads();
-        let (nodal, member) = self.slab_load_case_content();
 
-        let existing = self
-            .model
-            .load_cases
-            .iter()
-            .find(|lc| lc.name == SLAB_AUTO_LOAD_CASE_NAME);
+        // DL（固定荷重）: `self.beam_loads` は refresh_beam_loads で dead_intensity 分配済み。
+        let dl_beam_loads = self.beam_loads.clone();
+        let (dl_nodal, dl_member) = self.slab_load_case_content(&dl_beam_loads);
+        self.sync_one_slab_case(
+            SLAB_AUTO_LOAD_CASE_NAME,
+            LoadCaseKind::Dead,
+            dl_nodal,
+            dl_member,
+        );
+
+        // LL（積載荷重・骨組用）: スラブ用途から令別表第1 の骨組用積載を分配。
+        let ll_beam_loads = self.slab_beam_loads(|slab| slab.live_intensity(LoadPurpose::Frame));
+        let (ll_nodal, ll_member) = self.slab_load_case_content(&ll_beam_loads);
+        self.sync_one_slab_case(
+            SLAB_LIVE_AUTO_LOAD_CASE_NAME,
+            LoadCaseKind::Live,
+            ll_nodal,
+            ll_member,
+        );
+    }
+
+    /// 名前付き荷重ケースを指定の `kind`・内容へ冪等に同期する
+    /// （`sync_slab_loads_action` の DL/LL 各ケース同期の共通処理）。
+    /// 既存ケースの内容と一致すれば何もしない。
+    fn sync_one_slab_case(
+        &mut self,
+        name: &str,
+        kind: squid_n_core::model::LoadCaseKind,
+        nodal: Vec<squid_n_core::model::NodalLoad>,
+        member: Vec<squid_n_core::model::MemberLoad>,
+    ) {
+        let existing = self.model.load_cases.iter().find(|lc| lc.name == name);
         let needs_create = existing.is_none() && !(nodal.is_empty() && member.is_empty());
         let needs_update = existing
-            .map(|lc| {
-                lc.kind != squid_n_core::model::LoadCaseKind::Dead
-                    || lc.nodal != nodal
-                    || lc.member != member
-            })
+            .map(|lc| lc.kind != kind || lc.nodal != nodal || lc.member != member)
             .unwrap_or(false);
         if !needs_create && !needs_update {
             return;
@@ -1788,7 +1828,8 @@ impl App {
         self.undo.run(
             &mut self.model,
             Box::new(squid_n_edit::SyncSlabLoadsToCase {
-                name: SLAB_AUTO_LOAD_CASE_NAME.to_string(),
+                name: name.to_string(),
+                kind,
                 nodal,
                 member,
             }),
@@ -1835,6 +1876,7 @@ impl App {
             &mut self.model,
             Box::new(squid_n_edit::SyncSlabLoadsToCase {
                 name: SELF_WEIGHT_AUTO_LOAD_CASE_NAME.to_string(),
+                kind: squid_n_core::model::LoadCaseKind::Dead,
                 nodal,
                 member,
             }),

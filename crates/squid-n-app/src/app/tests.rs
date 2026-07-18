@@ -2143,6 +2143,74 @@ fn test_sync_slab_loads_action_square_slab_triangle_distribution() {
     );
 }
 
+/// 床 Phase A-2: 用途（`SlabUsage`）を設定したスラブは、`sync_slab_loads_action`
+/// で固定荷重（DL・「床荷重(自動)」kind=Dead）と積載荷重（LL・「床積載(自動)」
+/// kind=Live）の 2 ケースに分離されることを確認する。LL は令別表第1 の
+/// **骨組用**積載（事務室=1800 N/m²）を用い、DL とは独立に総和保存する。
+#[test]
+fn test_sync_slab_loads_action_separates_dead_and_live() {
+    use squid_n_core::model::{LoadCaseKind, MemberLoadKind, SlabUsage};
+
+    let mut model = make_square_slab_test_model();
+    // 事務室用途を設定（骨組用 LL = 1800 N/m² = 1.8e-3 N/mm²）。
+    model.slabs[0].usage = Some(SlabUsage::Office);
+    model
+        .validate()
+        .expect("テストモデルは validate を通るはず");
+    let mut app = App {
+        model,
+        ..App::default()
+    };
+
+    app.sync_slab_loads_action();
+
+    fn sum_vertical(model: &squid_n_core::model::Model, name: &str) -> f64 {
+        model
+            .load_cases
+            .iter()
+            .find(|lc| lc.name == name)
+            .map(|c| {
+                c.member
+                    .iter()
+                    .map(|m| match m.kind {
+                        MemberLoadKind::Distributed { a, b, w1, w2 } => (w1 + w2) / 2.0 * (b - a),
+                        MemberLoadKind::Point { p, .. } => p,
+                    })
+                    .sum()
+            })
+            .unwrap_or(0.0)
+    }
+
+    // DL ケース: 従来どおり loads(0.005) を分配。
+    let dl = app
+        .model
+        .load_cases
+        .iter()
+        .find(|lc| lc.name == SLAB_AUTO_LOAD_CASE_NAME)
+        .expect("床荷重(自動)ケースが作られるはず");
+    assert_eq!(dl.kind, LoadCaseKind::Dead);
+    let area = 4000.0 * 4000.0;
+    assert!((sum_vertical(&app.model, SLAB_AUTO_LOAD_CASE_NAME) - 0.005 * area).abs() < 1e-6);
+
+    // LL ケース: 骨組用積載 1.8e-3 N/mm² を分配（DL とは別ケース・kind=Live）。
+    let ll = app
+        .model
+        .load_cases
+        .iter()
+        .find(|lc| lc.name == SLAB_LIVE_AUTO_LOAD_CASE_NAME)
+        .expect("床積載(自動)ケースが作られるはず");
+    assert_eq!(ll.kind, LoadCaseKind::Live);
+    assert!((sum_vertical(&app.model, SLAB_LIVE_AUTO_LOAD_CASE_NAME) - 1.8e-3 * area).abs() < 1e-6);
+
+    // 用途を外すと LL ケースは空同期され、寄与が無くなる（新規なら作られない）。
+    app.model.slabs[0].usage = None;
+    app.sync_slab_loads_action();
+    assert!(
+        (sum_vertical(&app.model, SLAB_LIVE_AUTO_LOAD_CASE_NAME)).abs() < 1e-12,
+        "用途を外したら積載寄与は 0 になるはず"
+    );
+}
+
 /// レビュー §1.7: 地震用重量に使う荷重ケースの選択が、並び順ではなく
 /// `LoadCaseKind` に基づくことを確認する（Dead+LiveSeismic 優先、
 /// LiveSeismic が無ければ Dead+Live、種別が一つも設定されていなければ
