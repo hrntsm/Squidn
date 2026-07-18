@@ -674,6 +674,7 @@ fn test_delete_section_referenced_by_joist() {
             spacing: 900.0,
             support: [NodeId(0), NodeId(1)],
             section: Some(SectionId(1)),
+            pinned_onto: None,
         }],
         loads: vec![],
         method: DistributionMethod::TriTrapezoid,
@@ -1673,6 +1674,7 @@ fn test_set_slab_joists_roundtrip() {
         spacing: 900.0,
         support: [NodeId(0), NodeId(3)],
         section: None,
+        pinned_onto: None,
     }];
     stack.run(
         &mut model,
@@ -1714,6 +1716,7 @@ fn test_materialize_slab_joists_creates_beams() {
                 spacing: 900.0,
                 support: [NodeId(0), NodeId(3)],
                 section: None,
+                pinned_onto: None,
             }],
             loads: vec![],
             method: DistributionMethod::TriTrapezoid,

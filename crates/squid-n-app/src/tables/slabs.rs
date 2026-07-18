@@ -477,9 +477,45 @@ fn joists_section(ui: &mut egui::Ui, app: &mut App) {
                     "小梁{}: 支持 N{}–N{}, 負担幅 {:.0} mm, 断面 {}",
                     k, j.support[0].0, j.support[1].0, j.spacing, sec
                 ));
+                // 交差接合の指定: 剛接十字（既定）か、他の小梁への受け/架け（ピン）か。
+                // 「受け:小梁c」を選ぶとこの小梁が架け梁となり、交点で小梁c にピン接合で
+                // 載る（曲げは伝えず鉛直せん断のみ。交差しない相手を選んでも無効）。
+                let cur = match j.pinned_onto {
+                    Some(c) => format!("受け:小梁{c}"),
+                    None => "剛接十字".to_string(),
+                };
+                egui::ComboBox::from_id_salt(format!("joist_pin_{k}"))
+                    .selected_text(cur)
+                    .show_ui(ui, |ui| {
+                        let mut sel = j.pinned_onto;
+                        ui.selectable_value(&mut sel, None, "剛接十字");
+                        for c in 0..joists.len() {
+                            if c == k {
+                                continue;
+                            }
+                            ui.selectable_value(&mut sel, Some(c), format!("受け:小梁{c}"));
+                        }
+                        if sel != j.pinned_onto {
+                            let mut v = joists.clone();
+                            v[k].pinned_onto = sel;
+                            new_joists = Some(v);
+                        }
+                    })
+                    .response
+                    .on_hover_text(
+                        "剛接十字＝交点で二方向曲げ連続（たわみ抑制）。受け/架け＝架け梁が受け梁にピンで載る（鉛直せん断のみ伝達）。",
+                    );
                 if ui.button("🗑").on_hover_text("この小梁を削除").clicked() {
                     let mut v = joists.clone();
                     v.remove(k);
+                    // 削除で小梁インデックスがずれるため、pinned_onto を補正する。
+                    for jj in v.iter_mut() {
+                        match jj.pinned_onto {
+                            Some(c) if c == k => jj.pinned_onto = None,
+                            Some(c) if c > k => jj.pinned_onto = Some(c - 1),
+                            _ => {}
+                        }
+                    }
                     new_joists = Some(v);
                 }
             });
@@ -600,6 +636,7 @@ fn joists_section(ui: &mut egui::Ui, app: &mut App) {
             spacing,
             support: [a, b],
             section: app.slab_draft.joist_section,
+            pinned_onto: None,
         })
     })();
 

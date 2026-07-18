@@ -6,8 +6,9 @@
 //!
 //! 反力はソルバが直接返さないため、要素の全体剛性から `K·u` を集計し、外力
 //! （節点荷重＋部材荷重の等価節点力）を差し引いて求める（`reaction = K·u − F_ext`。
-//! 拘束自由度でのみ意味を持つ）。交点ジョイントのピン／剛接は、サブモデルの
-//! 小梁要素の端部条件（`EndCondition::Pinned`/`Fixed`）で表現する。
+//! 拘束自由度でのみ意味を持つ）。交点ジョイントは、剛接十字＝交点を共有節点として
+//! 二方向曲げ連続、ピン受け/架け＝架け梁側に座標一致の別節点を設け受け梁節点と
+//! **鉛直 Uz のみ**を `RigidLink` で結合（曲げは伝えず鉛直せん断のみ）で表現する。
 
 use squid_n_core::ids::{ElemId, LoadCaseId, NodeId};
 use squid_n_core::model::{Model, Slab};
@@ -63,6 +64,12 @@ impl NodeRegistry {
                 return i;
             }
         }
+        self.coords.push(c);
+        self.coords.len() - 1
+    }
+    /// 座標一致でも重複排除せず、必ず新しい節点を割り当てる（ピン受け/架けの
+    /// 交点で、架け梁側に受け梁と座標一致する別節点を作るために用いる）。
+    fn add_distinct(&mut self, c: [f64; 3]) -> usize {
         self.coords.push(c);
         self.coords.len() - 1
     }
@@ -134,9 +141,30 @@ pub fn build_slab_grillage(model: &Model, slab: &Slab, w: f64) -> Option<SlabGri
             support_origin.push((ib, j.b_id));
         }
     }
-    // 交点検出: 各小梁について、他小梁との内部交点を (t, sub_node_index) で収集。
+    // 交点検出: 各小梁について、他小梁との内部交点を (t, sub_node, 相手小梁の原index)
+    // で収集する（相手 index はピン接合〔受け/架け〕の判定に用いる）。
+    //
+    // ピン受け/架け（`joists[i].pinned_onto == Some(相手)`）の交点では、架け梁 i の側に
+    // 受け梁と**座標一致する別節点**を作り（`add_distinct`）、その鉛直変位のみを受け梁
+    // 節点に `RigidLink`（Uz のみ）で結合する。これにより架け梁は自身は連続のまま
+    // （曲げ・ねじり連続＝機構〔特異〕を生じない）、受け梁との間では曲げは伝えず鉛直
+    // せん断だけを伝える単純支持となる。剛接十字は交点を共有節点として二方向曲げを連続。
+    //
+    // `major_bending_dof`: 水平梁の「主曲げ回転（鉛直たわみの勾配に対応する回転）」に
+    // 対応する全体回転自由度。X 主方向の梁は 主曲げ=Ry（ねじり=Rx）、Y 主方向の梁は
+    // 主曲げ=Rx（ねじり=Ry）。小梁は大梁に両端ピン（＝主曲げ解放）で取り付くが、
+    // ねじりは接合部で拘束される（大梁がねじり戻しを受け持つ）ため支点では解放しない。
+    let major_bending_dof = |a: [f64; 3], b: [f64; 3]| -> Dof {
+        if (b[0] - a[0]).abs() >= (b[1] - a[1]).abs() {
+            Dof::Ry // X 主方向 → 主曲げは Ry
+        } else {
+            Dof::Rx // Y 主方向 → 主曲げは Rx
+        }
+    };
     let mut crossings = false;
-    let mut per_joist_pts: Vec<Vec<(f64, usize)>> = vec![Vec::new(); js.len()];
+    let mut per_joist_pts: Vec<Vec<(f64, usize, usize)>> = vec![Vec::new(); js.len()];
+    // (受け梁の共有節点, 架け梁の別節点): Uz を結合する鉛直リンク。
+    let mut uz_links: Vec<(usize, usize)> = Vec::new();
     for i in 0..js.len() {
         for k in 0..js.len() {
             if i == k {
@@ -144,7 +172,8 @@ pub fn build_slab_grillage(model: &Model, slab: &Slab, w: f64) -> Option<SlabGri
             }
             if let Some(p) = segment_intersection(js[i].a, js[i].b, js[k].a, js[k].b) {
                 crossings = true;
-                let ni = reg.get_or_add(p);
+                // 受け梁（または剛接十字）が使う共有節点。
+                let shared = reg.get_or_add(p);
                 // t パラメータ（a→b 上の位置）。
                 let ab = [js[i].b[0] - js[i].a[0], js[i].b[1] - js[i].a[1]];
                 let ap = [p[0] - js[i].a[0], p[1] - js[i].a[1]];
@@ -154,7 +183,15 @@ pub fn build_slab_grillage(model: &Model, slab: &Slab, w: f64) -> Option<SlabGri
                 } else {
                     0.0
                 };
-                per_joist_pts[i].push((t, ni));
+                // i が k にピン接合（架け）なら i 用の別節点を作り Uz 結合。
+                let node_i = if slab.joists[js[i].idx].pinned_onto == Some(js[k].idx) {
+                    let fresh = reg.add_distinct(p);
+                    uz_links.push((shared, fresh));
+                    fresh
+                } else {
+                    shared
+                };
+                per_joist_pts[i].push((t, node_i, js[k].idx));
             }
         }
     }
@@ -189,10 +226,10 @@ pub fn build_slab_grillage(model: &Model, slab: &Slab, w: f64) -> Option<SlabGri
         let ia = reg.get_or_add(j.a);
         let ib = reg.get_or_add(j.b);
         // 分割点を t 昇順に並べ、両端を挟んで区間列を作る。
-        let mut pts: Vec<(f64, usize)> = per_joist_pts[j.idx].clone();
+        let mut pts: Vec<(f64, usize, usize)> = per_joist_pts[j.idx].clone();
         pts.sort_by(|x, y| x.0.partial_cmp(&y.0).unwrap_or(std::cmp::Ordering::Equal));
         let mut chain: Vec<usize> = vec![ia];
-        for (_, ni) in &pts {
+        for (_, ni, _) in &pts {
             if *chain.last().unwrap() != *ni {
                 chain.push(*ni);
             }
@@ -200,6 +237,9 @@ pub fn build_slab_grillage(model: &Model, slab: &Slab, w: f64) -> Option<SlabGri
         if *chain.last().unwrap() != ib {
             chain.push(ib);
         }
+        // 全区間とも端部は曲げ連続（Fixed）。受け/架けの曲げ解放は、架け梁側の
+        // 別節点と受け梁節点を Uz のみ結合する `RigidLink` で表現しており、部材端では
+        // 解放しない（架け梁は自身は連続＝機構を生じない）。
         let sec_idx = sub_sec_id(j.sec, &mut sub_sections, &mut sec_map);
         let w_udl = w * j.spacing; // 負担幅の等分布荷重（下向き）。
         for seg in chain.windows(2) {
@@ -217,7 +257,7 @@ pub fn build_slab_grillage(model: &Model, slab: &Slab, w: f64) -> Option<SlabGri
                 local_axis: LocalAxis {
                     ref_vector: [0.0, 0.0, 1.0],
                 },
-                // 剛接十字: 交点は共有節点で曲げ連続（両端 Fixed）。
+                // 全区間 Fixed（曲げ連続）。受け/架けは Uz-only RigidLink で表現。
                 end_cond: [EndCondition::Fixed, EndCondition::Fixed],
                 force_regime: ForceRegime::Auto,
                 rigid_zone: Default::default(),
@@ -247,26 +287,41 @@ pub fn build_slab_grillage(model: &Model, slab: &Slab, w: f64) -> Option<SlabGri
     // 支点集合（端点＝大梁接続点）。
     let support_nodes: std::collections::HashSet<usize> =
         support_origin.iter().map(|(n, _)| *n).collect();
-    // 支点拘束マスク: Ux,Uy,Uz,Rz 固定・Rx,Ry 自由（鉛直単純支持＋面内拘束）。
-    let mut sup_mask = Dof6Mask::FREE;
-    for d in [Dof::Ux, Dof::Uy, Dof::Uz, Dof::Rz] {
-        sup_mask.set_fixed(d);
+    // 支点拘束（向き依存）: 既定は全並進＋全回転を固定し、そこに取り付く各小梁の
+    // **主曲げ回転のみ**を解放する（＝大梁への両端ピン）。ねじり（自軸回転）は
+    // 固定のまま残す。これにより (1) ねじり剛体回転〔機構〕を生じず、(2) 剛接十字が
+    // 交差材のねじり剛性で曲げ連続を効かせる（たわみ抑制）ことができる。
+    let mut sup_free: Vec<Dof6Mask> = vec![Dof6Mask::FREE; reg.coords.len()];
+    for j in &js {
+        let ia = reg.get_or_add(j.a);
+        let ib = reg.get_or_add(j.b);
+        let major = major_bending_dof(j.a, j.b);
+        sup_free[ia].set_fixed(major); // ここでは「解放する回転」を記録（後で set_free）。
+        sup_free[ib].set_fixed(major);
     }
-
     let nodes: Vec<Node> = reg
         .coords
         .iter()
         .enumerate()
-        .map(|(i, c)| Node {
-            id: NodeId(i as u32),
-            coord: *c,
-            restraint: if support_nodes.contains(&i) {
-                sup_mask
+        .map(|(i, c)| {
+            let r = if support_nodes.contains(&i) {
+                let mut m = Dof6Mask::FIXED; // 全並進＋全回転固定を基準に、
+                for d in [Dof::Ux, Dof::Uy, Dof::Uz, Dof::Rx, Dof::Ry, Dof::Rz] {
+                    if sup_free[i].is_fixed(d) {
+                        m.set_free(d); // 主曲げ回転だけ解放（両端ピン）。
+                    }
+                }
+                m
             } else {
                 Dof6Mask::FREE
-            },
-            mass: None,
-            story: None,
+            };
+            Node {
+                id: NodeId(i as u32),
+                coord: *c,
+                restraint: r,
+                mass: None,
+                story: None,
+            }
         })
         .collect();
 
@@ -282,11 +337,27 @@ pub fn build_slab_grillage(model: &Model, slab: &Slab, w: f64) -> Option<SlabGri
         fy: Some(235.0),
     }];
 
+    // ピン受け/架けの鉛直リンク: 架け梁の別節点(fresh, master)と受け梁の共有節点
+    // (shared, slave)の Uz のみを結合。曲げは伝えず鉛直せん断だけを伝える。
+    let mut uz_mask = Dof6Mask::FREE;
+    uz_mask.set_fixed(Dof::Uz);
+    let constraints: Vec<squid_n_core::model::Constraint> = uz_links
+        .iter()
+        .map(
+            |(shared, fresh)| squid_n_core::model::Constraint::RigidLink {
+                master: NodeId(*fresh as u32),
+                slaves: vec![NodeId(*shared as u32)],
+                dofs: uz_mask,
+            },
+        )
+        .collect();
+
     let sub = Model {
         nodes,
         elements,
         sections: sub_sections,
         materials,
+        constraints,
         load_cases: vec![LoadCase {
             id: LoadCaseId(0),
             name: "床格子".into(),
@@ -646,12 +717,14 @@ mod tests {
                         spacing: 2000.0,
                         support: [NodeId(4), NodeId(5)], // 縦（x=2000）
                         section: Some(SectionId(0)),
+                        pinned_onto: None,
                     },
                     JoistLine {
                         dir: [1.0, 0.0],
                         spacing: 2000.0,
                         support: [NodeId(6), NodeId(7)], // 横（y=2000）
                         section: Some(SectionId(0)),
+                        pinned_onto: None,
                     },
                 ],
                 loads: vec![],
@@ -694,5 +767,113 @@ mod tests {
         for r in &rs {
             assert!((r - r0).abs() / r0 < 1e-6, "非対称: {rs:?}");
         }
+    }
+
+    /// ピン受け/架け（`pinned_onto`）と剛接十字で結果が異なることを確認する。
+    /// 同一の対称十字を、(a) 両端固定＝剛接、(b) 小梁0 を小梁1 にピン接合＝架け、
+    /// で解き、架け梁（小梁0）の交点での曲げが解放されて設計曲げが変わることを見る。
+    #[test]
+    fn test_pin_vs_rigid_cross_differ() {
+        use squid_n_core::ids::SlabId;
+        use squid_n_core::model::{DistributionMethod, JoistLine, Slab};
+
+        let mk = |id: u32, x: f64, y: f64| Node {
+            id: NodeId(id),
+            coord: [x, y, 0.0],
+            restraint: Dof6Mask::FREE,
+            mass: None,
+            story: None,
+        };
+        // 受け梁を y=1000 に置き、架け梁（x=2000, y=0..4000）を 1000/3000 に非対称分割
+        // する。非対称だと交点回転が非ゼロになり、剛接（回転拘束）とピン（回転自由）で
+        // 曲げ分布が明確に変わる（対称分割だと交点回転が 0 で差が出ない）。
+        let base_nodes = vec![
+            mk(0, 0.0, 0.0),
+            mk(1, 4000.0, 0.0),
+            mk(2, 4000.0, 4000.0),
+            mk(3, 0.0, 4000.0),
+            mk(4, 2000.0, 0.0),
+            mk(5, 2000.0, 4000.0),
+            mk(6, 0.0, 1000.0),
+            mk(7, 4000.0, 1000.0),
+        ];
+        // 小梁0＝縦（x=2000, 節点4-5, 通常剛性・架け）,
+        // 小梁1＝横（y=2000, 節点6-7, 高剛性・受け）。受け梁を格段に硬くすると
+        // 交点で実際に鉛直荷重が伝達され、ピン/剛接の違いが表面化する
+        //（対称・同剛性だと交点で荷重が伝わらず差が出ない）。
+        // 剛接十字の曲げ連続は交差材の「ねじり剛性(GJ)」で効くため、`j` も大きくする。
+        // これにより剛接では架け梁の交点回転が拘束され（部分固定）、ピン（回転自由）と
+        // 明確に異なる曲げ分布になる。
+        let stiff = {
+            let mut s = beam_section(1);
+            s.iy = 1.0e11;
+            s.iz = 1.0e11;
+            s.j = 1.0e11;
+            s
+        };
+        let make_model = |pinned_onto: Option<usize>| Model {
+            nodes: base_nodes.clone(),
+            sections: vec![beam_section(0), stiff.clone()],
+            slabs: vec![Slab {
+                id: SlabId(0),
+                boundary: vec![NodeId(0), NodeId(1), NodeId(2), NodeId(3)],
+                joists: vec![
+                    JoistLine {
+                        dir: [0.0, 1.0],
+                        spacing: 2000.0,
+                        support: [NodeId(4), NodeId(5)],
+                        section: Some(SectionId(0)),
+                        pinned_onto, // 小梁0 を小梁1 にピン（架け）
+                    },
+                    JoistLine {
+                        dir: [1.0, 0.0],
+                        spacing: 2000.0,
+                        support: [NodeId(6), NodeId(7)],
+                        section: Some(SectionId(1)),
+                        pinned_onto: None,
+                    },
+                ],
+                loads: vec![],
+                method: DistributionMethod::TriTrapezoid,
+                kind: Default::default(),
+                one_way: None,
+                edge_supported: None,
+                usage: None,
+                thickness: None,
+            }],
+            ..Default::default()
+        };
+        let w = 0.005_f64;
+
+        // (a) 剛接十字（pinned_onto=None）。
+        let m_rigid = make_model(None);
+        let g_rigid = build_slab_grillage(&m_rigid, &m_rigid.slabs[0], w).expect("剛接構築");
+        let s_rigid = solve_grillage(&g_rigid.model, LoadCaseId(0)).expect("剛接解");
+        let f_rigid = joist_design_forces(&g_rigid, &s_rigid);
+
+        // (b) ピン受け/架け（小梁0 を小梁1 にピン接合）。
+        let m_pin = make_model(Some(1));
+        let g_pin = build_slab_grillage(&m_pin, &m_pin.slabs[0], w).expect("ピン構築");
+        let s_pin = solve_grillage(&g_pin.model, LoadCaseId(0)).expect("ピン解");
+        let f_pin = joist_design_forces(&g_pin, &s_pin);
+
+        // 架け梁（小梁0）の設計曲げは、剛接とピンで有意に異なる。
+        let m0_rigid = f_rigid[0].2;
+        let m0_pin = f_pin[0].2;
+        assert!(
+            (m0_rigid - m0_pin).abs() / m0_rigid.max(1.0) > 0.05,
+            "架け梁の曲げが剛接({m0_rigid})とピン({m0_pin})で変わらない"
+        );
+        // 総載荷は接合条件によらず不変（釣合いの健全性）。
+        let total = w * 2000.0 * 4000.0 * 2.0;
+        let sum_pin: f64 = g_pin
+            .support_origin
+            .iter()
+            .map(|(n, _)| s_pin.reactions[*n][2])
+            .sum();
+        assert!(
+            (sum_pin - total).abs() / total < 1e-6,
+            "ピン時の支点反力総和={sum_pin} 全載荷={total}"
+        );
     }
 }

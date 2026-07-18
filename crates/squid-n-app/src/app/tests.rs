@@ -2381,6 +2381,7 @@ fn test_floor_design_checks_joist_and_slab() {
         spacing: 2000.0,
         support: [NodeId(4), NodeId(5)],
         section: Some(SectionId(0)),
+        pinned_onto: None,
     });
     model.validate().expect("validate");
     let app = App {
@@ -2442,6 +2443,7 @@ fn test_floor_design_skips_materialized_joist() {
         spacing: 2000.0,
         support: [NodeId(4), NodeId(5)],
         section: Some(SectionId(0)),
+        pinned_onto: None,
     });
     // 支持 N4–N5 を両端に持つ実 Beam を追加（実部材化相当）。
     let next = model.elements.len() as u32;
@@ -2516,12 +2518,14 @@ fn test_floor_design_uses_grillage_for_crossing_joists() {
             spacing: 2000.0,
             support: [NodeId(4), NodeId(5)],
             section: Some(SectionId(0)),
+            pinned_onto: None,
         },
         JoistLine {
             dir: [1.0, 0.0],
             spacing: 2000.0,
             support: [NodeId(6), NodeId(7)],
             section: Some(SectionId(0)),
+            pinned_onto: None,
         },
     ];
     model.validate().expect("validate");
