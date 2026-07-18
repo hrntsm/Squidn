@@ -1939,6 +1939,7 @@ fn make_slab_test_model() -> squid_n_core::model::Model {
         mk_beam(3, 3, 0),
     ];
     let slab = Slab {
+        usage: None,
         edge_supported: None,
         kind: Default::default(),
         one_way: None,
@@ -2042,6 +2043,7 @@ fn make_square_slab_test_model() -> squid_n_core::model::Model {
         mk_beam(3, 3, 0),
     ];
     let slab = Slab {
+        usage: None,
         edge_supported: None,
         kind: Default::default(),
         one_way: None,
@@ -2138,6 +2140,198 @@ fn test_sync_slab_loads_action_square_slab_triangle_distribution() {
             .iter()
             .any(|lc| lc.name == SLAB_AUTO_LOAD_CASE_NAME),
         "undo で「床荷重(自動)」ケースが消えるはず"
+    );
+}
+
+/// 床 Phase A-2: 用途（`SlabUsage`）を設定したスラブは、`sync_slab_loads_action`
+/// で固定荷重（DL・「床荷重(自動)」kind=Dead）と積載荷重（LL・「床積載(自動)」
+/// kind=Live）の 2 ケースに分離されることを確認する。LL は令別表第1 の
+/// **骨組用**積載（事務室=1800 N/m²）を用い、DL とは独立に総和保存する。
+#[test]
+fn test_sync_slab_loads_action_separates_dead_and_live() {
+    use squid_n_core::model::{LoadCaseKind, MemberLoadKind, SlabUsage};
+
+    let mut model = make_square_slab_test_model();
+    // 事務室用途を設定（骨組用 LL = 1800 N/m² = 1.8e-3 N/mm²）。
+    model.slabs[0].usage = Some(SlabUsage::Office);
+    model
+        .validate()
+        .expect("テストモデルは validate を通るはず");
+    let mut app = App {
+        model,
+        ..App::default()
+    };
+
+    app.sync_slab_loads_action();
+
+    fn sum_vertical(model: &squid_n_core::model::Model, name: &str) -> f64 {
+        model
+            .load_cases
+            .iter()
+            .find(|lc| lc.name == name)
+            .map(|c| {
+                c.member
+                    .iter()
+                    .map(|m| match m.kind {
+                        MemberLoadKind::Distributed { a, b, w1, w2 } => (w1 + w2) / 2.0 * (b - a),
+                        MemberLoadKind::Point { p, .. } => p,
+                    })
+                    .sum()
+            })
+            .unwrap_or(0.0)
+    }
+
+    // DL ケース: 従来どおり loads(0.005) を分配。
+    let dl = app
+        .model
+        .load_cases
+        .iter()
+        .find(|lc| lc.name == SLAB_AUTO_LOAD_CASE_NAME)
+        .expect("床荷重(自動)ケースが作られるはず");
+    assert_eq!(dl.kind, LoadCaseKind::Dead);
+    let area = 4000.0 * 4000.0;
+    assert!((sum_vertical(&app.model, SLAB_AUTO_LOAD_CASE_NAME) - 0.005 * area).abs() < 1e-6);
+
+    // LL ケース: 骨組用積載 1.8e-3 N/mm² を分配（DL とは別ケース・kind=Live）。
+    let ll = app
+        .model
+        .load_cases
+        .iter()
+        .find(|lc| lc.name == SLAB_LIVE_AUTO_LOAD_CASE_NAME)
+        .expect("床積載(自動)ケースが作られるはず");
+    assert_eq!(ll.kind, LoadCaseKind::Live);
+    assert!((sum_vertical(&app.model, SLAB_LIVE_AUTO_LOAD_CASE_NAME) - 1.8e-3 * area).abs() < 1e-6);
+
+    // 用途を外すと LL ケースは空同期され、寄与が無くなる（新規なら作られない）。
+    app.model.slabs[0].usage = None;
+    app.sync_slab_loads_action();
+    assert!(
+        (sum_vertical(&app.model, SLAB_LIVE_AUTO_LOAD_CASE_NAME)).abs() < 1e-12,
+        "用途を外したら積載寄与は 0 になるはず"
+    );
+}
+
+/// 床 Phase A-3: 用途を設定したスラブは地震用積載（LiveSeismic）ケースも同期され、
+/// 地震用重量の重力ケース選択（`gravity_cases_for_seismic_weight`）が
+/// 骨組用 Live ではなく地震用 LiveSeismic を採用することを確認する
+/// （令85条1項の地震用値〔事務室=800 N/m²〕を地震用重量に用いる）。
+#[test]
+fn test_sync_slab_loads_action_seismic_live_case() {
+    use squid_n_core::model::{LoadCaseKind, MemberLoadKind, SlabUsage};
+
+    let mut model = make_square_slab_test_model();
+    model.slabs[0].usage = Some(SlabUsage::Office);
+    model
+        .validate()
+        .expect("テストモデルは validate を通るはず");
+    let mut app = App {
+        model,
+        ..App::default()
+    };
+    app.sync_slab_loads_action();
+
+    let sum_vertical = |name: &str| -> f64 {
+        app.model
+            .load_cases
+            .iter()
+            .find(|lc| lc.name == name)
+            .map(|c| {
+                c.member
+                    .iter()
+                    .map(|m| match m.kind {
+                        MemberLoadKind::Distributed { a, b, w1, w2 } => (w1 + w2) / 2.0 * (b - a),
+                        MemberLoadKind::Point { p, .. } => p,
+                    })
+                    .sum()
+            })
+            .unwrap_or(0.0)
+    };
+
+    let area = 4000.0 * 4000.0;
+    // 地震用積載ケース: 地震用値 800 N/m² = 8e-4 N/mm²。
+    let ls = app
+        .model
+        .load_cases
+        .iter()
+        .find(|lc| lc.name == SLAB_LIVE_SEISMIC_AUTO_LOAD_CASE_NAME)
+        .expect("床地震用積載(自動)ケースが作られるはず");
+    assert_eq!(ls.kind, LoadCaseKind::LiveSeismic);
+    assert!((sum_vertical(SLAB_LIVE_SEISMIC_AUTO_LOAD_CASE_NAME) - 8e-4 * area).abs() < 1e-6);
+
+    // 地震用重量の重力ケース: DL(床荷重) と LiveSeismic(床地震用積載) を含み、
+    // 骨組用 Live(床積載) は含まない（LiveSeismic 優先）。
+    let dl_id = app
+        .model
+        .load_cases
+        .iter()
+        .find(|lc| lc.name == SLAB_AUTO_LOAD_CASE_NAME)
+        .unwrap()
+        .id;
+    let live_id = app
+        .model
+        .load_cases
+        .iter()
+        .find(|lc| lc.name == SLAB_LIVE_AUTO_LOAD_CASE_NAME)
+        .unwrap()
+        .id;
+    let ls_id = ls.id;
+    let gravity = gravity_cases_for_seismic_weight(&app.model);
+    assert!(gravity.contains(&dl_id), "DL(床荷重)は地震用重量に含むはず");
+    assert!(
+        gravity.contains(&ls_id),
+        "LiveSeismic(床地震用積載)は地震用重量に含むはず"
+    );
+    assert!(
+        !gravity.contains(&live_id),
+        "骨組用 Live(床積載)は地震用重量に含めないはず（LiveSeismic 優先）"
+    );
+}
+
+/// 床 Phase A-3 レビュー指摘: 用途の地震用値が明示的に 0（骨組用のみ正）の場合、
+/// 地震用積載(LiveSeismic)ケースは生成されないが、骨組用 Live(床積載)ケースへ
+/// フォールバックして地震用重量が過大にならないことを確認する
+/// （自動生成の骨組用 Live ケースは地震用重量の代用対象から除外される）。
+#[test]
+fn test_gravity_cases_excludes_auto_frame_live_when_no_seismic() {
+    use squid_n_core::model::SlabUsage;
+
+    let mut model = make_square_slab_test_model();
+    // 骨組用のみ正・地震用 0 の用途（serde 由来を想定した異常系）。
+    model.slabs[0].usage = Some(SlabUsage::Custom {
+        floor: 3e-3,
+        frame: 2e-3,
+        seismic: 0.0,
+    });
+    model
+        .validate()
+        .expect("テストモデルは validate を通るはず");
+    let mut app = App {
+        model,
+        ..App::default()
+    };
+    app.sync_slab_loads_action();
+
+    // 地震用値 0 なので LiveSeismic ケースは生成されない。
+    assert!(
+        !app.model
+            .load_cases
+            .iter()
+            .any(|lc| lc.name == SLAB_LIVE_SEISMIC_AUTO_LOAD_CASE_NAME),
+        "地震用値 0 なら床地震用積載(自動)は作られないはず"
+    );
+    // 骨組用 Live ケースは生成される。
+    let live_id = app
+        .model
+        .load_cases
+        .iter()
+        .find(|lc| lc.name == SLAB_LIVE_AUTO_LOAD_CASE_NAME)
+        .expect("床積載(自動)は作られるはず")
+        .id;
+    // 地震用重量の重力ケースに、骨組用 Live(床積載)を含めてはならない。
+    let gravity = gravity_cases_for_seismic_weight(&app.model);
+    assert!(
+        !gravity.contains(&live_id),
+        "自動生成の骨組用 Live(床積載)は地震用重量にフォールバックしてはならない"
     );
 }
 

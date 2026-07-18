@@ -224,6 +224,7 @@ fn test_beam_new_slab_cooperation_width_amplifies_iy() {
             fy: None,
         }],
         slabs: vec![Slab {
+            usage: None,
             id: SlabId(0),
             boundary: vec![NodeId(0), NodeId(1), NodeId(2), NodeId(3)],
             joists: vec![],
@@ -330,6 +331,7 @@ fn test_beam_new_composite_steel_beam_averages_stiffness() {
             fy: Some(235.0),
         }],
         slabs: vec![Slab {
+            usage: None,
             id: SlabId(0),
             boundary: vec![NodeId(0), NodeId(1), NodeId(2), NodeId(3)],
             joists: vec![],

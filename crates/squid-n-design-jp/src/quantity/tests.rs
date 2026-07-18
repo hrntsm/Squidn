@@ -275,6 +275,7 @@ fn test_girder_formwork_slab_deduction() {
     model.nodes.push(node(7, 6_000.0, -5_000.0, 3_500.0));
     for (sid, (a, b)) in [(0u32, (5u32, 4u32)), (1u32, (6u32, 7u32))] {
         model.slabs.push(Slab {
+            usage: None,
             id: SlabId(sid),
             boundary: vec![NodeId(2), NodeId(3), NodeId(a), NodeId(b)],
             joists: vec![],
@@ -394,6 +395,7 @@ fn test_slab_quantity() {
     model.nodes.push(node(4, 0.0, 5_000.0, 3_500.0));
     model.nodes.push(node(5, 6_000.0, 5_000.0, 3_500.0));
     model.slabs.push(Slab {
+        usage: None,
         id: SlabId(0),
         boundary: vec![NodeId(2), NodeId(3), NodeId(5), NodeId(4)],
         joists: vec![],

@@ -62,8 +62,19 @@ use fem::{fem_trapezoid, fem_triangle, fem_uniform};
 /// 設計している（床スラブは全体座標 XY 平面内（Z一定）にあることを仮定する）。
 /// 入隅の片持ちスラブは本実装では未対応。
 pub fn distribute_slab(model: &Model, slab: &Slab) -> Vec<BeamLoad> {
+    // 従来互換: `slab.loads`（固定荷重 DL）の総和を分配する。
+    distribute_slab_w(model, slab, slab.dead_intensity())
+}
+
+/// 指定した面荷重強度 `w`（N/mm²）のみをスラブ境界へ分配する。
+///
+/// 分岐ロジックは [`distribute_slab`] と同一で、荷重源だけを引数 `w` に差し替える。
+/// これにより DL（固定荷重）と LL（積載荷重）を別々の荷重ケースへ分配できる
+/// （令85条1項の床用/骨組用/地震用の使い分けや、荷重組合せでの DL/LL 係数分けに用いる）。
+/// `w == 0.0` の場合は空の分配結果を返す。
+pub fn distribute_slab_w(model: &Model, slab: &Slab, w: f64) -> Vec<BeamLoad> {
     let mut loads = Vec::new();
-    if slab.boundary.len() < 3 {
+    if slab.boundary.len() < 3 || w == 0.0 {
         return loads;
     }
     let Some(coords) = boundary_coords(model, slab) else {
@@ -72,44 +83,39 @@ pub fn distribute_slab(model: &Model, slab: &Slab) -> Vec<BeamLoad> {
 
     let rect_dims = slab_dimensions(model, slab);
 
-    for area_load in &slab.loads {
-        let w = area_load.value;
-        match slab.kind {
-            SlabKind::Corner => {
-                distribute_corner(slab, &coords, w, &mut loads);
-                continue;
+    match slab.kind {
+        SlabKind::Corner => {
+            distribute_corner(slab, &coords, w, &mut loads);
+            return loads;
+        }
+        SlabKind::Cantilever => {
+            match &slab.edge_supported {
+                Some(supported) => distribute_polygon_supported(&coords, w, &mut loads, supported),
+                None => distribute_cantilever(&coords, w, &mut loads),
             }
-            SlabKind::Cantilever => {
-                match &slab.edge_supported {
-                    Some(supported) => {
-                        distribute_polygon_supported(&coords, w, &mut loads, supported)
-                    }
-                    None => distribute_cantilever(&coords, w, &mut loads),
-                }
-                continue;
-            }
-            SlabKind::Interior => {
-                if let Some(supported) = &slab.edge_supported {
-                    distribute_polygon_supported(&coords, w, &mut loads, supported);
-                    continue;
-                }
+            return loads;
+        }
+        SlabKind::Interior => {
+            if let Some(supported) = &slab.edge_supported {
+                distribute_polygon_supported(&coords, w, &mut loads, supported);
+                return loads;
             }
         }
-        match rect_dims {
-            Some((lx, ly)) => {
-                let use_joists = !slab.joists.is_empty()
-                    && matches!(
-                        slab.method,
-                        DistributionMethod::TriTrapezoid | DistributionMethod::OneWay
-                    );
-                if use_joists {
-                    distribute_rect_with_joists(model, slab, &coords, w, &mut loads);
-                } else {
-                    distribute_rect(slab, &coords, lx, ly, w, &mut loads);
-                }
+    }
+    match rect_dims {
+        Some((lx, ly)) => {
+            let use_joists = !slab.joists.is_empty()
+                && matches!(
+                    slab.method,
+                    DistributionMethod::TriTrapezoid | DistributionMethod::OneWay
+                );
+            if use_joists {
+                distribute_rect_with_joists(model, slab, &coords, w, &mut loads);
+            } else {
+                distribute_rect(slab, &coords, lx, ly, w, &mut loads);
             }
-            None => distribute_polygon(&coords, w, &mut loads),
         }
+        None => distribute_polygon(&coords, w, &mut loads),
     }
 
     loads

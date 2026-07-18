@@ -626,8 +626,20 @@ pub fn install_japanese_fonts(ctx: &egui::Context) {
     eprintln!("[info] 日本語フォントを読み込みました: {path}");
 }
 
-/// `sync_slab_loads_action` が同期先とする専用荷重ケース名（レビュー §1.1）。
+/// `sync_slab_loads_action` が固定荷重（DL）の同期先とする専用荷重ケース名
+/// （レビュー §1.1）。スラブの `loads`（仕上げ等の固定荷重）を分配する。
 pub const SLAB_AUTO_LOAD_CASE_NAME: &str = "床荷重(自動)";
+
+/// `sync_slab_loads_action` が積載荷重（LL・骨組用）の同期先とする専用荷重
+/// ケース名。スラブ用途（`SlabUsage`）から令別表第1 の骨組用積載を分配する
+/// （長期骨組解析用。令85条1項）。
+pub const SLAB_LIVE_AUTO_LOAD_CASE_NAME: &str = "床積載(自動)";
+
+/// `sync_slab_loads_action` が地震用積載荷重（LL・地震用）の同期先とする専用
+/// 荷重ケース名（kind=LiveSeismic）。スラブ用途から令別表第1 の**地震用**積載を
+/// 分配する。地震用重量の集計（`gravity_cases_for_seismic_weight` が
+/// LiveSeismic を優先採用）に用いる（令85条1項・令88条）。
+pub const SLAB_LIVE_SEISMIC_AUTO_LOAD_CASE_NAME: &str = "床地震用積載(自動)";
 
 /// `sync_self_weight_action` が同期先とする専用荷重ケース名。
 /// `squid_n_load::self_weight` の定数を単一ソースオブトゥルースとして再公開する。
@@ -687,7 +699,11 @@ pub fn column_live_load_factors(model: &squid_n_core::model::Model) -> Vec<(Elem
 /// - `kind == LiveSeismic`（地震用積載）のケースがあれば併せて対象とする。
 ///   無ければ `kind == Live`（長期用積載）で代用する
 ///   （地震用の積載荷重には地震用の値を用いる（令85条）。地震用の値が
-///   個別に定義されていなければ長期用の値をそのまま使う）。
+///   個別に定義されていなければ長期用の値をそのまま使う）。ただし
+///   スラブ自動生成の骨組用積載ケース（[`SLAB_LIVE_AUTO_LOAD_CASE_NAME`]）は
+///   **骨組用**の値を持つため、この代用対象から除外する（地震用値が明示的に
+///   0 の用途で骨組用値へフォールバックし地震用重量が過大になるのを防ぐ。
+///   スラブの地震用積載は常に [`SLAB_LIVE_SEISMIC_AUTO_LOAD_CASE_NAME`] が担う）。
 /// - いずれのケースも `kind` が設定されていない（全ケースが既定値 `Other`）
 ///   場合は、旧スキーマ・後方互換のため先頭ケースのみを返す
 ///   （並び順に依存する旧規約。新規モデルは kind 設定を推奨）。
@@ -722,7 +738,9 @@ fn gravity_cases_for_seismic_weight(model: &squid_n_core::model::Model) -> Vec<L
             model
                 .load_cases
                 .iter()
-                .filter(|lc| lc.kind == LoadCaseKind::Live)
+                .filter(|lc| {
+                    lc.kind == LoadCaseKind::Live && lc.name != SLAB_LIVE_AUTO_LOAD_CASE_NAME
+                })
                 .map(|lc| lc.id),
         );
     }

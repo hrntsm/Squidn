@@ -1,7 +1,7 @@
 use crate::app::App;
 use squid_n_core::ids::{NodeId, SlabId};
-use squid_n_core::model::{AreaLoad, DistributionMethod, OneWayDir, SlabKind};
-use squid_n_edit::{AddSlab, DeleteSlab, SetSlabKind, SetSlabOneWay};
+use squid_n_core::model::{AreaLoad, DistributionMethod, OneWayDir, SlabKind, SlabUsage};
+use squid_n_edit::{AddSlab, DeleteSlab, SetSlabKind, SetSlabOneWay, SetSlabUsage};
 
 /// スラブ追加フォームのドラフト状態（GUI 専用）。
 /// `nodes` は境界4節点（頂点0→1→2→3→0 の順で外周を辿る）の選択状態。
@@ -13,6 +13,8 @@ pub struct SlabDraft {
     /// 荷重値の入力文字列。**UI 表示は kN/m²**（内部格納は ×1e-3 した N/mm²）。
     pub load_value: String,
     pub method: DistributionMethod,
+    /// スラブ用途（積載荷重プリセット。`None` は積載寄与なし）。
+    pub usage: Option<SlabUsage>,
 }
 
 impl Default for SlabDraft {
@@ -22,7 +24,41 @@ impl Default for SlabDraft {
             load_kind: "DL".to_string(),
             load_value: "0".to_string(),
             method: DistributionMethod::TriTrapezoid,
+            usage: None,
         }
+    }
+}
+
+/// 用途選択で提示するプリセット（令別表第1）。`None` は「なし（積載寄与なし）」。
+/// `Custom` は UI からは扱わない（モデル/シリアライズでは利用可）。
+const USAGE_PRESETS: &[Option<SlabUsage>] = &[
+    None,
+    Some(SlabUsage::Residential),
+    Some(SlabUsage::Office),
+    Some(SlabUsage::Classroom),
+    Some(SlabUsage::Store),
+    Some(SlabUsage::AssemblyFixed),
+    Some(SlabUsage::AssemblyOther),
+    Some(SlabUsage::Corridor),
+    Some(SlabUsage::Garage),
+    Some(SlabUsage::RoofResidential),
+    Some(SlabUsage::RoofStore),
+];
+
+fn usage_label(u: Option<SlabUsage>) -> &'static str {
+    match u {
+        None => "なし",
+        Some(SlabUsage::Residential) => "住宅の居室・寝室・病室",
+        Some(SlabUsage::Office) => "事務室",
+        Some(SlabUsage::Classroom) => "教室",
+        Some(SlabUsage::Store) => "百貨店・店舗の売場",
+        Some(SlabUsage::AssemblyFixed) => "集会室・客席（固定席）",
+        Some(SlabUsage::AssemblyOther) => "集会室・客席（その他）",
+        Some(SlabUsage::Corridor) => "廊下・玄関・階段",
+        Some(SlabUsage::Garage) => "自動車車庫・通路",
+        Some(SlabUsage::RoofResidential) => "屋上・バルコニー（住宅系）",
+        Some(SlabUsage::RoofStore) => "屋上・バルコニー（学校・百貨店系）",
+        Some(SlabUsage::Custom { .. }) => "任意入力",
     }
 }
 
@@ -63,6 +99,7 @@ pub fn slabs_table(ui: &mut egui::Ui, app: &mut App) {
     let mut pending_delete: Option<SlabId> = None;
     let mut pending_kind: Vec<(SlabId, SlabKind)> = Vec::new();
     let mut pending_one_way: Vec<(SlabId, Option<OneWayDir>)> = Vec::new();
+    let mut pending_usage: Vec<(SlabId, Option<SlabUsage>)> = Vec::new();
 
     TableBuilder::new(ui)
         .striped(true)
@@ -72,9 +109,19 @@ pub fn slabs_table(ui: &mut egui::Ui, app: &mut App) {
         .column(Column::initial(140.0))
         .column(Column::initial(90.0))
         .column(Column::initial(90.0))
+        .column(Column::initial(180.0))
         .column(Column::auto())
         .header(20.0, |mut h| {
-            for t in &["ID", "境界節点", "荷重", "分配法", "種別", "一方向", ""] {
+            for t in &[
+                "ID",
+                "境界節点",
+                "荷重",
+                "分配法",
+                "種別",
+                "一方向",
+                "用途",
+                "",
+            ] {
                 h.col(|ui| {
                     ui.strong(*t);
                 });
@@ -140,6 +187,21 @@ pub fn slabs_table(ui: &mut egui::Ui, app: &mut App) {
                         });
                 });
                 row.col(|ui| {
+                    egui::ComboBox::from_id_salt(("slab_usage", slab.id.0))
+                        .selected_text(usage_label(slab.usage))
+                        .show_ui(ui, |ui| {
+                            for &u in USAGE_PRESETS {
+                                if ui
+                                    .selectable_label(slab.usage == u, usage_label(u))
+                                    .clicked()
+                                    && slab.usage != u
+                                {
+                                    pending_usage.push((slab.id, u));
+                                }
+                            }
+                        });
+                });
+                row.col(|ui| {
                     if ui.button("🗑").on_hover_text("このスラブを削除").clicked() {
                         pending_delete = Some(slab.id);
                     }
@@ -147,8 +209,10 @@ pub fn slabs_table(ui: &mut egui::Ui, app: &mut App) {
             });
         });
 
-    let had_pending =
-        !pending_kind.is_empty() || !pending_one_way.is_empty() || pending_delete.is_some();
+    let had_pending = !pending_kind.is_empty()
+        || !pending_one_way.is_empty()
+        || !pending_usage.is_empty()
+        || pending_delete.is_some();
     for (id, kind) in pending_kind {
         app.undo
             .run(&mut app.model, Box::new(SetSlabKind { id, kind }));
@@ -156,6 +220,10 @@ pub fn slabs_table(ui: &mut egui::Ui, app: &mut App) {
     for (id, one_way) in pending_one_way {
         app.undo
             .run(&mut app.model, Box::new(SetSlabOneWay { id, one_way }));
+    }
+    for (id, usage) in pending_usage {
+        app.undo
+            .run(&mut app.model, Box::new(SetSlabUsage { id, usage }));
     }
     if let Some(id) = pending_delete {
         app.undo.run(&mut app.model, Box::new(DeleteSlab { id }));
@@ -206,6 +274,28 @@ pub fn slabs_table(ui: &mut egui::Ui, app: &mut App) {
         ui.add(egui::TextEdit::singleline(&mut app.slab_draft.load_kind).desired_width(60.0));
         ui.label("荷重 [kN/m²]:");
         ui.add(egui::TextEdit::singleline(&mut app.slab_draft.load_value).desired_width(80.0));
+    });
+
+    ui.horizontal(|ui| {
+        ui.label("用途（積載荷重）:")
+            .on_hover_text("令別表第1 の積載荷重（骨組用）を「床積載(自動)」ケースへ分配します");
+        egui::ComboBox::from_id_salt("slab_draft_usage")
+            .selected_text(usage_label(app.slab_draft.usage))
+            .show_ui(ui, |ui| {
+                for &u in USAGE_PRESETS {
+                    ui.selectable_value(&mut app.slab_draft.usage, u, usage_label(u));
+                }
+            });
+        if let Some(u) = app.slab_draft.usage {
+            use squid_n_core::model::LoadPurpose;
+            // 表示は kN/m²（内部 N/mm² を ×1e3）。
+            ui.label(format!(
+                "床用 {:.2} / 骨組用 {:.2} / 地震用 {:.2} kN/m²",
+                u.live_load(LoadPurpose::Floor) * 1e3,
+                u.live_load(LoadPurpose::Frame) * 1e3,
+                u.live_load(LoadPurpose::Seismic) * 1e3,
+            ));
+        }
     });
 
     ui.horizontal(|ui| {
@@ -261,6 +351,7 @@ pub fn slabs_table(ui: &mut egui::Ui, app: &mut App) {
                 joists: Vec::new(),
                 loads: vec![AreaLoad { kind, value }],
                 method: app.slab_draft.method,
+                usage: app.slab_draft.usage,
             }),
         );
         app.staleness.mark_edited();

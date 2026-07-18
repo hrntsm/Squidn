@@ -265,6 +265,8 @@ pub struct AddSlab {
     pub joists: Vec<squid_n_core::model::JoistLine>,
     pub loads: Vec<squid_n_core::model::AreaLoad>,
     pub method: squid_n_core::model::DistributionMethod,
+    /// スラブ用途（積載荷重プリセット。`None` は積載寄与なし）。
+    pub usage: Option<squid_n_core::model::SlabUsage>,
 }
 
 impl EditCommand for AddSlab {
@@ -274,6 +276,7 @@ impl EditCommand for AddSlab {
             edge_supported: None,
             kind: Default::default(),
             one_way: None,
+            usage: self.usage,
             id: new_id,
             boundary: self.boundary.clone(),
             joists: self.joists.clone(),

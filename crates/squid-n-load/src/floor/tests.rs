@@ -110,6 +110,7 @@ fn make_rect_slab_model(lx: f64, ly: f64, method: DistributionMethod, w: f64) ->
         ..Default::default()
     };
     let slab = Slab {
+        usage: None,
         edge_supported: None,
         kind: Default::default(),
         one_way: None,
@@ -246,6 +247,7 @@ fn polygon_slab_model(pts: &[(f64, f64)], method: DistributionMethod, w: f64) ->
         ..Default::default()
     };
     let slab = Slab {
+        usage: None,
         edge_supported: None,
         kind: Default::default(),
         one_way: None,
@@ -362,6 +364,7 @@ fn test_cantilever_conservation() {
         ..Default::default()
     };
     let slab = Slab {
+        usage: None,
         edge_supported: None,
         kind: SlabKind::Cantilever,
         one_way: None,
@@ -433,6 +436,7 @@ fn test_joist_two_stage_transfer_conservation() {
         },
     ];
     let slab = Slab {
+        usage: None,
         edge_supported: None,
         kind: Default::default(),
         one_way: None,
@@ -652,6 +656,7 @@ fn test_corner_slab_all_load_to_column_node() {
         ..Default::default()
     };
     let slab = Slab {
+        usage: None,
         edge_supported: None,
         kind: SlabKind::Corner,
         one_way: None,
@@ -701,6 +706,7 @@ fn test_corner_slab_ignores_one_way_and_edge_supported() {
         ..Default::default()
     };
     let slab = Slab {
+        usage: None,
         edge_supported: Some(vec![true, true, true, true]),
         kind: SlabKind::Corner,
         one_way: Some(OneWayDir::X),
@@ -742,6 +748,7 @@ fn test_cantilever_edge_supported_three_of_four_conservation() {
         ..Default::default()
     };
     let slab = Slab {
+        usage: None,
         edge_supported: Some(vec![true, true, false, true]),
         kind: SlabKind::Cantilever,
         one_way: None,
