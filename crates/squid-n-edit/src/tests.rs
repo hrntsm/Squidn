@@ -1567,6 +1567,54 @@ fn test_set_slab_kind_and_one_way_roundtrip() {
 }
 
 #[test]
+fn test_set_slab_joists_roundtrip() {
+    use squid_n_core::model::{DistributionMethod, JoistLine};
+    let mut model = empty_model();
+    let mut stack = UndoStack::new();
+    stack.run(
+        &mut model,
+        Box::new(AddSlab {
+            boundary: vec![NodeId(0), NodeId(1), NodeId(2), NodeId(3)],
+            joists: vec![],
+            loads: vec![],
+            method: DistributionMethod::TriTrapezoid,
+            usage: None,
+        }),
+    );
+    assert!(model.slabs[0].joists.is_empty());
+
+    let joists = vec![JoistLine {
+        dir: [0.0, 1.0],
+        spacing: 900.0,
+        support: [NodeId(0), NodeId(3)],
+    }];
+    stack.run(
+        &mut model,
+        Box::new(SetSlabJoists {
+            id: SlabId(0),
+            joists: joists.clone(),
+        }),
+    );
+    assert_eq!(model.slabs[0].joists, joists);
+
+    // undo で元の空 joists に戻る（対称逆操作）。
+    stack.undo(&mut model);
+    assert!(model.slabs[0].joists.is_empty());
+    stack.redo(&mut model);
+    assert_eq!(model.slabs[0].joists, joists);
+
+    // 存在しない SlabId は Noop（モデル不変・undo スタックも安全）。
+    stack.run(
+        &mut model,
+        Box::new(SetSlabJoists {
+            id: SlabId(99),
+            joists: vec![],
+        }),
+    );
+    assert_eq!(model.slabs[0].joists, joists);
+}
+
+#[test]
 fn test_set_multi_opening_mode_roundtrip() {
     use squid_n_core::model::MultiOpeningMode;
     let mut model = empty_model();

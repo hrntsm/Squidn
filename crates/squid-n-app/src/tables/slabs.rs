@@ -1,7 +1,9 @@
 use crate::app::App;
 use squid_n_core::ids::{NodeId, SlabId};
-use squid_n_core::model::{AreaLoad, DistributionMethod, OneWayDir, SlabKind, SlabUsage};
-use squid_n_edit::{AddSlab, DeleteSlab, SetSlabKind, SetSlabOneWay, SetSlabUsage};
+use squid_n_core::model::{
+    AreaLoad, DistributionMethod, JoistLine, OneWayDir, SlabKind, SlabUsage,
+};
+use squid_n_edit::{AddSlab, DeleteSlab, SetSlabJoists, SetSlabKind, SetSlabOneWay, SetSlabUsage};
 
 /// スラブ追加フォームのドラフト状態（GUI 専用）。
 /// `nodes` は境界4節点（頂点0→1→2→3→0 の順で外周を辿る）の選択状態。
@@ -15,6 +17,12 @@ pub struct SlabDraft {
     pub method: DistributionMethod,
     /// スラブ用途（積載荷重プリセット。`None` は積載寄与なし）。
     pub usage: Option<SlabUsage>,
+    /// 小梁入力の対象スラブ（小梁編集セクション用）。
+    pub joist_target: Option<SlabId>,
+    /// 小梁の支持節点（両端。小梁が架かる2節点）。
+    pub joist_supports: [Option<NodeId>; 2],
+    /// 小梁の負担幅 spacing の入力文字列（**UI 表示は mm**、内部も mm）。
+    pub joist_spacing: String,
 }
 
 impl Default for SlabDraft {
@@ -25,6 +33,9 @@ impl Default for SlabDraft {
             load_value: "0".to_string(),
             method: DistributionMethod::TriTrapezoid,
             usage: None,
+            joist_target: None,
+            joist_supports: [None; 2],
+            joist_spacing: "0".to_string(),
         }
     }
 }
@@ -110,6 +121,7 @@ pub fn slabs_table(ui: &mut egui::Ui, app: &mut App) {
         .column(Column::initial(90.0))
         .column(Column::initial(90.0))
         .column(Column::initial(180.0))
+        .column(Column::initial(60.0))
         .column(Column::auto())
         .header(20.0, |mut h| {
             for t in &[
@@ -120,6 +132,7 @@ pub fn slabs_table(ui: &mut egui::Ui, app: &mut App) {
                 "種別",
                 "一方向",
                 "用途",
+                "小梁",
                 "",
             ] {
                 h.col(|ui| {
@@ -200,6 +213,14 @@ pub fn slabs_table(ui: &mut egui::Ui, app: &mut App) {
                                 }
                             }
                         });
+                });
+                row.col(|ui| {
+                    let cnt = slab.joists.len();
+                    ui.label(if cnt == 0 {
+                        "―".to_string()
+                    } else {
+                        format!("{cnt}本")
+                    });
                 });
                 row.col(|ui| {
                     if ui.button("🗑").on_hover_text("このスラブを削除").clicked() {
@@ -352,6 +373,150 @@ pub fn slabs_table(ui: &mut egui::Ui, app: &mut App) {
                 loads: vec![AreaLoad { kind, value }],
                 method: app.slab_draft.method,
                 usage: app.slab_draft.usage,
+            }),
+        );
+        app.staleness.mark_edited();
+    }
+
+    joists_section(ui, app);
+}
+
+/// 小梁（`JoistLine`）の入力セクション。対象スラブを選び、支持2節点＋負担幅
+/// `spacing` で小梁を追加/削除する。小梁は矩形スラブの二段階伝達
+/// （`distribute_rect_with_joists`）でのみ使われ、分配法が「三角/台形」または
+/// 「一方向」のとき有効になる（それ以外の分配法では無視される）。
+///
+/// 小梁の架かる方向 `dir` は支持2節点の平面（XY）ベクトルから自動算定する。
+fn joists_section(ui: &mut egui::Ui, app: &mut App) {
+    ui.separator();
+    ui.strong("小梁を入力（矩形スラブの二段階伝達）");
+    ui.label(
+        "対象スラブを選び、小梁が架かる支持2節点と負担幅を指定します。分配法が「三角/台形」または「一方向」のときに有効です。",
+    );
+
+    if app.model.slabs.is_empty() {
+        ui.label("スラブがありません");
+        return;
+    }
+
+    // 対象スラブ選択。
+    let slab_ids: Vec<SlabId> = app.model.slabs.iter().map(|s| s.id).collect();
+    if app
+        .slab_draft
+        .joist_target
+        .is_none_or(|t| !slab_ids.contains(&t))
+    {
+        app.slab_draft.joist_target = slab_ids.first().copied();
+    }
+    egui::ComboBox::from_id_salt("joist_target_slab")
+        .selected_text(
+            app.slab_draft
+                .joist_target
+                .map(|t| format!("スラブ #{}", t.0))
+                .unwrap_or_else(|| "―".to_string()),
+        )
+        .show_ui(ui, |ui| {
+            for &sid in &slab_ids {
+                ui.selectable_value(
+                    &mut app.slab_draft.joist_target,
+                    Some(sid),
+                    format!("スラブ #{}", sid.0),
+                );
+            }
+        });
+
+    let Some(target) = app.slab_draft.joist_target else {
+        return;
+    };
+    let Some(slab_idx) = app.model.slabs.iter().position(|s| s.id == target) else {
+        return;
+    };
+
+    // 変更は借用衝突を避けるため、UI 走査後に SetSlabJoists で一括反映する。
+    let mut new_joists: Option<Vec<JoistLine>> = None;
+
+    // 既存小梁の一覧（削除ボタン付き）。
+    let joists = app.model.slabs[slab_idx].joists.clone();
+    if joists.is_empty() {
+        ui.label("この床には小梁がありません");
+    } else {
+        for (k, j) in joists.iter().enumerate() {
+            ui.horizontal(|ui| {
+                ui.label(format!(
+                    "小梁{}: 支持 N{}–N{}, 負担幅 {:.0} mm",
+                    k, j.support[0].0, j.support[1].0, j.spacing
+                ));
+                if ui.button("🗑").on_hover_text("この小梁を削除").clicked() {
+                    let mut v = joists.clone();
+                    v.remove(k);
+                    new_joists = Some(v);
+                }
+            });
+        }
+    }
+
+    // 小梁の追加フォーム。
+    let node_ids: Vec<NodeId> = app.model.nodes.iter().map(|n| n.id).collect();
+    ui.horizontal(|ui| {
+        for e in 0..2 {
+            let text = app.slab_draft.joist_supports[e]
+                .map(|n| format!("N{}", n.0))
+                .unwrap_or_else(|| "―".to_string());
+            egui::ComboBox::from_id_salt(format!("joist_support_{e}"))
+                .selected_text(format!("支持{e}: {text}"))
+                .show_ui(ui, |ui| {
+                    for &nid in &node_ids {
+                        if ui
+                            .selectable_label(
+                                app.slab_draft.joist_supports[e] == Some(nid),
+                                format!("N{}", nid.0),
+                            )
+                            .clicked()
+                        {
+                            app.slab_draft.joist_supports[e] = Some(nid);
+                        }
+                    }
+                });
+        }
+        ui.label("負担幅 [mm]:");
+        ui.add(egui::TextEdit::singleline(&mut app.slab_draft.joist_spacing).desired_width(80.0));
+    });
+
+    let s0 = app.slab_draft.joist_supports[0];
+    let s1 = app.slab_draft.joist_supports[1];
+    let spacing = app
+        .slab_draft
+        .joist_spacing
+        .trim()
+        .parse::<f64>()
+        .unwrap_or(0.0);
+    let can_add_joist = matches!((s0, s1), (Some(a), Some(b)) if a != b) && spacing > 0.0;
+
+    if ui
+        .add_enabled(can_add_joist, egui::Button::new("+ 小梁を追加"))
+        .on_hover_text("異なる支持2節点と正の負担幅を指定してください")
+        .clicked()
+    {
+        let (a, b) = (s0.expect("can_add_joist で確認済み"), s1.expect("同上"));
+        // dir は支持2節点の平面（XY）ベクトルから算定する。
+        let ca = app.model.nodes[a.index()].coord;
+        let cb = app.model.nodes[b.index()].coord;
+        let dir = [cb[0] - ca[0], cb[1] - ca[1]];
+        let mut v = joists.clone();
+        v.push(JoistLine {
+            dir,
+            spacing,
+            support: [a, b],
+        });
+        new_joists = Some(v);
+    }
+
+    if let Some(v) = new_joists {
+        app.undo.run(
+            &mut app.model,
+            Box::new(SetSlabJoists {
+                id: target,
+                joists: v,
             }),
         );
         app.staleness.mark_edited();

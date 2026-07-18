@@ -434,3 +434,29 @@ impl EditCommand for SetSlabUsage {
         "スラブ用途変更"
     }
 }
+
+/// スラブの小梁（`joists`。二段階伝達の小梁ライン）を全置換する。逆操作は
+/// 変更前の `joists` への復元（`SetLoadCfg` と同様の値置換パターン）。
+/// 存在しない `SlabId` は Noop。
+pub struct SetSlabJoists {
+    pub id: SlabId,
+    pub joists: Vec<squid_n_core::model::JoistLine>,
+}
+
+impl EditCommand for SetSlabJoists {
+    fn apply(&self, model: &mut Model) -> Box<dyn EditCommand> {
+        let idx = self.id.index();
+        if idx >= model.slabs.len() || model.slabs[idx].id != self.id {
+            return Box::new(Noop);
+        }
+        let old = std::mem::replace(&mut model.slabs[idx].joists, self.joists.clone());
+        Box::new(SetSlabJoists {
+            id: self.id,
+            joists: old,
+        })
+    }
+
+    fn label(&self) -> &str {
+        "スラブ小梁変更"
+    }
+}
