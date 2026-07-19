@@ -157,6 +157,19 @@ impl HysteresisMaterial {
         if reversed {
             s.reversal = (c.theta, c.m);
             let ty = self.rule.yield_deformation();
+            // 耐力劣化のサイクル計数（TakedaDegrading）: スケルトン（包絡線）上の
+            // ピークから反転したとき、その側のサイクル数を 1 進める。スケルトンを
+            // 前進中（単調載荷）は計数しないため載荷刻み数に依存しない。従来は
+            // スケルトン上で新記録を更新する毎ステップ計数しており、単調載荷を
+            // 細かく刻むほど耐力が劣化する非物理な挙動だった。内側ループ点からの
+            // 反転（包絡線未到達）は計数しない。
+            if matches!(c.branch, Branch::Skeleton) {
+                if c.theta > ty {
+                    s.peak_count_pos = c.peak_count_pos + 1;
+                } else if c.theta < -ty {
+                    s.peak_count_neg = c.peak_count_neg + 1;
+                }
+            }
             let yielded = c.theta.abs() >= ty || self.has_yielded();
             if self.rule.is_standard() {
                 // 標準型: Masing 則の除荷・再載荷枝（除荷開始剛性 = K1）。
@@ -219,30 +232,15 @@ impl HysteresisMaterial {
         s.kt = kt;
         s.branch = branch_out;
 
-        // スケルトン上で新記録時に最大経験を更新。ピーク到達でカウント進行（劣化版用）。
-        // 降伏後（|θ| > θy）のピーク到達・再訪でカウントし、劣化を進める。
+        // スケルトン上で新記録時に最大経験を更新（降伏後のみ）。サイクル計数は
+        // 反転検知側（上記）で行うため、ここでは包絡線の記憶（max_pos/max_neg）だけ
+        // 更新する。従来はここで毎ステップ計数しており載荷刻み依存の劣化になっていた。
         if matches!(s.branch, Branch::Skeleton) {
             let ty = self.rule.yield_deformation();
-            let beyond_yield_pos = theta > ty;
-            let beyond_yield_neg = theta < -ty;
-            if theta > c.max_pos.0 && beyond_yield_pos {
-                s.max_pos = (theta, m);
-                s.peak_count_pos = c.peak_count_pos + 1;
-            } else if beyond_yield_pos
-                && (theta - c.max_pos.0).abs() < ty * 1e-3
-                && c.max_pos.0 > ty
-            {
-                s.peak_count_pos = c.peak_count_pos + 1;
+            if theta > c.max_pos.0 && theta > ty {
                 s.max_pos = (theta, m);
             }
-            if theta < c.max_neg.0 && beyond_yield_neg {
-                s.max_neg = (theta, m);
-                s.peak_count_neg = c.peak_count_neg + 1;
-            } else if beyond_yield_neg
-                && (theta - c.max_neg.0).abs() < ty * 1e-3
-                && c.max_neg.0 < -ty
-            {
-                s.peak_count_neg = c.peak_count_neg + 1;
+            if theta < c.max_neg.0 && theta < -ty {
                 s.max_neg = (theta, m);
             }
         }
@@ -404,11 +402,21 @@ fn reload_line(
         return (origin.1, 0.0);
     }
     if let HysteresisRule::Slip { slip_factor, .. } = rule {
-        // ピリニア再載荷: origin → (origin + slip_factor·dt, target.1) → target
-        let pinch_x = origin.0 + slip_factor * dt;
-        let pinch_m = target.1;
+        // バイリニア再載荷（ピンチ）: origin → (pinch_x, pinch_m) → target。
+        // 「原点付近の剛性を slip_factor 倍に低下」させるスリップ挙動を表すため、
+        // 第1区間（スリップ域）の剛性を直線割線 k_line=(ΔM/dt) の slip_factor 倍とし、
+        // その後 peak へ急峻に立ち上げる。ピンチ点は変形 origin→target の slip_factor
+        // 割の位置に置くので pinch_m=origin.1 + slip_factor²·ΔM。
+        //   区間1剛性 = slip_factor·k_line（< k_line＝軟化）、
+        //   区間2剛性 = (1+slip_factor)·k_line（> k_line＝急峻）。
+        // 従来は pinch_m=target.1（全復元力）としており、原点付近が k_line/slip_factor
+        // と逆に急峻・第2区間が水平になる、ピンチと真逆の挙動だった。
+        let sf = slip_factor.clamp(1e-6, 1.0 - 1e-6);
+        let dm = target.1 - origin.1;
+        let pinch_x = origin.0 + sf * dt;
+        let pinch_m = origin.1 + sf * sf * dm;
         if (theta - origin.0).abs() <= (pinch_x - origin.0).abs() {
-            let k = pinch_m / (pinch_x - origin.0);
+            let k = (pinch_m - origin.1) / (pinch_x - origin.0);
             (origin.1 + k * (theta - origin.0), k)
         } else {
             let k = (target.1 - pinch_m) / (target.0 - pinch_x);
@@ -528,6 +536,42 @@ mod tests {
     }
 
     #[test]
+    fn test_slip_reload_pinch_shape() {
+        // スリップ再載荷は「原点付近の剛性が直線割線より低く、その後急峻」という
+        // ピンチ形状でなければならない（従来は逆に原点付近が急峻だった）。
+        let rule = HysteresisRule::Slip {
+            yield_point: (100.0, 0.01),
+            ultimate: (120.0, 0.05),
+            slip_factor: 0.5,
+        };
+        let origin = (0.0, 0.0);
+        let target = (0.03, 110.0);
+        let dt = target.0 - origin.0;
+        let k_line = (target.1 - origin.1) / dt;
+
+        // 区間1（スリップ域、θ=0.3·dt < 0.5·dt）: 剛性 = slip_factor·k_line。
+        let (_m1, k1) = reload_line(&rule, origin, target, 0.3 * dt);
+        assert!(
+            (k1 - 0.5 * k_line).abs() < 1e-6 * k_line,
+            "segment-1 slope should be slip_factor·k_line: k1={k1} k_line={k_line}"
+        );
+        // 区間2（θ=0.7·dt > 0.5·dt）: 剛性 = (1+slip_factor)·k_line。
+        let (_m2, k2) = reload_line(&rule, origin, target, 0.7 * dt);
+        assert!(
+            (k2 - 1.5 * k_line).abs() < 1e-6 * k_line,
+            "segment-2 slope should be (1+slip_factor)·k_line: k2={k2}"
+        );
+        // ピンチ: 原点付近は割線より軟、その後は割線より剛。
+        assert!(
+            k1 < k_line && k2 > k_line,
+            "k1={k1} k_line={k_line} k2={k2}"
+        );
+        // 終点で target に一致（連続）。
+        let (m_end, _) = reload_line(&rule, origin, target, target.0);
+        assert!((m_end - target.1).abs() < 1e-9, "reload must reach target");
+    }
+
+    #[test]
     fn test_commit_revert() {
         let mut mat = HysteresisMaterial::new(takeda());
         mat.trial(0.01);
@@ -589,6 +633,38 @@ mod tests {
             "degrading model should reduce peak on 2nd cycle: m={}",
             m_peak2
         );
+    }
+
+    #[test]
+    fn test_takeda_degrading_monotonic_is_step_independent() {
+        // 単調載荷での耐力劣化は載荷刻み数に依存してはならない（物理的に、
+        // 処女包絡線を辿るだけでは劣化しない）。1 ステップと 50 ステップで
+        // 同一変位まで押した最終応力が一致することを検証する。
+        let rule = HysteresisRule::TakedaDegrading {
+            crack: (40.0, 0.002),
+            yield_point: (100.0, 0.01),
+            ultimate: (120.0, 0.05),
+            alpha: 0.4,
+            degradation: 0.9,
+        };
+        let target = 0.03;
+
+        let mut coarse = HysteresisMaterial::new(rule.clone());
+        let (m_coarse, _) = coarse.trial(target);
+        coarse.commit();
+
+        let mut fine = HysteresisMaterial::new(rule);
+        let n = 50;
+        let mut m_fine = 0.0;
+        for i in 1..=n {
+            let (m, _) = fine.trial(target * i as f64 / n as f64);
+            fine.commit();
+            m_fine = m;
+        }
+
+        assert_relative_eq!(m_coarse, m_fine, epsilon = 1e-9);
+        // 処女単調載荷では劣化なし（スケルトン値 110 に一致）。
+        assert_relative_eq!(m_coarse, 110.0, epsilon = 1e-6);
     }
 
     #[test]
