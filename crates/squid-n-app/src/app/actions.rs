@@ -1781,10 +1781,56 @@ impl App {
         self.beam_loads = self.slab_beam_loads(|slab| slab.dead_intensity());
     }
 
+    /// 交差小梁スラブについて、床格子サブモデル（二方向）の**支点反力**を大梁接続点
+    /// への集中荷重（下向き）として返す（床 Phase F-3b）。`None` の場合は呼び出し側が
+    /// 既存の平行小梁モデル（`distribute_rect_with_joists` の点反力）を用いる。
+    ///
+    /// 反力は面荷重強度 `w` に線形なので各荷重ケースの `w` で解き直す。格子の各小梁は
+    /// 平行モデルと同じ `w·spacing` を負担するため、支点反力の総和は平行モデルの小梁
+    /// 反力総和（`w·Σ spacing·L`）と厳密に一致する（総和保存）。相違は交点での荷重
+    /// 分担の精度のみ。実部材化された小梁を含むスラブは、実 Beam が本体 FEM で荷重を
+    /// 伝達し二重計上になるため対象外（`None`）とする。
+    pub(crate) fn slab_grillage_node_reactions(
+        &self,
+        slab: &squid_n_core::model::Slab,
+        w: f64,
+    ) -> Option<Vec<(NodeId, f64)>> {
+        // 実部材化された小梁を含む場合は対象外（本体 FEM と二重計上を避ける）。
+        let materialized = |a: NodeId, b: NodeId| -> bool {
+            self.model.elements.iter().any(|e| {
+                e.kind == squid_n_core::model::ElementKind::Beam
+                    && e.nodes.len() == 2
+                    && ((e.nodes[0] == a && e.nodes[1] == b)
+                        || (e.nodes[0] == b && e.nodes[1] == a))
+            })
+        };
+        if slab
+            .joists
+            .iter()
+            .any(|j| materialized(j.support[0], j.support[1]))
+        {
+            return None;
+        }
+        let g = crate::floor_grillage::build_slab_grillage(&self.model, slab, w)?;
+        let sol = crate::floor_grillage::solve_grillage(&g.model, LoadCaseId(0)).ok()?;
+        // 支点反力 Fz（上向き正）＝大梁が受け取る下向き荷重の大きさ。
+        Some(
+            g.support_origin
+                .iter()
+                .map(|(n, id)| (*id, sol.reactions[*n][2]))
+                .collect(),
+        )
+    }
+
     /// 各スラブについて面荷重強度 `w_of(slab)`（N/mm²）を境界へ分配し、
     /// `LoadTarget::Edge` を実 `ElemId` に対応付けた `BeamLoad` 列を返す。
     /// 対応する梁が無い辺の荷重は捨てる。`refresh_beam_loads`（DL）と
     /// `sync_slab_loads_action`（LL）の共通経路（令85条1項の DL/LL 分離）。
+    ///
+    /// 交差小梁スラブ（軸平行・全仮想）は、平行小梁モデルの小梁点反力
+    /// （`LoadTarget::Node`）を床格子サブモデルの支点反力で置換する（床 Phase F-3b。
+    /// 総和は保存し、交点での荷重分担のみ高精度化）。境界大梁の残り負担
+    /// （`LoadTarget::Edge`）や実部材化小梁（`LoadTarget::Span`）はそのまま。
     fn slab_beam_loads(
         &self,
         w_of: impl Fn(&squid_n_core::model::Slab) -> f64,
@@ -1809,10 +1855,15 @@ impl App {
                     .map(|e| e.id)
             };
             let w = w_of(slab);
+            // 交差小梁スラブは格子サブモデルの支点反力で小梁点反力を置換する（F-3b）。
+            let grillage_reactions = self.slab_grillage_node_reactions(slab, w);
             for mut bl in squid_n_load::floor::distribute_slab_w(&self.model, slab, w) {
                 match bl.target {
                     squid_n_load::floor::LoadTarget::Node(_) => {
-                        beam_loads.push(bl);
+                        // 格子が有効なら平行小梁モデルの点反力は捨てる（格子反力で置換）。
+                        if grillage_reactions.is_none() {
+                            beam_loads.push(bl);
+                        }
                     }
                     squid_n_load::floor::LoadTarget::Edge(k) => {
                         if k >= n {
@@ -1834,6 +1885,25 @@ impl App {
                         bl.elem = elem;
                         beam_loads.push(bl);
                     }
+                }
+            }
+            // 格子反力を大梁接続点への下向き集中荷重として追加（点反力の置換）。
+            if let Some(reactions) = grillage_reactions {
+                for (node, r) in reactions {
+                    if r.abs() <= 1e-9 {
+                        continue;
+                    }
+                    beam_loads.push(squid_n_load::floor::BeamLoad {
+                        elem: ElemId(u32::MAX),
+                        target: squid_n_load::floor::LoadTarget::Node(node),
+                        shape: squid_n_load::floor::LoadShape::Point { p: r, x: 0.0 },
+                        cmq: squid_n_load::floor::Cmq {
+                            c_i: 0.0,
+                            c_j: 0.0,
+                            q_i: r,
+                            q_j: 0.0,
+                        },
+                    });
                 }
             }
         }
