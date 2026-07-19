@@ -137,7 +137,7 @@ pub fn time_history_panel(ui: &mut egui::Ui, app: &mut App) {
             plot_ui.line(
                 egui_plot::Line::new("series", egui_plot::PlotPoints::from(values))
                     .color(line_color)
-                    .width(1.5),
+                    .width(1.5_f32),
             );
         });
 

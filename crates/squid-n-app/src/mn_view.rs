@@ -650,7 +650,7 @@ fn draw_wireframe(
         let p = project(to_world(g, refs), center3, cam, scale, screen_center);
         egui::pos2(p[0], p[1])
     };
-    let stroke = egui::Stroke::new(1.0, theme::translucent(color, 180));
+    let stroke = egui::Stroke::new(1.0_f32, theme::translucent(color, 180));
 
     let n_beta = match surf.grid.first() {
         Some(row) if !row.is_empty() => row.len(),
@@ -690,7 +690,7 @@ fn draw_axes(painter: &egui::Painter, cam: &CameraState, scale: f32, screen_cent
     ];
     for (dir, color, label) in axes {
         let neg = [-dir[0], -dir[1], -dir[2]];
-        painter.line_segment([proj(neg), proj(dir)], egui::Stroke::new(1.5, color));
+        painter.line_segment([proj(neg), proj(dir)], egui::Stroke::new(1.5_f32, color));
         painter.text(
             proj(dir),
             egui::Align2::LEFT_BOTTOM,
@@ -724,7 +724,7 @@ fn draw_slice_plane(
     painter.add(egui::Shape::convex_polygon(
         poly,
         theme::translucent(theme::HILITE_PURPLE, 30),
-        egui::Stroke::new(1.0, theme::translucent(theme::HILITE_PURPLE, 120)),
+        egui::Stroke::new(1.0_f32, theme::translucent(theme::HILITE_PURPLE, 120)),
     ));
 
     let label_pos = project([H, H, z], center3, cam, scale, screen_center);
@@ -772,7 +772,7 @@ fn draw_slice_plot(ui: &mut egui::Ui, cache: &MnCache, show: [bool; 3], n_target
                             egui_plot::PlotPoints::from(pts),
                         )
                         .color(model_color(YieldModelKind::SimpleSpring))
-                        .width(2.0),
+                        .width(2.0_f32),
                     );
                 }
             }
@@ -811,7 +811,7 @@ fn plot_slice_curve(
     plot_ui.line(
         egui_plot::Line::new(kind.label(), egui_plot::PlotPoints::from(xy))
             .color(model_color(kind))
-            .width(2.0),
+            .width(2.0_f32),
     );
 }
 
@@ -854,6 +854,6 @@ fn plot_m_theta_line(plot_ui: &mut egui_plot::PlotUi<'_>, pts: &[[f64; 2]], kind
     plot_ui.line(
         egui_plot::Line::new(kind.label(), egui_plot::PlotPoints::from(xy))
             .color(model_color(kind))
-            .width(2.0),
+            .width(2.0_f32),
     );
 }

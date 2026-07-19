@@ -107,7 +107,7 @@ pub fn apply_theme(ctx: &egui::Context) {
 
     // 選択ハイライト（§6 アクティブ）= blue-500 背景 + 白文字
     v.selection.bg_fill = BLUE_500;
-    v.selection.stroke = Stroke::new(1.0, WHITE);
+    v.selection.stroke = Stroke::new(1.0_f32, WHITE);
 
     v.window_corner_radius = CornerRadius::same(6);
     v.menu_corner_radius = CornerRadius::same(6);
@@ -118,36 +118,36 @@ pub fn apply_theme(ctx: &egui::Context) {
     // 静かなクローム: 非対話（パネル・ラベル・カード）= gray-100 / gray-200 枠 / gray-700 文字
     v.widgets.noninteractive.bg_fill = GRAY_100;
     v.widgets.noninteractive.weak_bg_fill = GRAY_100;
-    v.widgets.noninteractive.bg_stroke = Stroke::new(1.0, GRAY_200);
-    v.widgets.noninteractive.fg_stroke = Stroke::new(1.0, GRAY_700);
+    v.widgets.noninteractive.bg_stroke = Stroke::new(1.0_f32, GRAY_200);
+    v.widgets.noninteractive.fg_stroke = Stroke::new(1.0_f32, GRAY_700);
     v.widgets.noninteractive.corner_radius = r6;
 
     // ボタン（rest）: 透明背景・gray-700 文字・gray-200 枠（入力欄/コンボ兼用）
     v.widgets.inactive.bg_fill = Color32::TRANSPARENT;
     v.widgets.inactive.weak_bg_fill = Color32::TRANSPARENT;
-    v.widgets.inactive.bg_stroke = Stroke::new(1.0, GRAY_200);
-    v.widgets.inactive.fg_stroke = Stroke::new(1.0, GRAY_700);
+    v.widgets.inactive.bg_stroke = Stroke::new(1.0_f32, GRAY_200);
+    v.widgets.inactive.fg_stroke = Stroke::new(1.0_f32, GRAY_700);
     v.widgets.inactive.corner_radius = r4;
 
     // ホバー: blue-300 背景 + 白文字
     v.widgets.hovered.bg_fill = BLUE_300;
     v.widgets.hovered.weak_bg_fill = BLUE_300;
-    v.widgets.hovered.bg_stroke = Stroke::new(1.0, BLUE_300);
-    v.widgets.hovered.fg_stroke = Stroke::new(1.5, WHITE);
+    v.widgets.hovered.bg_stroke = Stroke::new(1.0_f32, BLUE_300);
+    v.widgets.hovered.fg_stroke = Stroke::new(1.5_f32, WHITE);
     v.widgets.hovered.corner_radius = r4;
 
     // アクティブ（押下・選択）: blue-500 背景 + 白文字
     v.widgets.active.bg_fill = BLUE_500;
     v.widgets.active.weak_bg_fill = BLUE_500;
-    v.widgets.active.bg_stroke = Stroke::new(1.0, BLUE_500);
-    v.widgets.active.fg_stroke = Stroke::new(1.5, WHITE);
+    v.widgets.active.bg_stroke = Stroke::new(1.0_f32, BLUE_500);
+    v.widgets.active.fg_stroke = Stroke::new(1.5_f32, WHITE);
     v.widgets.active.corner_radius = r4;
 
     // コンボボックス展開トリガ: 入力欄相当（gray-100 / gray-200 枠）
     v.widgets.open.bg_fill = GRAY_100;
     v.widgets.open.weak_bg_fill = GRAY_100;
-    v.widgets.open.bg_stroke = Stroke::new(1.0, GRAY_200);
-    v.widgets.open.fg_stroke = Stroke::new(1.0, GRAY_700);
+    v.widgets.open.bg_stroke = Stroke::new(1.0_f32, GRAY_200);
+    v.widgets.open.fg_stroke = Stroke::new(1.0_f32, GRAY_700);
     v.widgets.open.corner_radius = r4;
 
     style.visuals = v;

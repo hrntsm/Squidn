@@ -167,7 +167,7 @@ fn cross3(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
 
 /// スクリーン座標上の矢印（線分＋矢頭）を描く。
 fn draw_arrow(painter: &egui::Painter, from: egui::Pos2, to: egui::Pos2, color: egui::Color32) {
-    let stroke = egui::Stroke::new(2.0, color);
+    let stroke = egui::Stroke::new(2.0_f32, color);
     painter.line_segment([from, to], stroke);
     let dir = to - from;
     let len = dir.length();
@@ -218,7 +218,7 @@ fn draw_rotation_arc(
     let u = [u_raw[0] / un, u_raw[1] / un, u_raw[2] / un];
     let v = cross3(axis, u);
 
-    let stroke = egui::Stroke::new(1.5, color);
+    let stroke = egui::Stroke::new(1.5_f32, color);
     const N: usize = 32;
     let mut prev: Option<egui::Pos2> = None;
     for i in 0..=N {
@@ -343,7 +343,7 @@ fn draw_support_legend(painter: &egui::Painter) {
     painter.circle_stroke(
         egui::pos2(x0 + 10.0, arc_y - 6.0),
         7.0,
-        egui::Stroke::new(1.5, theme::AXIS_X),
+        egui::Stroke::new(1.5_f32, theme::AXIS_X),
     );
     painter.text(
         egui::pos2(x0 + 28.0, y0),
@@ -922,7 +922,7 @@ pub fn viewer_panel(ui: &mut egui::Ui, app: &mut App) {
                 painter.add(egui::Shape::convex_polygon(
                     poly,
                     theme::translucent(theme::DATA_BLUE, 50),
-                    egui::Stroke::new(1.5, theme::DATA_BLUE),
+                    egui::Stroke::new(1.5_f32, theme::DATA_BLUE),
                 ));
             }
             continue;
@@ -938,7 +938,7 @@ pub fn viewer_panel(ui: &mut egui::Ui, app: &mut App) {
                     egui::pos2(pts[n0][0], pts[n0][1]),
                     egui::pos2(pts[n1][0], pts[n1][1]),
                 ],
-                egui::Stroke::new(2.0, line_color),
+                egui::Stroke::new(2.0_f32, line_color),
             );
         }
     }
@@ -963,7 +963,7 @@ pub fn viewer_panel(ui: &mut egui::Ui, app: &mut App) {
                             egui::pos2(pts[n0][0], pts[n0][1]),
                             egui::pos2(pts[n1][0], pts[n1][1]),
                         ],
-                        egui::Stroke::new(4.0, theme::PARETO_RED),
+                        egui::Stroke::new(4.0_f32, theme::PARETO_RED),
                     );
                 }
             }
@@ -1081,7 +1081,7 @@ fn draw_force_diagram(
             painter.add(egui::Shape::convex_polygon(
                 poly,
                 theme::translucent(theme::DATA_BLUE, 60),
-                egui::Stroke::new(1.5, theme::DATA_BLUE),
+                egui::Stroke::new(1.5_f32, theme::DATA_BLUE),
             ));
         }
     }
@@ -1169,7 +1169,7 @@ fn draw_cmq_diagram(painter: &egui::Painter, app: &App, pts: &[[f32; 2]]) {
         painter.add(egui::Shape::convex_polygon(
             c_poly,
             theme::translucent(theme::DATA_BLUE, 60),
-            egui::Stroke::new(1.5, theme::DATA_BLUE),
+            egui::Stroke::new(1.5_f32, theme::DATA_BLUE),
         ));
 
         // Q 図（せん断）: 両端の q_i, q_j を結ぶ折れ線ポリゴン（反対側に描画）
@@ -1189,7 +1189,7 @@ fn draw_cmq_diagram(painter: &egui::Painter, app: &App, pts: &[[f32; 2]]) {
         painter.add(egui::Shape::convex_polygon(
             q_poly,
             theme::translucent(theme::GOOD_GREEN, 60),
-            egui::Stroke::new(1.5, theme::GOOD_GREEN),
+            egui::Stroke::new(1.5_f32, theme::GOOD_GREEN),
         ));
     }
 
@@ -1353,7 +1353,7 @@ fn draw_grid_and_axes(
     /// グリッド間隔 [mm]（1 m）。
     const STEP: f64 = 1000.0;
     // ダーク半透明・線幅 0.5（淡グレー背景の上で奥行きを示す）
-    let grid_stroke = egui::Stroke::new(0.5, egui::Color32::from_black_alpha(36));
+    let grid_stroke = egui::Stroke::new(0.5_f32, egui::Color32::from_black_alpha(36));
     let origin: [f64; 3] = [0.0; 3];
 
     // ビューポートに映るワールド範囲を計算。対角ピクセル長 / scale で大まかな半径を得て
@@ -1405,7 +1405,7 @@ fn draw_grid_and_axes(
         // 正方向: 原点 → range の上端
         let mut pe = origin;
         pe[axis] = range[axis].1;
-        painter.line_segment([proj(origin), proj(pe)], egui::Stroke::new(1.5, col));
+        painter.line_segment([proj(origin), proj(pe)], egui::Stroke::new(1.5_f32, col));
         painter.text(
             proj(pe),
             egui::Align2::LEFT_BOTTOM,
@@ -1418,7 +1418,7 @@ fn draw_grid_and_axes(
         pn[axis] = range[axis].0;
         painter.line_segment(
             [proj(origin), proj(pn)],
-            egui::Stroke::new(1.0, theme::lighten(col, 0.45)),
+            egui::Stroke::new(1.0_f32, theme::lighten(col, 0.45)),
         );
         painter.text(
             proj(pn),

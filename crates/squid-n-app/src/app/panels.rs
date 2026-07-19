@@ -1220,7 +1220,7 @@ impl App {
                 plot_ui.line(
                     egui_plot::Line::new("capacity", egui_plot::PlotPoints::from(points))
                         .color(crate::theme::DATA_BLUE)
-                        .width(2.0),
+                        .width(2.0_f32),
                 );
             });
 
