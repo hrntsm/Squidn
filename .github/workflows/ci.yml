@@ -31,6 +31,10 @@ jobs:
       # （v_and_v/p8_review.md）、ここで明示的にビルド・テストして再発を防ぐ。
       - name: MCP featureテスト実行
         run: cargo test -p squid-n-mcp --features mcp
+      # gui は非デフォルト feature のため --workspace では検証されない。
+      # GUI コードのコンパイル漏れ（網羅的 match 等）を検知するためビルドする。
+      - name: GUI featureビルド
+        run: cargo build -p squid-n-app --features gui
 
   clippy:
     name: Clippy静的解析
@@ -46,6 +50,11 @@ jobs:
       # 非デフォルト feature の mcp（bin ターゲット含む）も静的解析の対象にする。
       - name: Clippy実行（MCP feature）
         run: cargo clippy -p squid-n-mcp --all-targets --features mcp --locked -- -D warnings
+      # 非デフォルト feature の gui（eframe 経由の GUI コード）も静的解析の対象にする。
+      # 過去に squid-n-app の GUI コードが網羅的 match 漏れでコンパイル不能のまま
+      # 放置された経緯があり（mn_view.rs）、ここで明示的に検証して再発を防ぐ。
+      - name: Clippy実行（GUI feature）
+        run: cargo clippy -p squid-n-app --all-targets --features gui --locked -- -D warnings
 
   fmt:
     name: フォーマットチェック
