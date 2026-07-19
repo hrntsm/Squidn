@@ -1081,6 +1081,73 @@ mod tests {
         );
     }
 
+    /// 標準モード: リップ溝形が `StbSecColumn_S`＋`StbSecRoll-LipC` として往復する。
+    #[test]
+    fn test_standard_roundtrip_lip_channel() {
+        let mut m = frame_nodes();
+        let shape = SectionShape::SteelLipChannel {
+            height: 150.0,
+            width: 75.0,
+            lip: 20.0,
+            thick: 2.3,
+        };
+        m.sections
+            .push(shape.to_section(SectionId(0), "LipC1".into()));
+        m.elements.push(member(0, true, 0)); // 柱
+
+        let xml = export_stbridge_with(&m, SectionExportMode::Standard).unwrap();
+        assert!(
+            xml.contains("<StbSecRoll-LipC "),
+            "リップ溝形の形鋼ライブラリ: {xml}"
+        );
+        let back = import_stbridge(&xml).expect("import");
+        assert!(back.validate().is_ok(), "{:?}", back.validate());
+        assert_eq!(
+            back.sections[0].shape, m.sections[0].shape,
+            "リップ溝形が往復"
+        );
+    }
+
+    /// import: 実 ST-Bridge のリップ溝形ライブラリ名（`StbSecRoll-LipC`）を直接読み取れる。
+    #[test]
+    fn test_import_lip_channel_library() {
+        let xml = r#"<?xml version="1.0"?>
+<ST_BRIDGE version="2.0.0"><StbModel>
+  <StbNodes>
+    <StbNode id="0" X="0" Y="0" Z="0"/>
+    <StbNode id="1" X="0" Y="0" Z="3000"/>
+  </StbNodes>
+  <StbSections>
+    <StbSecColumn_S id="0" name="LC">
+      <StbSecSteelFigureColumn_S><StbSecSteelColumn_S_Same shape="LipC-200x75x20x3.2"/></StbSecSteelFigureColumn_S>
+    </StbSecColumn_S>
+    <StbSecSteel>
+      <StbSecRoll-LipC name="LipC-200x75x20x3.2" A="200" B="75" C="20" t="3.2"/>
+    </StbSecSteel>
+  </StbSections>
+  <StbMembers>
+    <StbColumn id="0" id_node_bottom="0" id_node_top="1" id_section="0"/>
+  </StbMembers>
+</StbModel></ST_BRIDGE>"#;
+        let (m, report) = import_stbridge_with_report(xml).expect("import");
+        assert!(
+            report.warnings.iter().all(|w| !w.contains("物性ゼロ")),
+            "リップ溝形の形鋼参照が解決されるべき: {:?}",
+            report.warnings
+        );
+        assert_eq!(
+            m.sections[0].shape,
+            Some(SectionShape::SteelLipChannel {
+                height: 200.0,
+                width: 75.0,
+                lip: 20.0,
+                thick: 3.2
+            }),
+            "リップ溝形が復元される"
+        );
+        assert!(m.sections[0].area > 0.0);
+    }
+
     /// 標準モード: CFT 角形柱が `StbSecColumn_CFT`＋形鋼ライブラリとして往復する。
     #[test]
     fn test_standard_roundtrip_cft_box() {

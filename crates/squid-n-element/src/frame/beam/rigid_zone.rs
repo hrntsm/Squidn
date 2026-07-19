@@ -50,6 +50,7 @@ fn member_kind(model: &Model, e: &squid_n_core::model::ElementData) -> MemberKin
             | SectionShape::SteelPipe { .. }
             | SectionShape::SteelFlatBar { .. }
             | SectionShape::SteelRoundBar { .. }
+            | SectionShape::SteelLipChannel { .. }
             | SectionShape::CftBox { .. }
             | SectionShape::CftPipe { .. } => MemberKind::Steel,
         };

@@ -84,9 +84,11 @@ pub fn max_width_thickness(shape: &SectionShape) -> Option<f64> {
             Some(hi.max(wi))
         }
         SectionShape::CftPipe { .. } => None,
-        // 平鋼・中実丸鋼は板要素でない中実断面のため幅厚比検定の対象外。
+        // 平鋼・中実丸鋼は中実断面、リップ溝形は冷間成形材（有効幅で別途検討）のため
+        // 本検定（熱間圧延材の幅厚比）の対象外。
         SectionShape::SteelFlatBar { .. }
         | SectionShape::SteelRoundBar { .. }
+        | SectionShape::SteelLipChannel { .. }
         | SectionShape::RcRect { .. }
         | SectionShape::RcCircle { .. }
         | SectionShape::SrcRect { .. }

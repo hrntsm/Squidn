@@ -38,6 +38,32 @@ pub(crate) fn angle_centroid(leg_a: f64, leg_b: f64, thick: f64) -> (f64, f64, f
     (cx, cy, a_total)
 }
 
+/// リップ溝形鋼（cold-formed lipped channel）の非重複矩形分解と図心・断面積。
+///
+/// せい `height`（H, Y方向）・フランジ幅 `width`（B, Z方向。ウェブ外面〜フランジ先端）・
+/// リップ長 `lip`（C, Y方向）・板厚 `thick`（t、全要素一様）の薄肉開断面を、
+/// ウェブ／上下フランジ／上下リップの 5 枚の矩形へ重なり無く分解する。
+/// 上下対称のため図心 y = H/2。戻り値は `(z_bar, area)`（z はウェブ外面 z=0 起点）。
+///
+/// 分解（各矩形の (z範囲, y範囲)）:
+/// - ウェブ:   z∈[0,t],     y∈[0,H]
+/// - フランジ: z∈[t,B],     y∈[0,t] と [H−t,H]
+/// - リップ:   z∈[B−t,B],   y∈[t,C] と [H−C,H−t]
+pub(crate) fn lip_channel_centroid_z(height: f64, width: f64, lip: f64, thick: f64) -> (f64, f64) {
+    let a_web = thick * height;
+    let a_flange = (width - thick) * thick;
+    let a_lip = thick * (lip - thick);
+    let a_total = a_web + 2.0 * a_flange + 2.0 * a_lip;
+    if a_total < 1e-30 {
+        return (0.0, 0.0);
+    }
+    let z_web = thick / 2.0;
+    let z_flange = (thick + width) / 2.0;
+    let z_lip = width - thick / 2.0;
+    let z_bar = (a_web * z_web + 2.0 * a_flange * z_flange + 2.0 * a_lip * z_lip) / a_total;
+    (z_bar, a_total)
+}
+
 pub(crate) fn tee_centroid(height: f64, width: f64, web_thick: f64, flange_thick: f64) -> f64 {
     let a_f = width * flange_thick;
     let a_w = (height - flange_thick) * web_thick;

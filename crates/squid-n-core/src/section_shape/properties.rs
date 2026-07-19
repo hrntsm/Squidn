@@ -1,7 +1,7 @@
 //! [`SectionShape`] の基本断面性能（A, Zp, Iy, Iz, J, 軸剛性用断面積）。
 
 use super::constants::N_S_EQ;
-use super::geometry::{angle_centroid, rect_torsion_j, tee_centroid};
+use super::geometry::{angle_centroid, lip_channel_centroid_z, rect_torsion_j, tee_centroid};
 use super::types::SectionShape;
 
 impl SectionShape {
@@ -43,6 +43,15 @@ impl SectionShape {
             }
             SectionShape::SteelFlatBar { width, thick } => width * thick,
             SectionShape::SteelRoundBar { dia } => std::f64::consts::PI * dia * dia / 4.0,
+            SectionShape::SteelLipChannel {
+                height,
+                width,
+                lip,
+                thick,
+            } => {
+                let (_, area) = lip_channel_centroid_z(height, width, lip, thick);
+                area
+            }
             SectionShape::RcRect { b, d, .. } => b * d,
             SectionShape::RcCircle { d, .. } => std::f64::consts::PI * d * d / 4.0,
             // SRC: 質量算定への影響を避けるためコンクリート全断面とする（doc 参照）。
@@ -157,6 +166,26 @@ impl SectionShape {
             // 平鋼は中実矩形（せい d=thick、幅 b=width）。iy は b·d³/12。
             SectionShape::SteelFlatBar { width, thick } => width * thick.powi(3) / 12.0,
             SectionShape::SteelRoundBar { dia } => std::f64::consts::PI * dia.powi(4) / 64.0,
+            // リップ溝形: 強軸（せい方向 y=H/2 まわり）。矩形分解＋平行軸。上下対称。
+            SectionShape::SteelLipChannel {
+                height,
+                width,
+                lip,
+                thick,
+            } => {
+                let t = thick;
+                // ウェブ（幅 t×せい H、図心 y=H/2 でオフセット 0）。
+                let i_web = t * height.powi(3) / 12.0;
+                // フランジ（幅 (B−t)×厚 t、図心 y=H−t/2 → オフセット (H−t)/2）。2 枚。
+                let a_f = (width - t) * t;
+                let off_f = (height - t) / 2.0;
+                let i_f = (width - t) * t.powi(3) / 12.0 + a_f * off_f.powi(2);
+                // リップ（幅 t×せい (C−t)、図心 y=H−(C+t)/2 → オフセット (H−C−t)/2）。2 枚。
+                let a_l = t * (lip - t);
+                let off_l = (height - lip - t) / 2.0;
+                let i_l = t * (lip - t).powi(3) / 12.0 + a_l * off_l.powi(2);
+                i_web + 2.0 * i_f + 2.0 * i_l
+            }
             SectionShape::RcRect { b, d, .. } => b * d.powi(3) / 12.0,
             SectionShape::RcCircle { d, .. } => std::f64::consts::PI * d.powi(4) / 64.0,
             SectionShape::SrcRect {
@@ -260,6 +289,28 @@ impl SectionShape {
             // 平鋼は中実矩形。iz は d·b³/12（b=width、d=thick）。
             SectionShape::SteelFlatBar { width, thick } => thick * width.powi(3) / 12.0,
             SectionShape::SteelRoundBar { .. } => self.calc_iy(),
+            // リップ溝形: 弱軸（幅方向 z=z_bar まわり）。矩形分解＋平行軸（Z へ偏心）。
+            SectionShape::SteelLipChannel {
+                height,
+                width,
+                lip,
+                thick,
+            } => {
+                let t = thick;
+                let (z_bar, _) = lip_channel_centroid_z(height, width, lip, thick);
+                // ウェブ（z 方向厚 t、y 方向せい H、z 図心 t/2）。
+                let a_web = t * height;
+                let i_web = height * t.powi(3) / 12.0 + a_web * (t / 2.0 - z_bar).powi(2);
+                // フランジ（z 方向 (B−t)、y 方向 t、z 図心 (t+B)/2）。2 枚。
+                let a_f = (width - t) * t;
+                let z_f = (t + width) / 2.0;
+                let i_f = t * (width - t).powi(3) / 12.0 + a_f * (z_f - z_bar).powi(2);
+                // リップ（z 方向厚 t、y 方向 (C−t)、z 図心 B−t/2）。2 枚。
+                let a_l = t * (lip - t);
+                let z_l = width - t / 2.0;
+                let i_l = (lip - t) * t.powi(3) / 12.0 + a_l * (z_l - z_bar).powi(2);
+                i_web + 2.0 * i_f + 2.0 * i_l
+            }
             SectionShape::RcRect { b, d, .. } => d * b.powi(3) / 12.0,
             SectionShape::RcCircle { .. } => self.calc_iy(),
             SectionShape::SrcRect {
@@ -343,6 +394,16 @@ impl SectionShape {
             // 平鋼は中実矩形のねじり定数（RC 矩形と同じ閉形式）。
             SectionShape::SteelFlatBar { width, thick } => rect_torsion_j(width, thick),
             SectionShape::SteelRoundBar { dia } => std::f64::consts::PI * dia.powi(4) / 32.0,
+            // リップ溝形（薄肉開断面）: J = (1/3)Σ l·t³。矩形分解の板長で近似。
+            SectionShape::SteelLipChannel {
+                height,
+                width,
+                lip,
+                thick,
+            } => {
+                let len = height + 2.0 * (width - thick) + 2.0 * (lip - thick);
+                len * thick.powi(3) / 3.0
+            }
             SectionShape::RcRect { b, d, .. } => rect_torsion_j(b, d),
             SectionShape::RcCircle { d, .. } => std::f64::consts::PI * d.powi(4) / 32.0,
             // ねじりは RC 矩形と同じ扱い（内蔵鉄骨の寄与は無視。

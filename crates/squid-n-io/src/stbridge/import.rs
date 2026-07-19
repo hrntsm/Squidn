@@ -1363,6 +1363,13 @@ fn steel_shape_from(tag: &str, a: &HashMap<String, String>) -> Option<SectionSha
             let dia = a_(&["D", "A"]).or_else(|| a_(&["R"]).map(|r| r * 2.0))?;
             Some(SectionShape::SteelRoundBar { dia })
         }
+        // リップ溝形鋼（冷間成形）。せい A・幅 B・リップ C・板厚 t。
+        t if t.ends_with("-LipC") => Some(SectionShape::SteelLipChannel {
+            height: a_(&["A", "H"])?,
+            width: a_(&["B"])?,
+            lip: a_(&["C"])?,
+            thick: a_(&["t", "t1"])?,
+        }),
         _ => None,
     }
 }

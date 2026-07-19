@@ -87,6 +87,18 @@ pub enum SectionShape {
     ///
     /// `dia`: 直径 D [mm]。断面性能は中実円として算定する。
     SteelRoundBar { dia: f64 },
+    /// Steel cold-formed lipped channel (リップ溝形鋼). `StbSecRoll-LipC`。
+    ///
+    /// `height`: せい H [mm]（Y 方向）、`width`: フランジ幅 B [mm]（Z 方向。ウェブ外面〜
+    /// フランジ先端）、`lip`: リップ長 C [mm]（Y 方向）、`thick`: 板厚 t [mm]（全要素一様）。
+    /// 薄肉開断面としてウェブ・上下フランジ・上下リップの矩形分解で断面性能を算定する
+    /// （図心は Z 方向に偏心。冷間成形材の有効断面・局部座屈は別途検討）。
+    SteelLipChannel {
+        height: f64,
+        width: f64,
+        lip: f64,
+        thick: f64,
+    },
     /// Reinforced concrete rectangle (RC 矩形).
     RcRect { b: f64, d: f64, rebar: RcRebar },
     /// Reinforced concrete circle column (RC 円形).

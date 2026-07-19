@@ -118,6 +118,10 @@ fn shape_of(sec: &Section) -> (ShapeCategory, f64, f64) {
                 return (ShapeCategory::Other, thick, thick)
             }
             SectionShape::SteelRoundBar { dia } => return (ShapeCategory::Other, dia, dia),
+            // リップ溝形は冷間成形の開断面。局部座屈は有効幅で扱うため Other 扱い（板厚 t）。
+            SectionShape::SteelLipChannel { thick, .. } => {
+                return (ShapeCategory::Other, thick, thick)
+            }
             // CFT の鋼管部分は角形/円形鋼管として扱う（検定本体は cft 側で行う）。
             SectionShape::CftBox { thick, .. } => return (ShapeCategory::Box, thick, thick),
             SectionShape::CftPipe { thick, .. } => return (ShapeCategory::Pipe, thick, thick),

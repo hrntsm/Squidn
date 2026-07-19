@@ -295,6 +295,7 @@ pub fn plastic_fibers(
         SectionShape::SteelPipe { outer_dia, .. } => outer_dia,
         SectionShape::SteelFlatBar { width, thick } => width.max(thick),
         SectionShape::SteelRoundBar { dia } => dia,
+        SectionShape::SteelLipChannel { height, width, .. } => height.max(width),
         SectionShape::RcRect { b, d, .. } => b.max(d),
         SectionShape::RcCircle { d, .. } => d,
         SectionShape::SrcRect { b, d, .. } => b.max(d),
@@ -420,6 +421,46 @@ pub fn plastic_fibers(
             let n_r = if fine { 12 } else { 2 };
             mesh_annulus(&mut fibers, dia, dia / 2.0, n_theta, n_r, steel);
         }
+        SectionShape::SteelLipChannel {
+            height,
+            width,
+            lip,
+            thick,
+        } => {
+            let t = thick;
+            // ウェブ・上下フランジ・上下リップの 5 枚（重なり無し）。座標は後で図心補正。
+            mesh_rect(
+                &mut fibers,
+                [t / 2.0, height / 2.0],
+                t,
+                height,
+                target,
+                steel,
+            );
+            for ysign in [1.0, -1.0] {
+                // フランジ（y=±(H−t)/2）
+                mesh_rect(
+                    &mut fibers,
+                    [(t + width) / 2.0, height / 2.0 + ysign * (height - t) / 2.0],
+                    width - t,
+                    t,
+                    target,
+                    steel,
+                );
+                // リップ（y=±(H−C−t)/2）
+                mesh_rect(
+                    &mut fibers,
+                    [
+                        width - t / 2.0,
+                        height / 2.0 + ysign * (height - lip - t) / 2.0,
+                    ],
+                    t,
+                    lip - t,
+                    target,
+                    steel,
+                );
+            }
+        }
         SectionShape::RcRect { b, d, ref rebar } => {
             mesh_rect(&mut fibers, [0.0, 0.0], b, d, target, conc);
             rebar_fibers_rect(
@@ -511,6 +552,7 @@ pub fn plastic_fibers(
         SectionShape::SteelAngle { .. }
             | SectionShape::SteelChannel { .. }
             | SectionShape::SteelTee { .. }
+            | SectionShape::SteelLipChannel { .. }
     ) {
         let a_sum: f64 = fibers.iter().map(|f| f.area).sum();
         if a_sum > 0.0 {

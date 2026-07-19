@@ -42,7 +42,11 @@ SteelFlatBar / SteelRoundBar / RcRect / RcCircle / SrcRect / CftBox / CftPipe / 
   `StbSecRoll-FlatBar` として往復。断面エディタにも「鋼 平鋼」を追加。
 - **中実丸鋼**（solid round bar）: ✅ **実装済み**。`SteelRoundBar { dia }` として中実円の
   断面性能を算定。`StbSecRoll-RoundBar` として往復。断面エディタにも「鋼 中実丸鋼」を追加。
-- **リップ溝形・軽量形鋼**（`StbSecRoll-LipC` 等の冷間成形材）
+- **リップ溝形・軽量形鋼**（`StbSecRoll-LipC` 等の冷間成形材）: ✅ **実装済み**（リップ溝形）。
+  `SteelLipChannel { height, width, lip, thick }` として薄肉開断面（ウェブ・上下フランジ・
+  上下リップの矩形分解）で断面性能を算定。`StbSecRoll-LipC` として往復し、断面エディタにも
+  「鋼 リップ溝形」を追加。冷間成形材の有効断面・局部座屈（有効幅法）は今後の課題で、
+  幅厚比・部材ランク検定は対象外扱い。リップ Z 形・軽溝形等の他の軽量形鋼は未対応。
 - **組立断面**: 2L（抱き山形）・2C（抱き溝形）・十字形（cross-H）などの built-up
 - **非対称 H**（上下フランジ幅・厚が異なる `StbSecBuild-H`）。現 `SteelH` は左右上下対称前提。
 - **RC の T 形・L 形梁**（スラブ一体のフランジ付き断面）、テーパ/ハンチ断面。

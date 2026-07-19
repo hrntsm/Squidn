@@ -93,6 +93,18 @@ impl SectionShape {
             ),
             // 中実丸鋼: せん断形状係数 κ=10/9（As=0.9A）。
             SectionShape::SteelRoundBar { dia } => (dia, dia, area * 0.9, area * 0.9),
+            // リップ溝形（溝形鋼と同規約）: 強軸せん断はウェブ、弱軸はフランジが負担。
+            SectionShape::SteelLipChannel {
+                height,
+                width,
+                thick,
+                ..
+            } => (
+                height,
+                width,
+                2.0 * (width - thick) * thick,
+                h_web_shear_area(height, thick),
+            ),
             SectionShape::RcRect { b, d, .. } => (d, b, b * d / KAPPA_RC, b * d / KAPPA_RC),
             SectionShape::RcCircle { d, .. } => (d, d, area / KAPPA_RC, area / KAPPA_RC),
             SectionShape::SrcRect {

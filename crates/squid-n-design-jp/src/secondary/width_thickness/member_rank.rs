@@ -283,12 +283,14 @@ pub fn s_member_rank_by_kihon(
             let is_490 = is_490_class(grade_name, thick);
             Some(rank_from_limits(wt, &pipe_limits(is_490)))
         }
-        // 平鋼・中実丸鋼は板要素でない中実断面のため幅厚比ランクの対象外。
+        // 平鋼・中実丸鋼は板要素でない中実断面、リップ溝形は冷間成形材（有効幅で別途検討）
+        // のため、いずれも本表（熱間圧延材の幅厚比ランク）の対象外。
         SectionShape::SteelChannel { .. }
         | SectionShape::SteelTee { .. }
         | SectionShape::SteelAngle { .. }
         | SectionShape::SteelFlatBar { .. }
         | SectionShape::SteelRoundBar { .. }
+        | SectionShape::SteelLipChannel { .. }
         | SectionShape::RcRect { .. }
         | SectionShape::RcCircle { .. }
         | SectionShape::SrcRect { .. }

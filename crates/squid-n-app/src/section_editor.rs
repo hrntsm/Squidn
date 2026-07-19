@@ -23,6 +23,8 @@ pub struct SectionEditorDraft {
     pub tf: f64,
     pub t: f64,
     pub r: f64,
+    // リップ溝形（リップ長）
+    pub lip: f64,
     // L 形
     pub leg_a: f64,
     pub leg_b: f64,
@@ -57,6 +59,7 @@ impl Default for SectionEditorDraft {
             tf: 12.0,
             t: 12.0,
             r: 12.0,
+            lip: 20.0,
             leg_a: 75.0,
             leg_b: 75.0,
             leg_thick: 9.0,
@@ -88,6 +91,7 @@ pub enum ShapeKind {
     SteelPipe,
     SteelFlatBar,
     SteelRoundBar,
+    SteelLipChannel,
     RcRect,
     RcCircle,
 }
@@ -103,11 +107,12 @@ impl ShapeKind {
             ShapeKind::SteelPipe => "鋼 丸鋼管",
             ShapeKind::SteelFlatBar => "鋼 平鋼",
             ShapeKind::SteelRoundBar => "鋼 中実丸鋼",
+            ShapeKind::SteelLipChannel => "鋼 リップ溝形",
             ShapeKind::RcRect => "RC 矩形",
             ShapeKind::RcCircle => "RC 円形",
         }
     }
-    pub const ALL: [ShapeKind; 10] = [
+    pub const ALL: [ShapeKind; 11] = [
         ShapeKind::SteelH,
         ShapeKind::SteelBox,
         ShapeKind::SteelAngle,
@@ -116,6 +121,7 @@ impl ShapeKind {
         ShapeKind::SteelPipe,
         ShapeKind::SteelFlatBar,
         ShapeKind::SteelRoundBar,
+        ShapeKind::SteelLipChannel,
         ShapeKind::RcRect,
         ShapeKind::RcCircle,
     ];
@@ -286,6 +292,9 @@ pub fn section_editor_panel(ui: &mut egui::Ui, app: &mut App) {
             }
             ShapeKind::SteelRoundBar => {
                 steel_round_bar_fields(ui, draft);
+            }
+            ShapeKind::SteelLipChannel => {
+                steel_lip_channel_fields(ui, draft);
             }
             ShapeKind::RcRect => {
                 rc_rect_fields(ui, draft);
@@ -471,6 +480,19 @@ fn steel_round_bar_fields(ui: &mut egui::Ui, d: &mut SectionEditorDraft) {
     });
 }
 
+fn steel_lip_channel_fields(ui: &mut egui::Ui, d: &mut SectionEditorDraft) {
+    ui.horizontal(|ui| {
+        ui.label("H せい:");
+        num_field(ui, &mut d.h);
+        ui.label("B 幅:");
+        num_field(ui, &mut d.b);
+        ui.label("C リップ:");
+        num_field(ui, &mut d.lip);
+        ui.label("t 板厚:");
+        num_field(ui, &mut d.t);
+    });
+}
+
 fn rc_rect_fields(ui: &mut egui::Ui, d: &mut SectionEditorDraft) {
     ui.horizontal(|ui| {
         ui.label("B 幅:");
@@ -608,6 +630,12 @@ fn build_shape(d: &SectionEditorDraft) -> SectionShape {
             thick: d.t,
         },
         ShapeKind::SteelRoundBar => SectionShape::SteelRoundBar { dia: d.outer_dia },
+        ShapeKind::SteelLipChannel => SectionShape::SteelLipChannel {
+            height: d.h,
+            width: d.b,
+            lip: d.lip,
+            thick: d.t,
+        },
         ShapeKind::RcRect => SectionShape::RcRect {
             b: d.rc_b,
             d: d.rc_d,

@@ -391,7 +391,8 @@ fn structure_kind(shape: Option<&SectionShape>, mat_name: &str) -> StructureKind
             | SectionShape::SteelTee { .. }
             | SectionShape::SteelPipe { .. }
             | SectionShape::SteelFlatBar { .. }
-            | SectionShape::SteelRoundBar { .. },
+            | SectionShape::SteelRoundBar { .. }
+            | SectionShape::SteelLipChannel { .. },
         ) => StructureKind::S,
         Some(
             SectionShape::RcRect { .. }

@@ -1014,6 +1014,7 @@ fn steel_max_thickness(shape: &squid_n_core::section_shape::SectionShape) -> f64
         | SectionShape::SteelAngle { thick, .. }
         | SectionShape::SteelPipe { thick, .. }
         | SectionShape::SteelFlatBar { thick, .. }
+        | SectionShape::SteelLipChannel { thick, .. }
         | SectionShape::CftBox { thick, .. }
         | SectionShape::CftPipe { thick, .. } => thick,
         // 中実丸鋼は板要素でないため径を板厚区分に用いる。

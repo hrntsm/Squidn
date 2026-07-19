@@ -73,6 +73,48 @@ fn test_steel_round_bar() {
 }
 
 #[test]
+fn test_steel_lip_channel() {
+    // リップ溝形 H=150, B=75, C=20, t=2.3。矩形分解で独立計算した値と一致するか。
+    let h = 150.0;
+    let b = 75.0;
+    let c = 20.0;
+    let t = 2.3;
+    let shape = SectionShape::SteelLipChannel {
+        height: h,
+        width: b,
+        lip: c,
+        thick: t,
+    };
+    let sec = shape.to_section(SectionId(0), "LipC-150x75x20x2.3".into());
+    // 断面積 = ウェブ + 2 フランジ + 2 リップ（重なり無し分解）。
+    let area_expect = t * h + 2.0 * (b - t) * t + 2.0 * t * (c - t);
+    assert!(
+        (sec.area - area_expect).abs() < 1e-6,
+        "A={} 期待 {}",
+        sec.area,
+        area_expect
+    );
+    // 強軸 iy（上下対称、y=H/2 まわり）を独立計算。
+    let i_web = t * h.powi(3) / 12.0;
+    let a_f = (b - t) * t;
+    let i_f = (b - t) * t.powi(3) / 12.0 + a_f * ((h - t) / 2.0).powi(2);
+    let a_l = t * (c - t);
+    let i_l = t * (c - t).powi(3) / 12.0 + a_l * ((h - c - t) / 2.0).powi(2);
+    let iy_expect = i_web + 2.0 * i_f + 2.0 * i_l;
+    assert!(
+        (sec.iy - iy_expect).abs() < 1e-3,
+        "iy={} 期待 {}",
+        sec.iy,
+        iy_expect
+    );
+    // 溝形なので強軸 > 弱軸、いずれも正、J・せん断有効断面も正。
+    assert!(sec.iy > sec.iz && sec.iz > 0.0);
+    assert!(sec.j > 0.0 && sec.as_y > 0.0 && sec.as_z > 0.0);
+    assert_eq!(sec.depth, h);
+    assert_eq!(sec.width, b);
+}
+
+#[test]
 fn test_rc_rect() {
     let shape = SectionShape::RcRect {
         b: 500.0,

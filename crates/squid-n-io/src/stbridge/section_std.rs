@@ -276,6 +276,29 @@ fn steel_figure(shape: &SectionShape) -> Option<(String, String)> {
             );
             Some(e(&name, body))
         }
+        SectionShape::SteelLipChannel {
+            height,
+            width,
+            lip,
+            thick,
+        } => {
+            let name = format!(
+                "LipC-{}x{}x{}x{}",
+                num(height),
+                num(width),
+                num(lip),
+                num(thick)
+            );
+            let body = format!(
+                "<StbSecRoll-LipC name=\"{}\" type=\"LipC\" A=\"{}\" B=\"{}\" C=\"{}\" t=\"{}\" r=\"0\"/>",
+                esc(&name),
+                num(height),
+                num(width),
+                num(lip),
+                num(thick)
+            );
+            Some(e(&name, body))
+        }
         _ => None,
     }
 }
