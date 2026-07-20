@@ -71,6 +71,13 @@ jobs:
   audit:
     name: 脆弱性確認
     runs-on: ubuntu-latest
+    # rustsec/audit-check は脆弱性が0件でも unmaintained 等の警告を
+    # Check Run として書き込むため checks: write が必須。GitHub の新規リポジトリは
+    # デフォルトで GITHUB_TOKEN が read-only になり、権限不足でジョブ自体が失敗する
+    # （"Resource not accessible by integration"）。最小権限でここに明示する。
+    permissions:
+      contents: read
+      checks: write
     steps:
       - uses: actions/checkout@v4
       - uses: rustsec/audit-check@v2.0.0
