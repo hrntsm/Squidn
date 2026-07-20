@@ -214,6 +214,28 @@ impl ElementBehavior for TrussElement {
         }
     }
 
+    fn serialize_checkpoint(&self) -> Vec<u8> {
+        // トライアル追従化により変位が蓄積されるようになったため、
+        // チェックポイントに committed/trial の両変位を含める（レジューム時に
+        // 変位 0 から再計算されて内力が不整合になるのを防ぐ）。
+        bincode::serialize(&(self.committed_disp, self.trial_disp)).expect("serialize checkpoint")
+    }
+
+    fn deserialize_checkpoint(
+        &mut self,
+        data: &[u8],
+    ) -> Result<(), crate::behavior::CheckpointError> {
+        // 旧チェックポイント（変位未収録・空バイト列）は「状態なし」として許容する。
+        if data.is_empty() {
+            return Ok(());
+        }
+        let (committed, trial): ([f64; 12], [f64; 12]) = bincode::deserialize(data)
+            .map_err(|e| crate::behavior::CheckpointError::Decode(e.to_string()))?;
+        self.committed_disp = committed;
+        self.trial_disp = trial;
+        Ok(())
+    }
+
     fn mass_matrix(&self, opt: MassOption) -> LocalMat {
         let m = self.density * self.a_mass * self.length;
         let mut mm = LocalMat::zeros(12);
@@ -425,7 +447,7 @@ mod tests {
         }
     }
 
-    /// j端の軸方向変位を与えると軸力が EA/L×変位 となること（committed_disp 経路）。
+    /// j端の軸方向変位を与えると軸力が EA/L×変位 となること（trial_disp 経路）。
     #[test]
     fn test_axial_force_matches_ea_over_l() {
         let (model, data) = make_model([0.0, 0.0, 0.0], [4000.0, 0.0, 0.0]);

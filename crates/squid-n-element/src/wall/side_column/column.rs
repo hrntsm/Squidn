@@ -179,6 +179,17 @@ impl ElementBehavior for InPlaneReleasedColumn {
         self.inner.restore_state(state);
     }
 
+    fn serialize_checkpoint(&self) -> Vec<u8> {
+        self.inner.serialize_checkpoint()
+    }
+
+    fn deserialize_checkpoint(
+        &mut self,
+        data: &[u8],
+    ) -> Result<(), crate::behavior::CheckpointError> {
+        self.inner.deserialize_checkpoint(data)
+    }
+
     fn mass_matrix(&self, opt: MassOption) -> LocalMat {
         self.inner.mass_matrix(opt)
     }

@@ -185,6 +185,28 @@ impl ElementBehavior for NodalSpringElement {
         }
     }
 
+    fn serialize_checkpoint(&self) -> Vec<u8> {
+        // トライアル追従化により変位が蓄積されるようになったため、
+        // チェックポイントに committed/trial の両変位を含める（レジューム時に
+        // 変位 0 から再計算されて内力が不整合になるのを防ぐ）。
+        bincode::serialize(&(self.committed_disp, self.trial_disp)).expect("serialize checkpoint")
+    }
+
+    fn deserialize_checkpoint(
+        &mut self,
+        data: &[u8],
+    ) -> Result<(), crate::behavior::CheckpointError> {
+        // 旧チェックポイント（変位未収録・空バイト列）は「状態なし」として許容する。
+        if data.is_empty() {
+            return Ok(());
+        }
+        let (committed, trial): ([f64; 12], [f64; 12]) = bincode::deserialize(data)
+            .map_err(|e| crate::behavior::CheckpointError::Decode(e.to_string()))?;
+        self.committed_disp = committed;
+        self.trial_disp = trial;
+        Ok(())
+    }
+
     fn mass_matrix(&self, _opt: MassOption) -> LocalMat {
         // 節点バネは質量を持たない（質量規定は設けない。既存要素の質量は
         // 接続する節点・部材側で評価される想定）。

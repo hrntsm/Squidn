@@ -315,6 +315,20 @@ fn test_concentrated_spring_checkpoint_roundtrip() {
     assert_relative_eq!(before.2, after.2, epsilon = 1e-12);
     assert_relative_eq!(before.3, after.3, epsilon = 1e-12);
     assert_relative_eq!(before.4, after.4, epsilon = 1e-12);
+    // 弾性梁部分の変位もチェックポイントを往復して保存されること
+    // （update_state で非零になっているため、欠落していればここで検出される）。
+    assert!(
+        before.5.iter().any(|v| v.abs() > 1e-15),
+        "前提: committed が非零"
+    );
+    assert!(
+        before.6.iter().any(|v| v.abs() > 1e-15),
+        "前提: trial が非零"
+    );
+    for i in 0..12 {
+        assert_relative_eq!(before.5[i], after.5[i], epsilon = 1e-12);
+        assert_relative_eq!(before.6[i], after.6[i], epsilon = 1e-12);
+    }
 }
 #[test]
 fn test_mn_interaction_reduces_spring_yield() {

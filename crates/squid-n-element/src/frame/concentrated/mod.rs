@@ -357,15 +357,9 @@ impl ElementBehavior for ConcentratedSpringBeam {
     }
 
     fn serialize_checkpoint(&self) -> Vec<u8> {
-        #[derive(serde::Serialize, serde::Deserialize)]
-        struct ConcentratedSpringCheckpoint {
-            rot_i: f64,
-            rot_j: f64,
-            trial_rot_i: f64,
-            trial_rot_j: f64,
-            spring_i: Vec<u8>,
-            spring_j: Vec<u8>,
-        }
+        // 弾性梁部分の変位（committed/trial）もチェックポイントへ含める。
+        // これを欠くと、レジューム時に弾性部の内力が変位 0 から再計算されて
+        // 不整合になる（snapshot_state と同じ理由。FiberBeam の直列化と同規約）。
         let cp = ConcentratedSpringCheckpoint {
             rot_i: self.rot_i,
             rot_j: self.rot_j,
@@ -373,6 +367,8 @@ impl ElementBehavior for ConcentratedSpringBeam {
             trial_rot_j: self.trial_rot_j,
             spring_i: self.spring_i.serialize_state(),
             spring_j: self.spring_j.serialize_state(),
+            elastic_committed_disp: self.elastic.committed_disp,
+            elastic_trial_disp: self.elastic.trial_disp,
         };
         bincode::serialize(&cp).expect("serialize checkpoint")
     }
@@ -381,15 +377,6 @@ impl ElementBehavior for ConcentratedSpringBeam {
         &mut self,
         data: &[u8],
     ) -> Result<(), crate::behavior::CheckpointError> {
-        #[derive(serde::Serialize, serde::Deserialize)]
-        struct ConcentratedSpringCheckpoint {
-            rot_i: f64,
-            rot_j: f64,
-            trial_rot_i: f64,
-            trial_rot_j: f64,
-            spring_i: Vec<u8>,
-            spring_j: Vec<u8>,
-        }
         let cp: ConcentratedSpringCheckpoint = bincode::deserialize(data)
             .map_err(|e| crate::behavior::CheckpointError::Decode(e.to_string()))?;
         self.rot_i = cp.rot_i;
@@ -398,8 +385,23 @@ impl ElementBehavior for ConcentratedSpringBeam {
         self.trial_rot_j = cp.trial_rot_j;
         self.spring_i.deserialize_state(&cp.spring_i)?;
         self.spring_j.deserialize_state(&cp.spring_j)?;
+        self.elastic.committed_disp = cp.elastic_committed_disp;
+        self.elastic.trial_disp = cp.elastic_trial_disp;
         Ok(())
     }
+}
+
+/// [`ConcentratedSpringBeam`] のチェックポイント形式（serialize/deserialize 共用）。
+#[derive(serde::Serialize, serde::Deserialize)]
+struct ConcentratedSpringCheckpoint {
+    rot_i: f64,
+    rot_j: f64,
+    trial_rot_i: f64,
+    trial_rot_j: f64,
+    spring_i: Vec<u8>,
+    spring_j: Vec<u8>,
+    elastic_committed_disp: [f64; 12],
+    elastic_trial_disp: [f64; 12],
 }
 
 #[cfg(test)]

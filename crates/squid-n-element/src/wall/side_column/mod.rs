@@ -161,17 +161,35 @@ mod tests {
     }
 
     /// 剛体移動（両端同一変位・回転0）では解放柱も内力ゼロ。
+    /// internal_force はトライアル追従（trial_disp 参照）のため trial 側へ変位を
+    /// 与える。片端のみの変位（非剛体）では内力が生じることも併せて確認し、
+    /// 「trial が空のまま常にゼロ」という無意味な合格を防ぐ。
     #[test]
     fn test_rigid_translation_zero_internal_force() {
         let model = Model::default();
         let ctx = Ctx { model: &model };
         for axis in [ReleaseAxis::LocalY, ReleaseAxis::LocalZ] {
             let mut col = make_test_column(axis);
+
+            // 有意性確認: 片端のみの軸方向伸び（非剛体）では内力が生じること。
+            // （横方向の片端変位は解放曲げ面では剛体回転となり内力ゼロが正しい
+            // ため、常に内力が出る軸方向で「trial が空のまま恒等的にゼロ」という
+            // 無意味な合格を防ぐ。）
+            let mut u_axial = [0.0; 12];
+            u_axial[0] = 1.0;
+            col.inner.trial_disp = u_axial;
+            let f_axial = col.internal_force(&ElemState::default(), &ctx);
+            assert!(
+                f_axial.data.iter().any(|fi| fi.abs() > 1e-3),
+                "axis={axis:?} 片端軸方向変位で内力が生じない（テストが無効化されている）"
+            );
+
             for dir in 0..3 {
+                // 剛体移動: 内力ゼロ
                 let mut u = [0.0; 12];
                 u[dir] = 1.0;
                 u[6 + dir] = 1.0;
-                col.inner.committed_disp = u;
+                col.inner.trial_disp = u;
                 let f = col.internal_force(&ElemState::default(), &ctx);
                 for (i, fi) in f.data.iter().enumerate() {
                     assert!(
