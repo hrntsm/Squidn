@@ -1384,11 +1384,15 @@ impl eframe::App for App {
         let available = ui.available_rect_before_wrap();
         let nav_width = self.left_panel_width.clamp(180.0, 520.0);
         let inspector_width = 240.0;
-        // ステータスバーの高さ: セパレータ（6px）＋ 行間 ＋ 本文1行 ＋ 余裕2px。
+        // ステータスバーの高さ: 上に引く区切り線の占有分 ＋ 本文1行 ＋ 余裕。
         // 固定値（旧 22px）では日本語フォントの行高（Body 13pt で約19px）に足りず、
         // 文字の下側がウィンドウ外へ見切れる。
-        let status_height =
-            ui.text_style_height(&egui::TextStyle::Body) + 6.0 + ui.spacing().item_spacing.y + 2.0;
+        const STATUS_BAR_SEPARATOR_PX: f32 = 6.0;
+        const STATUS_BAR_MARGIN_PX: f32 = 2.0;
+        let status_height = ui.text_style_height(&egui::TextStyle::Body)
+            + STATUS_BAR_SEPARATOR_PX
+            + ui.spacing().item_spacing.y
+            + STATUS_BAR_MARGIN_PX;
 
         let nav_rect = egui::Rect {
             min: available.min,

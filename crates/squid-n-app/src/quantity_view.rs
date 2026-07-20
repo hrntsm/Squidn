@@ -120,7 +120,7 @@ pub fn quantity_panel(ui: &mut egui::Ui, app: &mut App) {
                     .column(Column::initial(220.0))
                     .column(Column::initial(100.0))
                     .column(Column::initial(100.0))
-                    .header(20.0, |mut h| {
+                    .header(row_h, |mut h| {
                         for t in &["断面", "長さ [m]", "重量 [t]"] {
                             h.col(|ui| {
                                 ui.strong(*t);
@@ -150,7 +150,7 @@ pub fn quantity_panel(ui: &mut egui::Ui, app: &mut App) {
                     .column(Column::initial(120.0))
                     .column(Column::initial(120.0))
                     .column(Column::initial(100.0))
-                    .header(20.0, |mut h| {
+                    .header(row_h, |mut h| {
                         for t in &["呼び径", "長さ [m]", "重量 [t]"] {
                             h.col(|ui| {
                                 ui.strong(*t);
@@ -194,7 +194,7 @@ pub fn quantity_panel(ui: &mut egui::Ui, app: &mut App) {
                     .column(Column::initial(80.0)) // 鉄筋
                     .column(Column::initial(80.0)) // 鉄骨
                     .column(Column::initial(80.0)) // 継手
-                    .header(20.0, |mut h| {
+                    .header(row_h, |mut h| {
                         for t in &[
                             "ID",
                             "階",
@@ -299,7 +299,7 @@ fn totals_table(
         .column(Column::initial(80.0))
         .column(Column::initial(80.0))
         .column(Column::initial(80.0))
-        .header(20.0, |mut h| {
+        .header(row_h, |mut h| {
             for t in &[
                 key_label,
                 "ｺﾝｸﾘｰﾄ [m³]",

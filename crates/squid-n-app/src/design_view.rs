@@ -140,7 +140,7 @@ pub fn design_table(ui: &mut egui::Ui, app: &mut App) {
         .column(Column::initial(60.0))
         .column(Column::initial(200.0))
         .column(Column::initial(90.0))
-        .header(20.0, |mut h| {
+        .header(row_h, |mut h| {
             for t in &["部材", "位置", "検定比", "判定", "根拠", "断面"] {
                 h.col(|ui| {
                     ui.strong(*t);
@@ -229,7 +229,7 @@ pub fn design_table(ui: &mut egui::Ui, app: &mut App) {
             .column(Column::initial(80.0))
             .column(Column::initial(60.0))
             .column(Column::initial(260.0))
-            .header(20.0, |mut h| {
+            .header(row_h, |mut h| {
                 for t in &["節点", "種別", "検定比", "判定", "根拠"] {
                     h.col(|ui| {
                         ui.strong(*t);
@@ -409,7 +409,7 @@ pub fn design_table(ui: &mut egui::Ui, app: &mut App) {
             .column(Column::initial(80.0))
             .column(Column::initial(80.0))
             .column(Column::initial(60.0))
-            .header(20.0, |mut h| {
+            .header(row_h, |mut h| {
                 // 変形角の制限値は計算条件（令82条の2: 原則 1/200、緩和時 1/120）に追従する。
                 let denom = metrics
                     .first()
@@ -549,7 +549,7 @@ pub fn design_table(ui: &mut egui::Ui, app: &mut App) {
                 .column(Column::initial(80.0))
                 .column(Column::initial(60.0))
                 .column(Column::initial(70.0))
-                .header(20.0, |mut h| {
+                .header(row_h, |mut h| {
                     for t in &[
                         "階",
                         "Qu[kN]",
@@ -642,6 +642,7 @@ fn floor_design_section(ui: &mut egui::Ui, app: &App) {
 
     if !r.joist_checks.is_empty() {
         ui.label("小梁（単純支持梁）:");
+        let row_h = crate::theme::table_row_height(ui);
         TableBuilder::new(ui)
             .id_salt("joist_design_table")
             .striped(true)
@@ -653,7 +654,7 @@ fn floor_design_section(ui: &mut egui::Ui, app: &App) {
             .column(Column::initial(90.0))
             .column(Column::initial(70.0))
             .column(Column::auto())
-            .header(20.0, |mut h| {
+            .header(row_h, |mut h| {
                 for t in &[
                     "スラブ",
                     "小梁",
@@ -717,6 +718,7 @@ fn floor_design_section(ui: &mut egui::Ui, app: &App) {
     if !r.slab_checks.is_empty() {
         ui.add_space(6.0);
         ui.label("スラブ（一方向版）:");
+        let row_h = crate::theme::table_row_height(ui);
         TableBuilder::new(ui)
             .id_salt("slab_design_table")
             .striped(true)
@@ -726,7 +728,7 @@ fn floor_design_section(ui: &mut egui::Ui, app: &App) {
             .column(Column::initial(100.0))
             .column(Column::initial(80.0))
             .column(Column::initial(120.0))
-            .header(20.0, |mut h| {
+            .header(row_h, |mut h| {
                 for t in &[
                     "スラブ",
                     "スパン[mm]",

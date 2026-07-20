@@ -162,7 +162,7 @@ pub fn ultimate_table(ui: &mut egui::Ui, app: &mut App) {
                 .column(Column::initial(80.0))
                 .column(Column::initial(72.0))
                 .column(Column::initial(50.0))
-                .header(20.0, |mut h| {
+                .header(row_h, |mut h| {
                     for t in &[
                         "部材",
                         "種別",
@@ -293,7 +293,7 @@ pub fn ultimate_table(ui: &mut egui::Ui, app: &mut App) {
                 .column(Column::initial(90.0))
                 .column(Column::initial(72.0))
                 .column(Column::initial(50.0))
-                .header(20.0, |mut h| {
+                .header(row_h, |mut h| {
                     for t in &[
                         "部材",
                         "分類",
