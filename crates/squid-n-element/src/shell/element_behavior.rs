@@ -40,6 +40,10 @@ impl crate::behavior::ElementBehavior for ShellElement {
         // 接線剛性と同じ構成（剛床時の面内剛性無効化を含む）で評価し、
         // K・u の整合を保つ。従来は恒常的にゼロを返しており、非線形解析で
         // シェルが復元力を全く負担していなかった。
+        // 注: 剛床所属（membrane_active=false）時の面内成分は
+        // apply_rigid_floor_membrane_off が特異回避のため対角へ入れるダミー剛性
+        // 1.0 に由来する微小な寄生力を持ち、厳密なゼロにはならない（実剛性より
+        // 約 10 桁小さく実害なし。接線剛性と同一の K を使うため数学的には整合）。
         let mut k_local = self.local_stiffness();
         self.apply_rigid_floor_membrane_off(&mut k_local);
         let k = self.frame.to_global(&k_local);

@@ -653,6 +653,10 @@ fn test_patch_bending_distorted() {
 /// 反映され（内力 = 接線剛性·u と厳密に一致）、剛体並進では内力ゼロとなること。
 /// 従来は internal_force が恒常的にゼロを返しており、非線形解析でシェルが
 /// 復元力を負担していなかった。
+///
+/// K·u 比較は「internal_force と tangent_stiffness が将来ズレない」ことの
+/// 回帰ガードであり、K の値そのものの正しさは本ファイルのパッチテスト群
+/// （膜・曲げの解析解照合）が担保する（両者を合わせて非循環な検証となる）。
 #[test]
 fn test_shell_trial_displacement_tracking() {
     use crate::behavior::{Ctx, ElemState, ElementBehavior, LocalVec};

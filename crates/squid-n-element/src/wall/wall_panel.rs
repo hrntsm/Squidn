@@ -700,6 +700,11 @@ mod tests {
     /// 反映され（内力 = K24·u と厳密に一致）、commit / revert / snapshot / restore が
     /// beam/behavior.rs と同じ規律で機能すること。従来は internal_force が恒常的に
     /// ゼロを返しており、非線形解析で耐震壁が復元力を負担していなかった。
+    ///
+    /// 本テストの K·u 比較は「internal_force と tangent_stiffness が将来ズレない」
+    /// ことの回帰ガードであり、K24 の値そのものの正しさは独立の解析解と照合する
+    /// `test_wall_panel_inplane_shear_matches_column`（12EI/((1+φ)h³)）が担保する
+    /// （両者を合わせて非循環な検証となる）。
     #[test]
     fn test_wall_panel_trial_displacement_tracking() {
         use crate::behavior::{Ctx, ElemState, ElementBehavior, LocalVec};
