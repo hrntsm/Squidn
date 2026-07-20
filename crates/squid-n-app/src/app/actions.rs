@@ -5,7 +5,10 @@ use super::*;
 impl App {
     /// モデルを丸ごと差し替える（新規作成・サンプル読込・ファイル読込で共用）。
     /// undo 履歴・結果・選択・stale 状態をすべてリセットする。
-    pub fn load_model(&mut self, model: squid_n_core::model::Model) {
+    /// 旧スキーマの自動生成荷重ケース名（「床荷重(自動)」「自重(自動)」等）は
+    /// 標準ケース名（DL・LL(架構用)・LL(地震用)）へ移行する。
+    pub fn load_model(&mut self, mut model: squid_n_core::model::Model) {
+        model.migrate_legacy_auto_load_cases();
         self.model = model;
         self.results = None;
         self.selection = Selection::default();
@@ -48,6 +51,9 @@ impl App {
 
     /// ST-Bridge（XML, サブセット）ファイルを読み込む。
     /// Squid-N プロジェクト（.scz）とは別物なので project_path はクリアする。
+    /// ファイルが荷重情報（`StbLoadCase`）を持たない場合は、標準荷重ケース
+    /// （DL・LL(架構用)・LL(地震用)・EX・EY）を自動作成する（新規モデルと同じ
+    /// 出発点。DL の自重・スラブ荷重は解析実行前の同期アクションが自動計算する）。
     pub fn import_stbridge_from(&mut self, path: std::path::PathBuf) {
         self.last_error = None;
         let xml = match squid_n_io::stbridge::read_stbridge_file(&path) {
@@ -58,18 +64,28 @@ impl App {
             }
         };
         match squid_n_io::stbridge::import_stbridge_with_report(&xml) {
-            Ok((model, report)) => {
+            Ok((mut model, report)) => {
                 if let Err(e) = model.validate() {
                     self.last_error = Some(format!("ST-Bridge読込モデルの検証エラー: {:?}", e));
                     return;
                 }
+                if model.load_cases.is_empty() {
+                    model.load_cases = squid_n_core::model::default_load_cases();
+                }
                 self.load_model(model);
                 self.project_path = None;
-                // 欠落・近似があれば注意として表示する（致命的ではない）。
-                if !report.is_clean() {
+                // 欠落・近似（warnings）と自動補完の仮定（notes。支点の自動設定など）が
+                // あれば注意として表示する（致命的ではない）。
+                let lines: Vec<&str> = report
+                    .warnings
+                    .iter()
+                    .chain(report.notes.iter())
+                    .map(String::as_str)
+                    .collect();
+                if !lines.is_empty() {
                     self.last_error = Some(format!(
                         "⚠️ ST-Bridge 取り込み時の注意:\n- {}",
-                        report.warnings.join("\n- ")
+                        lines.join("\n- ")
                     ));
                 }
             }
@@ -127,15 +143,18 @@ impl App {
     /// T3: 線形静的解析を実行し、結果を `self.results` に格納する。
     /// 指定した荷重ケースが存在しない場合はエラーメッセージをセット。
     ///
-    /// 解析準備前にスラブ荷重を「床荷重(自動)」ケースへ（レビュー §1.1）、
-    /// 自重を「自重(自動)」ケースへ同期する（照合レビュー：③梁自重・②壁荷重の
-    /// CMoQ 経路を長期応力解析へ接続する）。
+    /// 解析準備前にスラブ荷重・躯体自重を「DL」等の標準ケースへ（レビュー §1.1・
+    /// 照合レビュー：③梁自重・②壁荷重の CMoQ 経路を長期応力解析へ接続）、
+    /// 階が定義済みなら地震荷重を「EX」「EY」ケースへ同期する。
     pub fn run_linear_static(&mut self, lc: LoadCaseId) {
         self.apply_parallelism_setting();
         self.last_error = None;
-        self.sync_slab_loads_action();
-        self.sync_self_weight_action();
+        self.sync_gravity_load_cases_action();
+        // 剛域の反映は地震荷重の同期より先に行う（SemiPrecise の固有周期算定が
+        // 剛域込みの剛性を用いるようにするため。`sync_seismic_load_cases_action`
+        // は内部で別途 `Analysis::prepare` する）。
         self.apply_rigid_zones_for_analysis();
+        self.sync_seismic_load_cases_action();
         match Analysis::prepare(&self.model) {
             Ok(analysis) => match analysis.linear_static(lc) {
                 Ok(res) => {
@@ -159,18 +178,29 @@ impl App {
     /// T7: 荷重組合せ解析を実行し、結果を `bundle.combos` に格納する。
     /// 指定インデックスの荷重組合せが存在しない場合はエラーメッセージをセット。
     ///
-    /// 解析準備前にスラブ荷重を「床荷重(自動)」ケースへ、自重を「自重(自動)」
-    /// ケースへ同期する（レビュー §1.1・照合レビュー）。
+    /// 解析準備前にスラブ荷重・躯体自重を「DL」等の標準ケースへ、階が定義済み
+    /// なら地震荷重を「EX」「EY」ケースへ同期する（レビュー §1.1・照合レビュー）。
+    /// 組合せが空の地震荷重ケースを参照している場合は解かずにエラーで案内する
+    /// （地震項が黙って 0 になるのを防ぐ）。
     pub fn run_combination(&mut self, index: usize) {
         self.apply_parallelism_setting();
         self.last_error = None;
-        self.sync_slab_loads_action();
-        self.sync_self_weight_action();
+        self.sync_gravity_load_cases_action();
+        // 剛域の反映は地震荷重の同期より先に行う（SemiPrecise の固有周期算定が
+        // 剛域込みの剛性を用いるようにするため）。
+        self.apply_rigid_zones_for_analysis();
+        self.sync_seismic_load_cases_action();
         let Some(combo) = self.model.combinations.get(index).cloned() else {
             self.last_error = Some(format!("荷重組合せ #{} が存在しません", index));
             return;
         };
-        self.apply_rigid_zones_for_analysis();
+        if let Some(name) = self.empty_seismic_case_in_combo(&combo) {
+            self.last_error = Some(format!(
+                "荷重組合せ「{}」が参照する地震荷重ケース「{}」が空です。解析タブの「階の自動生成」を実行して地震荷重を生成してください。",
+                combo.name, name
+            ));
+            return;
+        }
         match Analysis::prepare(&self.model) {
             Ok(analysis) => match analysis.linear_combination(&combo) {
                 Ok(res) => {
@@ -224,14 +254,16 @@ impl App {
     pub fn run_all_combinations(&mut self) {
         self.apply_parallelism_setting();
         self.last_error = None;
-        self.sync_slab_loads_action();
-        self.sync_self_weight_action();
+        self.sync_gravity_load_cases_action();
         if self.model.combinations.is_empty() {
             self.last_error =
                 Some("荷重組合せがありません。荷重タブで作成してください。".to_string());
             return;
         }
+        // 剛域の反映は地震荷重の同期より先に行う（SemiPrecise の固有周期算定が
+        // 剛域込みの剛性を用いるようにするため）。
         self.apply_rigid_zones_for_analysis();
+        self.sync_seismic_load_cases_action();
         let analysis = match Analysis::prepare(&self.model) {
             Ok(a) => a,
             Err(e) => {
@@ -240,10 +272,25 @@ impl App {
             }
         };
         let combos = self.model.combinations.clone();
+        // 空の地震荷重ケース（未生成の EX/EY 等）を参照する組合せは解かずに
+        // エラーへ回す（地震項が黙って 0 になるのを防ぐ）。
+        let mut errors: Vec<String> = Vec::new();
+        let combos: Vec<squid_n_core::model::LoadCombination> = combos
+            .into_iter()
+            .filter(|combo| match self.empty_seismic_case_in_combo(combo) {
+                Some(name) => {
+                    errors.push(format!(
+                        "[{}] 地震荷重ケース「{}」が空です。解析タブの「階の自動生成」を実行してください。",
+                        combo.name, name
+                    ));
+                    false
+                }
+                None => true,
+            })
+            .collect();
         let results = analysis.linear_combination_batch(&combos);
 
         let mut bundle = self.results.take().unwrap_or_default();
-        let mut errors: Vec<String> = Vec::new();
         let mut last_ok: Option<(usize, String)> = None;
         for (combo, res) in combos.iter().zip(results) {
             match res {
@@ -787,14 +834,24 @@ impl App {
 
     /// 階(Story)を節点標高から自動生成して適用する（undo 可能）。
     /// 地震重量には kind=Dead/LiveSeismic（無ければ Dead+Live、種別未設定なら
-    /// 先頭ケース）の荷重ケースの鉛直下向き荷重＋自重を用いる（レビュー §1.7）。
-    /// 先立ってスラブ荷重を「床荷重(自動)」ケースへ同期する（レビュー §1.1）ため、
-    /// 面荷重も地震用重量に反映される。
+    /// 先頭ケース）の荷重ケースの鉛直下向き荷重を用いる（レビュー §1.7）。
+    /// 先立ってスラブ荷重・躯体自重を「DL」等の標準ケースへ同期する
+    /// （レビュー §1.1）ため、面荷重・自重も地震用重量に反映される
+    /// （DL に自重が含まれるため、密度からの自重直接算入は DL が無い場合のみ。
+    /// `density_self_weight_for_stories`）。
+    ///
+    /// 階の適用後、地震荷重を「EX」「EY」ケースへ同期する（Ai 分布の水平力。
+    /// これで荷重組合せ G+P±K が実行可能になる）。
     pub fn generate_stories_action(&mut self) {
         self.last_error = None;
-        self.sync_slab_loads_action();
+        self.sync_gravity_load_cases_action();
         let gravity_lcs = gravity_cases_for_seismic_weight(&self.model);
-        match squid_n_load::story_gen::generate_stories_multi(&self.model, &gravity_lcs) {
+        let include_density = density_self_weight_for_stories(&self.model);
+        match squid_n_load::story_gen::generate_stories_with_opts(
+            &self.model,
+            &gravity_lcs,
+            include_density,
+        ) {
             Ok(gen) => {
                 self.undo.run(
                     &mut self.model,
@@ -807,6 +864,10 @@ impl App {
                     }),
                 );
                 self.staleness.mark_edited();
+                // 剛域の反映は地震荷重の同期より先に行う（SemiPrecise の固有周期算定が
+                // 剛域込みの剛性を用いるようにするため）。
+                self.apply_rigid_zones_for_analysis();
+                self.sync_seismic_load_cases_action();
             }
             Err(e) => self.last_error = Some(format!("階の自動生成エラー: {}", e)),
         }
@@ -816,9 +877,14 @@ impl App {
     /// 方向・Ai算定法・Z・地盤種別・C0 は `analysis_cfg` を用いる。
     /// 結果は `StaticCaseKey::Seismic(dir)` に格納するため、X/Y 双方の地震静的結果
     /// および任意のユーザー荷重ケースの結果と衝突せず共存できる。
+    /// あわせて同じ水平力を「EX」「EY」ケースへ同期する（荷重組合せ用）。
     pub fn run_seismic(&mut self, dir: SeismicDir) {
         self.apply_parallelism_setting();
         self.last_error = None;
+        // 剛域の反映は地震荷重の同期より先に行う（SemiPrecise の固有周期算定が
+        // 剛域込みの剛性を用いるようにするため）。
+        self.apply_rigid_zones_for_analysis();
+        self.sync_seismic_load_cases_action();
         let cfg = squid_n_solver::analysis::SeismicCfg {
             dir,
             mode: self.analysis_cfg.ai_mode,
@@ -826,7 +892,6 @@ impl App {
             soil: self.analysis_cfg.soil,
             c0: self.analysis_cfg.c0,
         };
-        self.apply_rigid_zones_for_analysis();
         match Analysis::prepare(&self.model) {
             Ok(analysis) => match analysis.seismic_static_with(cfg) {
                 Ok(res) => {
@@ -1768,7 +1833,7 @@ impl App {
     /// `LoadTarget::Node(id)`（小梁反力などの節点集中荷重）。`Edge` はここで
     /// その節点対を両端に持つ `Beam` 要素を探し、実 `ElemId` に置き換える
     /// （ノード順は不問）。`Node` はそのまま（`elem` は番兵 `ElemId(u32::MAX)`
-    /// のまま）保持する（部材マッピング不要。`sync_slab_loads_action` が
+    /// のまま）保持する（部材マッピング不要。`sync_gravity_load_cases_action` が
     /// `NodalLoad` へ変換する。CMQ 図描画側は `elem` で梁を引くため、この番兵は
     /// 単に描画対象外になるだけで安全）。
     pub fn refresh_beam_loads(&mut self) {
@@ -1827,7 +1892,7 @@ impl App {
     /// 各スラブについて面荷重強度 `w_of(slab)`（N/mm²）を境界へ分配し、
     /// `LoadTarget::Edge` を実 `ElemId` に対応付けた `BeamLoad` 列を返す。
     /// 対応する梁が無い辺の荷重は捨てる。`refresh_beam_loads`（DL）と
-    /// `sync_slab_loads_action`（LL）の共通経路（令85条1項の DL/LL 分離）。
+    /// `sync_gravity_load_cases_action`（LL）の共通経路（令85条1項の DL/LL 分離）。
     ///
     /// 交差小梁スラブ（軸平行・全仮想）は、平行小梁モデルの小梁点反力
     /// （`LoadTarget::Node`）を床格子サブモデルの支点反力で置換する（床 Phase F-3b。
@@ -1873,18 +1938,31 @@ impl App {
                         }
                         let n0 = slab.boundary[k];
                         let n1 = slab.boundary[(k + 1) % n];
-                        let Some(elem) = find_beam(n0, n1) else {
-                            continue;
-                        };
-                        bl.elem = elem;
-                        beam_loads.push(bl);
+                        match find_beam(n0, n1) {
+                            Some(elem) => {
+                                bl.elem = elem;
+                                beam_loads.push(bl);
+                            }
+                            None => {
+                                // 対応する実梁が無い辺（二次部材（小梁）上の辺・大梁の
+                                // 中間区間など）は節点対を保持して渡し、
+                                // `slab_load_case_content` が主架構へ変換する
+                                // （大梁の部分分布 or 単純梁反力→CMQ）。
+                                // Edge の `elem` は辺番号が入っているため、実部材と
+                                // 誤解されないよう番兵へ明示的に戻す。
+                                bl.elem = ElemId(u32::MAX);
+                                bl.target = squid_n_load::floor::LoadTarget::Span([n0, n1]);
+                                beam_loads.push(bl);
+                            }
+                        }
                     }
                     // 実部材化された小梁: 節点対から実 Beam の ElemId を解決して載せる。
+                    // 解決できない節点対はそのまま渡し、`slab_load_case_content` が
+                    // 主架構へ変換する。
                     squid_n_load::floor::LoadTarget::Span([n0, n1]) => {
-                        let Some(elem) = find_beam(n0, n1) else {
-                            continue;
-                        };
-                        bl.elem = elem;
+                        if let Some(elem) = find_beam(n0, n1) {
+                            bl.elem = elem;
+                        }
                         beam_loads.push(bl);
                     }
                 }
@@ -1938,6 +2016,7 @@ impl App {
     ) {
         use squid_n_core::model::{MemberLoad, MemberLoadKind, NodalLoad};
         use squid_n_load::floor::{LoadShape, LoadTarget};
+        use squid_n_load::secondary::{beam_span_position, SPAN_TOL_MM};
 
         const DIR: [f64; 3] = [0.0, 0.0, -1.0];
         let mut nodal = Vec::new();
@@ -1954,6 +2033,67 @@ impl App {
             });
         }
 
+        // 形状を「部材 `elem` の区間 [a0, a0+len_e]」へ載せる（`a0=0`・`len_e=部材長`
+        // なら従来の全長スパン）。`flip` は載荷区間の向きが部材軸と逆
+        // （n0 が j 端側）の場合に Point の位置を反転する（分布形状は対称なので不変）。
+        fn emit_shape(
+            member: &mut Vec<MemberLoad>,
+            elem: ElemId,
+            a0: f64,
+            len_e: f64,
+            flip: bool,
+            shape: &LoadShape,
+        ) {
+            match *shape {
+                LoadShape::Uniform { w } => push_dist(member, elem, a0, a0 + len_e, w, w),
+                LoadShape::Triangle { w0 } => {
+                    let mid = len_e / 2.0;
+                    push_dist(member, elem, a0, a0 + mid, 0.0, w0);
+                    push_dist(member, elem, a0 + mid, a0 + len_e, w0, 0.0);
+                }
+                LoadShape::Trapezoid { w0, a, b } => {
+                    push_dist(member, elem, a0, a0 + a, 0.0, w0);
+                    push_dist(member, elem, a0 + a, a0 + a + b, w0, w0);
+                    push_dist(member, elem, a0 + a + b, a0 + len_e, w0, 0.0);
+                }
+                LoadShape::Point { p, x } => {
+                    let xx = if flip { len_e - x } else { x };
+                    member.push(MemberLoad {
+                        elem,
+                        dir: DIR,
+                        kind: MemberLoadKind::Point { a: a0 + xx, p },
+                    });
+                }
+            }
+        }
+
+        // 形状の合計荷重と、単純梁とみなした場合の両端反力 (R0, R1)。
+        // 分布形状は対称なので折半、Point は載荷位置に応じて按分する。
+        fn simple_reactions(shape: &LoadShape, len: f64) -> (f64, f64) {
+            match *shape {
+                LoadShape::Uniform { w } => {
+                    let total = w * len;
+                    (total / 2.0, total / 2.0)
+                }
+                LoadShape::Triangle { w0 } => {
+                    let total = w0 * len / 2.0;
+                    (total / 2.0, total / 2.0)
+                }
+                LoadShape::Trapezoid { w0, a, b } => {
+                    let total = w0 * (a + b);
+                    (total / 2.0, total / 2.0)
+                }
+                LoadShape::Point { p, x } => {
+                    if len <= 1e-9 {
+                        (p / 2.0, p / 2.0)
+                    } else {
+                        let t = (x / len).clamp(0.0, 1.0);
+                        (p * (1.0 - t), p * t)
+                    }
+                }
+            }
+        }
+
         for bl in beam_loads {
             match bl.target {
                 LoadTarget::Node(n) => {
@@ -1965,9 +2105,8 @@ impl App {
                         values: [0.0, 0.0, -p, 0.0, 0.0, 0.0],
                     });
                 }
-                // Edge（境界大梁）と Span（実部材化小梁）はいずれも実部材への
-                // 分布/集中荷重として同一に扱う（bl.elem に解決済みの ElemId が入る）。
-                LoadTarget::Edge(_) | LoadTarget::Span(_) => {
+                // Edge（境界大梁）: bl.elem に解決済みの ElemId が入る。
+                LoadTarget::Edge(_) => {
                     let Some(elem) = self.model.elements.iter().find(|e| e.id == bl.elem) else {
                         continue;
                     };
@@ -1975,25 +2114,53 @@ impl App {
                     if l <= 1e-9 {
                         continue;
                     }
-                    match bl.shape {
-                        LoadShape::Uniform { w } => {
-                            push_dist(&mut member, elem.id, 0.0, l, w, w);
+                    emit_shape(&mut member, elem.id, 0.0, l, false, &bl.shape);
+                }
+                // Span（節点対）: 実部材化小梁（解決済み ElemId）はそのまま全長へ。
+                // 実梁が無い節点対（二次部材（小梁）上の辺・大梁の中間区間）は
+                // 主架構へ変換する:
+                // 1. 両節点が同一の大梁スパン上 → その大梁の**部分区間**分布へ
+                // 2. それ以外 → 単純梁の両端反力として節点荷重化
+                //    （節点が大梁スパン上なら後段で中間集中荷重（CMQ）へ変換）
+                LoadTarget::Span([n0, n1]) => {
+                    if let Some(elem) = self.model.elements.iter().find(|e| e.id == bl.elem) {
+                        let l = elem_geometric_length(elem, &self.model);
+                        if l > 1e-9 {
+                            emit_shape(&mut member, elem.id, 0.0, l, false, &bl.shape);
                         }
-                        LoadShape::Triangle { w0 } => {
-                            let mid = l / 2.0;
-                            push_dist(&mut member, elem.id, 0.0, mid, 0.0, w0);
-                            push_dist(&mut member, elem.id, mid, l, w0, 0.0);
+                        continue;
+                    }
+                    let (Some(node0), Some(node1)) = (
+                        self.model.nodes.get(n0.index()),
+                        self.model.nodes.get(n1.index()),
+                    ) else {
+                        continue;
+                    };
+                    let hit0 = beam_span_position(&self.model, node0.coord, SPAN_TOL_MM);
+                    let hit1 = beam_span_position(&self.model, node1.coord, SPAN_TOL_MM);
+                    if let (Some((e0, a0)), Some((e1, a1))) = (hit0, hit1) {
+                        if e0 == e1 {
+                            // 大梁の中間区間に載る辺: 部分区間の分布荷重へ。
+                            let start = a0.min(a1);
+                            let len_e = (a1 - a0).abs();
+                            if len_e > 1e-9 {
+                                emit_shape(&mut member, e0, start, len_e, a0 > a1, &bl.shape);
+                            }
+                            continue;
                         }
-                        LoadShape::Trapezoid { w0, a, b } => {
-                            push_dist(&mut member, elem.id, 0.0, a, 0.0, w0);
-                            push_dist(&mut member, elem.id, a, a + b, w0, w0);
-                            push_dist(&mut member, elem.id, a + b, l, w0, 0.0);
-                        }
-                        LoadShape::Point { p, x } => {
-                            member.push(MemberLoad {
-                                elem: elem.id,
-                                dir: DIR,
-                                kind: MemberLoadKind::Point { a: x, p },
+                    }
+                    // 二次部材（小梁）上の辺など: 単純梁反力として両端節点へ。
+                    let len = {
+                        let (a, b) = (node0.coord, node1.coord);
+                        ((a[0] - b[0]).powi(2) + (a[1] - b[1]).powi(2) + (a[2] - b[2]).powi(2))
+                            .sqrt()
+                    };
+                    let (r0, r1) = simple_reactions(&bl.shape, len);
+                    for (n, r) in [(n0, r0), (n1, r1)] {
+                        if r.abs() > 1e-9 {
+                            nodal.push(NodalLoad {
+                                node: n,
+                                values: [0.0, 0.0, -r, 0.0, 0.0, 0.0],
                             });
                         }
                     }
@@ -2001,64 +2168,124 @@ impl App {
             }
         }
 
+        // 要素が接続しない節点への荷重（小梁反力・小梁支持点など）を、載っている
+        // 大梁の中間集中荷重（CMQ）へ変換する（二次部材の荷重伝達）。
+        let (nodal, extra_member) =
+            squid_n_load::secondary::resolve_nodal_to_primary(&self.model, nodal, SPAN_TOL_MM);
+        member.extend(extra_member);
+
         (nodal, member)
     }
 
-    /// スラブ荷重を専用の 2 荷重ケースへ同期する（レビュー §1.1: 面荷重→大梁分配の
-    /// 結果を応力解析へ接続する最重要修正／床 Phase A-2: 令85条1項の DL/LL 分離）。
+    /// 重力系の標準荷重ケース（DL・LL(架構用)・LL(地震用)）へ自動計算値を同期する
+    /// （レビュー §1.1: 面荷重→大梁分配の結果を応力解析へ接続する最重要修正／
+    /// 床 Phase A-2: 令85条1項の DL/LL 分離／照合レビュー: ③梁自重・②壁荷重の
+    /// CMoQ 経路を長期応力解析へ接続）。
     ///
-    /// - 「床荷重(自動)」（kind=Dead）: スラブの `loads`（仕上げ等の固定荷重 DL）を分配。
-    /// - 「床積載(自動)」（kind=Live）: スラブ用途（`SlabUsage`）から令別表第1 の
+    /// - 「DL」（kind=Dead・[`DL_CASE_NAME`]）: スラブの `loads`（仕上げ等の
+    ///   固定荷重）の分配と、躯体自重（柱梁・壁・ダンパー・フレーム外雑壁。
+    ///   `squid_n_load::self_weight::self_weight_case_content`）の合算。
+    /// - 「LL(架構用)」（kind=Live）: スラブ用途（`SlabUsage`）から令別表第1 の
     ///   **骨組用**積載（LL）を分配（長期骨組解析用。用途未設定のスラブは寄与 0）。
+    /// - 「LL(地震用)」（kind=LiveSeismic）: スラブ用途から令別表第1 の地震用積載を
+    ///   分配。`gravity_cases_for_seismic_weight` が LiveSeismic を優先採用するため、
+    ///   地震用重量にはこの（骨組用より小さい）地震用値が算入される（令85条1項）。
     ///
-    /// 各ケースについて現在のスラブ荷重を計算し、既存ケースの内容と一致するなら
+    /// 各ケースについて現在の自動計算値を求め、既存ケースの内容と一致するなら
     /// 何もしない（undo 履歴・stale フラグを汚さない）。差分があれば
     /// `SyncSlabLoadsToCase`（全置換、undo 対応）を発行する。
-    /// スラブが無く既存ケースも無い場合は空ケースを作らない。
+    /// 対応するケースが無く内容も空の場合は空ケースを作らない。
+    ///
+    /// DL に自重を含めるため、階の自動生成（地震用重量）では密度からの自重直接
+    /// 算入を無効にして二重計上を防ぐ（`density_self_weight_for_stories`）。
     ///
     /// 解析実行系（`run_linear_static`/`run_combination`）・`generate_stories_action`
     /// の入口で毎回呼ぶことを想定した冪等な同期アクション。
-    pub fn sync_slab_loads_action(&mut self) {
+    pub fn sync_gravity_load_cases_action(&mut self) {
         use squid_n_core::model::{LoadCaseKind, LoadPurpose};
         self.refresh_beam_loads();
 
-        // DL（固定荷重）: `self.beam_loads` は refresh_beam_loads で dead_intensity 分配済み。
+        // DL（固定荷重）: スラブ分配（`self.beam_loads` は refresh_beam_loads で
+        // dead_intensity 分配済み）＋躯体自重。自重には二次部材（小梁・間柱）の
+        // 分（支持点への節点荷重）が含まれるため、要素が接続しない節点への荷重を
+        // 大梁の中間集中荷重（CMQ）へ変換してから同期する。
         let dl_beam_loads = self.beam_loads.clone();
-        let (dl_nodal, dl_member) = self.slab_load_case_content(&dl_beam_loads);
-        self.sync_one_slab_case(
-            SLAB_AUTO_LOAD_CASE_NAME,
-            LoadCaseKind::Dead,
+        let (mut dl_nodal, mut dl_member) = self.slab_load_case_content(&dl_beam_loads);
+        let load_cfg = self.model.load_cfg.clone().unwrap_or_default();
+        let (sw_nodal, sw_member) =
+            squid_n_load::self_weight::self_weight_case_content(&self.model, &load_cfg);
+        dl_nodal.extend(sw_nodal);
+        dl_member.extend(sw_member);
+        let (dl_nodal, extra_member) = squid_n_load::secondary::resolve_nodal_to_primary(
+            &self.model,
             dl_nodal,
-            dl_member,
+            squid_n_load::secondary::SPAN_TOL_MM,
         );
+        dl_member.extend(extra_member);
+        self.sync_one_auto_case(DL_CASE_NAME, LoadCaseKind::Dead, dl_nodal, dl_member);
 
         // LL（積載荷重・骨組用）: スラブ用途から令別表第1 の骨組用積載を分配。
         let ll_beam_loads = self.slab_beam_loads(|slab| slab.live_intensity(LoadPurpose::Frame));
         let (ll_nodal, ll_member) = self.slab_load_case_content(&ll_beam_loads);
-        self.sync_one_slab_case(
-            SLAB_LIVE_AUTO_LOAD_CASE_NAME,
-            LoadCaseKind::Live,
-            ll_nodal,
-            ll_member,
-        );
+        self.sync_one_auto_case(LL_FRAME_CASE_NAME, LoadCaseKind::Live, ll_nodal, ll_member);
 
         // LL（積載荷重・地震用）: スラブ用途から令別表第1 の地震用積載を分配。
-        // gravity_cases_for_seismic_weight が LiveSeismic を優先採用するため、
-        // 地震用重量にはこの（骨組用より小さい）地震用値が算入される（令85条1項）。
         let ls_beam_loads = self.slab_beam_loads(|slab| slab.live_intensity(LoadPurpose::Seismic));
         let (ls_nodal, ls_member) = self.slab_load_case_content(&ls_beam_loads);
-        self.sync_one_slab_case(
-            SLAB_LIVE_SEISMIC_AUTO_LOAD_CASE_NAME,
+        self.sync_one_auto_case(
+            LL_SEISMIC_CASE_NAME,
             LoadCaseKind::LiveSeismic,
             ls_nodal,
             ls_member,
         );
     }
 
+    /// 地震荷重の標準ケース（EX・EY、kind=Seismic）へ Ai 分布の水平力を同期する。
+    ///
+    /// 階（`model.stories`）が定義されている場合に、地震静的解析と同じ載荷
+    /// （`Analysis::build_seismic_load_case`。方向・Ai算定法・Z・地盤種別・C0 は
+    /// `analysis_cfg`）を EX/EY ケースへ書き込む。これにより荷重組合せ
+    /// （G+P±K など）が EX/EY を参照して解析できる。
+    ///
+    /// 階が未定義・解析準備に失敗・地震荷重が構築できない場合は何もしない
+    /// （既存の EX/EY ケースは変更しない。組合せ実行時に空の地震ケースを
+    /// 参照していればエラーで案内する）。冪等な同期アクション
+    /// （`sync_gravity_load_cases_action` と同じ規約）。
+    pub fn sync_seismic_load_cases_action(&mut self) {
+        use squid_n_core::model::LoadCaseKind;
+        if self.model.stories.is_empty() {
+            return;
+        }
+        let built: Vec<(&'static str, squid_n_core::model::LoadCase)> = {
+            let Ok(analysis) = Analysis::prepare(&self.model) else {
+                return;
+            };
+            [(SeismicDir::X, EX_CASE_NAME), (SeismicDir::Y, EY_CASE_NAME)]
+                .into_iter()
+                .filter_map(|(dir, name)| {
+                    let cfg = squid_n_solver::analysis::SeismicCfg {
+                        dir,
+                        mode: self.analysis_cfg.ai_mode,
+                        z: self.analysis_cfg.z,
+                        soil: self.analysis_cfg.soil,
+                        c0: self.analysis_cfg.c0,
+                    };
+                    analysis
+                        .build_seismic_load_case(cfg)
+                        .ok()
+                        .map(|lc| (name, lc))
+                })
+                .collect()
+        };
+        for (name, lc) in built {
+            self.sync_one_auto_case(name, LoadCaseKind::Seismic, lc.nodal, lc.member);
+        }
+    }
+
     /// 名前付き荷重ケースを指定の `kind`・内容へ冪等に同期する
-    /// （`sync_slab_loads_action` の DL/LL 各ケース同期の共通処理）。
-    /// 既存ケースの内容と一致すれば何もしない。
-    fn sync_one_slab_case(
+    /// （`sync_gravity_load_cases_action`／`sync_seismic_load_cases_action` の
+    /// 各ケース同期の共通処理）。既存ケースの内容と一致すれば何もしない。
+    fn sync_one_auto_case(
         &mut self,
         name: &str,
         kind: squid_n_core::model::LoadCaseKind,
@@ -2086,51 +2313,25 @@ impl App {
         self.staleness.mark_edited();
     }
 
-    /// 自重を専用の荷重ケース「自重(自動)」（kind=Dead）へ同期する
-    /// （照合レビュー: 大梁の CMoQ ①〜④のうち③梁自重（等分布部材荷重）と
-    /// ②壁荷重（三方スリット壁の上部大梁伝達を含む節点荷重）を長期応力解析へ
-    /// 接続する最重要修正。従来は自重が地震用重量にしか算入されず、長期応力・
-    /// 長期軸力が自重分だけ過小だった）。
-    ///
-    /// 算定は `squid_n_load::self_weight::self_weight_case_content`
-    /// （`story_gen` の地震用重量集計と同じ規則を共有）。内容が既存の
-    /// 「自重(自動)」ケースと一致するなら何もしない冪等な同期アクション
-    /// （`sync_slab_loads_action` と同じ規約）。
-    ///
-    /// このケースは地震用重量の重力ケース選択（`gravity_cases_for_seismic_weight`）
-    /// から名前で除外される（`story_gen` が自重を密度から直接集計するため）。
-    pub fn sync_self_weight_action(&mut self) {
-        let load_cfg = self.model.load_cfg.clone().unwrap_or_default();
-        let (nodal, member) =
-            squid_n_load::self_weight::self_weight_case_content(&self.model, &load_cfg);
-
-        let existing = self
-            .model
-            .load_cases
-            .iter()
-            .find(|lc| lc.name == SELF_WEIGHT_AUTO_LOAD_CASE_NAME);
-        let needs_create = existing.is_none() && !(nodal.is_empty() && member.is_empty());
-        let needs_update = existing
-            .map(|lc| {
-                lc.kind != squid_n_core::model::LoadCaseKind::Dead
-                    || lc.nodal != nodal
-                    || lc.member != member
-            })
-            .unwrap_or(false);
-        if !needs_create && !needs_update {
-            return;
-        }
-
-        self.undo.run(
-            &mut self.model,
-            Box::new(squid_n_edit::SyncSlabLoadsToCase {
-                name: SELF_WEIGHT_AUTO_LOAD_CASE_NAME.to_string(),
-                kind: squid_n_core::model::LoadCaseKind::Dead,
-                nodal,
-                member,
-            }),
-        );
-        self.staleness.mark_edited();
+    /// 組合せが参照する空の地震荷重ケース（kind=Seismic・内容なし）の名前を返す。
+    /// 空の地震ケースを含む組合せをそのまま解くと地震項が黙って 0 になるため、
+    /// 実行前のガードに使う（`run_combination`/`run_all_combinations`）。
+    fn empty_seismic_case_in_combo(
+        &self,
+        combo: &squid_n_core::model::LoadCombination,
+    ) -> Option<String> {
+        combo.terms.iter().find_map(|(id, _)| {
+            self.model
+                .load_cases
+                .iter()
+                .find(|lc| lc.id == *id)
+                .filter(|lc| {
+                    lc.kind == squid_n_core::model::LoadCaseKind::Seismic
+                        && lc.nodal.is_empty()
+                        && lc.member.is_empty()
+                })
+                .map(|lc| lc.name.clone())
+        })
     }
 }
 

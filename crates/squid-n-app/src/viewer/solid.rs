@@ -293,39 +293,26 @@ pub(super) fn draw_section_solids(
     let mut prims: Vec<(f32, SolidPrim)> = Vec::new();
     let mut skipped = 0usize;
 
-    for elem in &model.elements {
-        let is_line_member = matches!(
-            elem.kind,
-            ElementKind::Beam
-                | ElementKind::Fiber
-                | ElementKind::MultiSpring
-                | ElementKind::Brace { .. }
-        );
-        if !is_line_member || elem.nodes.len() < 2 {
-            continue;
-        }
-        let n0 = elem.nodes[0].index();
-        let n1 = elem.nodes[1].index();
-        if n0 >= coords.len() || n1 >= coords.len() {
-            continue;
-        }
-        let sec = elem
-            .section
-            .and_then(|sid| model.sections.iter().find(|s| s.id == sid));
-        let Some(outline) = sec.and_then(section_outline) else {
-            skipped += 1;
-            continue;
+    // 1 本の線材を断面押し出しソリッドとして prims へ積む共通処理
+    // （解析部材・二次部材（小梁・間柱）で共用）。`base` は塗りの基本色
+    // （二次部材は解析対象外を示す暖色）。断面輪郭が得られなければ false。
+    let mut extrude = |p_i: [f64; 3],
+                       p_j: [f64; 3],
+                       ref_vector: [f64; 3],
+                       sec: &Section,
+                       base: egui::Color32|
+     -> bool {
+        let Some(outline) = section_outline(sec) else {
+            return false;
         };
-        let p_i = coords[n0];
-        let p_j = coords[n1];
         let dx = p_j[0] - p_i[0];
         let dy = p_j[1] - p_i[1];
         let dz = p_j[2] - p_i[2];
         if dx * dx + dy * dy + dz * dz < 1e-6 {
-            continue;
+            return true;
         }
         // 解析と同じ局所座標系で断面を配向（ey=せい方向, ez=幅方向）
-        let frame = LocalFrame::from_nodes(p_i, p_j, elem.local_axis.ref_vector);
+        let frame = LocalFrame::from_nodes(p_i, p_j, ref_vector);
         let ey = frame.rot[1];
         let ez = frame.rot[2];
         let ring = |p: [f64; 3]| -> Vec<[f32; 3]> {
@@ -343,7 +330,6 @@ pub(super) fn draw_section_solids(
         };
         let ring_i = ring(p_i);
         let ring_j = ring(p_j);
-        let base = base_color(sec.and_then(|s| s.shape.as_ref()));
 
         // 側面フェイス（輪郭の各辺 × 材軸方向の四角形）
         let n = outline.len();
@@ -380,6 +366,71 @@ pub(super) fn draw_section_solids(
                     color: shaded(base, 0.5),
                 },
             ));
+        }
+        true
+    };
+
+    for elem in &model.elements {
+        let is_line_member = matches!(
+            elem.kind,
+            ElementKind::Beam
+                | ElementKind::Fiber
+                | ElementKind::MultiSpring
+                | ElementKind::Brace { .. }
+        );
+        if !is_line_member || elem.nodes.len() < 2 {
+            continue;
+        }
+        let n0 = elem.nodes[0].index();
+        let n1 = elem.nodes[1].index();
+        if n0 >= coords.len() || n1 >= coords.len() {
+            continue;
+        }
+        let Some(sec) = elem
+            .section
+            .and_then(|sid| model.sections.iter().find(|s| s.id == sid))
+        else {
+            skipped += 1;
+            continue;
+        };
+        let base = base_color(sec.shape.as_ref());
+        if !extrude(
+            coords[n0],
+            coords[n1],
+            elem.local_axis.ref_vector,
+            sec,
+            base,
+        ) {
+            skipped += 1;
+        }
+    }
+
+    // 二次部材（小梁・間柱）: 解析対象外だが実在部材のため、断面表示では
+    // 解析部材と同じ断面押し出しで大きさが分かるように描く。塗りは解析対象外を
+    // 示す暖色（スラブと同族の BEST_YELLOW。解析部材の青/グレーと弁別）。
+    // 断面の向きは既定の局所座標系（水平材は鉛直上基準、鉛直材は X 基準）とする。
+    for sm in &model.secondary_members {
+        let n0 = sm.nodes[0].index();
+        let n1 = sm.nodes[1].index();
+        if n0 >= coords.len() || n1 >= coords.len() {
+            continue;
+        }
+        let Some(sec) = sm
+            .section
+            .and_then(|sid| model.sections.iter().find(|s| s.id == sid))
+        else {
+            skipped += 1;
+            continue;
+        };
+        let (p_i, p_j) = (coords[n0], coords[n1]);
+        let dxy = ((p_j[0] - p_i[0]).powi(2) + (p_j[1] - p_i[1]).powi(2)).sqrt();
+        let ref_vector = if dxy < 1.0 {
+            [1.0, 0.0, 0.0] // 鉛直材（間柱）
+        } else {
+            [0.0, 0.0, 1.0] // 水平材（小梁）
+        };
+        if !extrude(p_i, p_j, ref_vector, sec, theme::BEST_YELLOW) {
+            skipped += 1;
         }
     }
 

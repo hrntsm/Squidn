@@ -1045,6 +1045,29 @@ pub fn viewer_panel(ui: &mut egui::Ui, app: &mut App) {
         }
     }
 
+    // 二次部材（小梁・間柱）: 解析対象外だが実在部材なので実線で描く
+    // （解析対象外を示す暖色アンバー。スラブの暖色と同族で、主架構の
+    // 青/グレーと弁別。断面表示中はソリッドが上に描かれているため
+    // 材軸線として薄く重ねる）。
+    let secondary_stroke = if app.show_sections {
+        egui::Stroke::new(1.0_f32, theme::translucent(theme::SECONDARY_AMBER, 110))
+    } else {
+        egui::Stroke::new(1.5_f32, theme::SECONDARY_AMBER)
+    };
+    for sm in &app.model.secondary_members {
+        let n0 = sm.nodes[0].index();
+        let n1 = sm.nodes[1].index();
+        if n0 < pts.len() && n1 < pts.len() {
+            painter.line_segment(
+                [
+                    egui::pos2(pts[n0][0], pts[n0][1]),
+                    egui::pos2(pts[n1][0], pts[n1][1]),
+                ],
+                secondary_stroke,
+            );
+        }
+    }
+
     // 断面を描けなかった線材（断面未割当・形状情報なし）があれば右上に注記
     if app.show_sections && solids_skipped > 0 {
         painter.text(
@@ -1220,13 +1243,19 @@ fn draw_force_diagram(
 /// 部材ローカルに沿って CMQ 図（両端の固定端モーメント C とせん断 Q）を描く。
 fn draw_cmq_diagram(painter: &egui::Painter, app: &App, pts: &[[f32; 2]]) {
     if app.beam_loads.is_empty() {
+        // スラブ自体が無いのか、スラブはあるが床荷重（強度）が 0 なのかを区別して案内する。
+        let msg = if app.model.slabs.is_empty() {
+            "スラブが未定義です。モデルタブの「スラブ」でスラブと床荷重を定義すると CMQ 図を表示できます"
+        } else {
+            "スラブの床荷重が 0 です。荷重タブ（スラブ）で固定荷重・用途（積載）を設定すると CMQ 図を表示できます"
+        };
         painter.text(
             egui::pos2(
                 painter.clip_rect().min.x + 10.0,
                 painter.clip_rect().min.y + 30.0,
             ),
             egui::Align2::LEFT_TOP,
-            "スラブが未定義です。モデルタブの「スラブ」でスラブと床荷重を定義すると CMQ 図を表示できます",
+            msg,
             egui::FontId::proportional(13.0),
             theme::GRAY_600,
         );
@@ -1250,13 +1279,18 @@ fn draw_cmq_diagram(painter: &egui::Painter, app: &App, pts: &[[f32; 2]]) {
     let q_scale = 60.0 / max_q.max(1e-12) as f32;
 
     for bl in &app.beam_loads {
-        let elem = app.model.elements.iter().find(|e| e.id == bl.elem);
-        let Some(elem) = elem else { continue };
-        if elem.nodes.len() < 2 {
-            continue;
-        }
-        let n0 = elem.nodes[0].index();
-        let n1 = elem.nodes[1].index();
+        // 描画スパンの両端節点: 実部材に解決済みなら部材の両端、未解決の節点対
+        // （二次部材（小梁）上の辺・大梁の中間区間）は節点対そのものに沿って描く。
+        let endpoints = match app.model.elements.iter().find(|e| e.id == bl.elem) {
+            Some(elem) if elem.nodes.len() >= 2 => {
+                Some((elem.nodes[0].index(), elem.nodes[1].index()))
+            }
+            _ => match bl.target {
+                squid_n_load::floor::LoadTarget::Span([a, b]) => Some((a.index(), b.index())),
+                _ => None,
+            },
+        };
+        let Some((n0, n1)) = endpoints else { continue };
         if n0 >= pts.len() || n1 >= pts.len() {
             continue;
         }

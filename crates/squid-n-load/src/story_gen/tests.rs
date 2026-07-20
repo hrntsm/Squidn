@@ -2,8 +2,9 @@ use super::*;
 use squid_n_core::dof::Dof6Mask;
 use squid_n_core::ids::{ElemId, MaterialId, SectionId};
 use squid_n_core::model::{
-    DamperSpec, ElementData, EndCondition, ForceRegime, LoadCase, LoadCfg, LocalAxis, Material,
-    MemberLoad, MiscWall, MiscWallTransfer, NodalLoad, Node, RigidZone, Section, WallAttr,
+    DamperSpec, ElementData, EndCondition, ForceRegime, LoadCase, LoadCaseKind, LoadCfg, LocalAxis,
+    Material, MemberLoad, MiscWall, MiscWallTransfer, NodalLoad, Node, RigidZone, Section,
+    WallAttr,
 };
 
 /// 2 層 × 1 スパンの平面ラーメン（各レベル 2 節点）。
@@ -817,6 +818,53 @@ fn test_generate_stories_multi_sums_multiple_gravity_cases_and_dedupes() {
     let gen_dup =
         generate_stories_multi(&model, &[LoadCaseId(0), LoadCaseId(0), LoadCaseId(1)]).unwrap();
     assert_eq!(gen_dup.stories[0].seismic_weight, Some(410000.0));
+}
+
+/// `generate_stories_with_opts` の自重算入方法:
+/// - `include_density_self_weight = false` では密度からの自重直接算入を行わない。
+/// - 自重同期ケース（`self_weight_case_content`）を重力ケースとして渡した場合の
+///   階重量が、密度直接算入（従来）の階重量と一致する
+///   （自重の単一ソースオブトゥルース＝「DL」経由でも二重計上・欠落がない）。
+#[test]
+fn test_generate_stories_with_opts_self_weight_via_case_matches_density() {
+    let mut model = two_story_model();
+
+    // 従来: 密度から直接算入（重力ケースなし）。
+    let by_density = generate_stories(&model, None).unwrap();
+
+    // 自重をケース内容として与え、密度算入は無効化。
+    // （two_story_model 組み込みの荷重ケースは重量比較の邪魔になるので除去）
+    model.load_cases.clear();
+    let (nodal, member) = crate::self_weight::self_weight_case_content(&model, &LoadCfg::default());
+    model.load_cases.push(LoadCase {
+        kind: LoadCaseKind::Dead,
+        id: LoadCaseId(0),
+        name: "DL".into(),
+        nodal,
+        member,
+    });
+    let by_case = generate_stories_with_opts(&model, &[LoadCaseId(0)], false).unwrap();
+
+    assert_eq!(by_density.stories.len(), by_case.stories.len());
+    for (a, b) in by_density.stories.iter().zip(by_case.stories.iter()) {
+        let (wa, wb) = (a.seismic_weight.unwrap(), b.seismic_weight.unwrap());
+        assert!(
+            (wa - wb).abs() < 1e-6 * wa.max(1.0),
+            "story {} weight density={} case={}",
+            a.name,
+            wa,
+            wb
+        );
+    }
+
+    // include_density_self_weight = true のままケースも渡すと二重計上になる
+    // （ガード側の except 選択が必要な旧構成の確認）。
+    let doubled = generate_stories_with_opts(&model, &[LoadCaseId(0)], true).unwrap();
+    let w1 = by_density.stories[0].seismic_weight.unwrap();
+    assert!(
+        (doubled.stories[0].seismic_weight.unwrap() - 2.0 * w1).abs() < 1e-6 * w1,
+        "自重をケースと密度の両方から算入すると 2 倍になるはず"
+    );
 }
 
 // ------------------------------------------------------------------

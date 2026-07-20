@@ -67,7 +67,7 @@ impl EditCommand for SetLoadCaseKind {
 /// `kind` は同期先ケースの種別を指定する（床固定荷重・自重は `Dead`、
 /// 床積載荷重は `Live` など。令85条1項の DL/LL 分離に用いる）。
 ///
-/// 呼び出し側（`squid-n-app::App::sync_slab_loads_action`）は、計算結果が
+/// 呼び出し側（`squid-n-app::App::sync_gravity_load_cases_action`）は、計算結果が
 /// 既存ケースの内容と変わらない場合はこのコマンドを発行しない（undo 履歴を
 /// 汚さないための冪等性は呼び出し側の責務）。
 pub struct SyncSlabLoadsToCase {
@@ -101,7 +101,7 @@ impl EditCommand for SyncSlabLoadsToCase {
     }
 
     fn label(&self) -> &str {
-        "床荷重の同期"
+        "荷重ケースの同期"
     }
 }
 

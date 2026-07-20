@@ -452,3 +452,112 @@ fn test_set_member_hysteresis_roundtrip() {
     assert_eq!(model.member_hysteresis(e), None);
     assert!(model.member_hysteresis_attrs.is_empty());
 }
+
+/// 標準荷重ケース一式（DL・LL(架構用)・LL(地震用)・EX・EY）の構成と、
+/// `Model::with_default_load_cases` が validate を通ることを確認する。
+#[test]
+fn test_default_load_cases_and_model() {
+    let cases = default_load_cases();
+    let names: Vec<&str> = cases.iter().map(|c| c.name.as_str()).collect();
+    assert_eq!(
+        names,
+        vec![
+            DL_CASE_NAME,
+            LL_FRAME_CASE_NAME,
+            LL_SEISMIC_CASE_NAME,
+            EX_CASE_NAME,
+            EY_CASE_NAME
+        ]
+    );
+    let kinds: Vec<LoadCaseKind> = cases.iter().map(|c| c.kind).collect();
+    assert_eq!(
+        kinds,
+        vec![
+            LoadCaseKind::Dead,
+            LoadCaseKind::Live,
+            LoadCaseKind::LiveSeismic,
+            LoadCaseKind::Seismic,
+            LoadCaseKind::Seismic
+        ]
+    );
+    // id == 添字の規約・内容は空。
+    for (i, c) in cases.iter().enumerate() {
+        assert_eq!(c.id.index(), i);
+        assert!(c.nodal.is_empty() && c.member.is_empty());
+    }
+    let model = Model::with_default_load_cases();
+    assert!(model.validate().is_ok());
+    assert_eq!(model.load_cases.len(), 5);
+}
+
+/// 旧スキーマの自動生成ケース名の移行: 改名（床荷重(自動)→DL 等）と、
+/// 「自重(自動)」の DL への統合（組合せ参照の付け替え・重複項の除去・
+/// id == 添字規約の維持）を確認する。
+#[test]
+fn test_migrate_legacy_auto_load_cases() {
+    let mk = |i: u32, name: &str, kind: LoadCaseKind| LoadCase {
+        id: LoadCaseId(i),
+        name: name.into(),
+        nodal: Vec::new(),
+        member: Vec::new(),
+        kind,
+    };
+    // 旧構成: 手動ケース + 床荷重(自動) + 自重(自動) + 床積載(自動)。
+    let mut model = Model {
+        load_cases: vec![
+            mk(0, "手動", LoadCaseKind::Other),
+            mk(1, "床荷重(自動)", LoadCaseKind::Dead),
+            mk(2, "自重(自動)", LoadCaseKind::Dead),
+            mk(3, "床積載(自動)", LoadCaseKind::Live),
+        ],
+        combinations: vec![
+            // 自重と床荷重の両方を参照する組合せ → 自重項は除去される。
+            LoadCombination {
+                name: "G+P".into(),
+                terms: vec![
+                    (LoadCaseId(1), 1.0),
+                    (LoadCaseId(2), 1.0),
+                    (LoadCaseId(3), 1.0),
+                ],
+            },
+            // 自重のみ参照する組合せ → DL へ付け替え。
+            LoadCombination {
+                name: "自重のみ".into(),
+                terms: vec![(LoadCaseId(2), 1.0)],
+            },
+        ],
+        ..Default::default()
+    };
+    model.migrate_legacy_auto_load_cases();
+    assert!(model.validate().is_ok(), "{:?}", model.validate());
+
+    let names: Vec<&str> = model.load_cases.iter().map(|c| c.name.as_str()).collect();
+    assert_eq!(names, vec!["手動", DL_CASE_NAME, LL_FRAME_CASE_NAME]);
+    let dl_id = model.load_cases[1].id;
+    // G+P: 自重項が除去され、床積載(→LL(架構用)、id 3→2)の参照が詰め直される。
+    assert_eq!(
+        model.combinations[0].terms,
+        vec![(dl_id, 1.0), (LoadCaseId(2), 1.0)]
+    );
+    // 自重のみ: DL へ付け替え。
+    assert_eq!(model.combinations[1].terms, vec![(dl_id, 1.0)]);
+}
+
+/// 「自重(自動)」だけがある旧モデルは DL へ改名される（削除しない）。
+#[test]
+fn test_migrate_legacy_self_weight_only_renames_to_dl() {
+    let mut model = Model {
+        load_cases: vec![LoadCase {
+            id: LoadCaseId(0),
+            name: "自重(自動)".into(),
+            nodal: Vec::new(),
+            member: Vec::new(),
+            kind: LoadCaseKind::Dead,
+        }],
+        ..Default::default()
+    };
+    model.migrate_legacy_auto_load_cases();
+    assert_eq!(model.load_cases.len(), 1);
+    assert_eq!(model.load_cases[0].name, DL_CASE_NAME);
+    assert_eq!(model.load_cases[0].kind, LoadCaseKind::Dead);
+}

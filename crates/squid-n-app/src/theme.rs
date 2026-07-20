@@ -53,6 +53,9 @@ pub const BEST_YELLOW: Color32 = Color32::from_rgb(0xFB, 0xBC, 0x04);
 pub const GOOD_GREEN: Color32 = Color32::from_rgb(0x34, 0xA8, 0x53);
 /// ハイライト試行点（選択中の試行点・等高線）
 pub const HILITE_PURPLE: Color32 = Color32::from_rgb(0x7C, 0x4D, 0xFF);
+/// 二次部材（小梁・間柱）= 解析対象外の実在部材の線・輪郭
+/// （スラブの BEST_YELLOW と同族の暖色。線の視認性のため濃いめのアンバー）
+pub const SECONDARY_AMBER: Color32 = Color32::from_rgb(0xD9, 0x77, 0x06);
 
 // ===== §3-2 3D ビュー =====
 /// 3D 背景（2D の白とは異なり淡いグレー。立体感のため意図的に白を避ける）

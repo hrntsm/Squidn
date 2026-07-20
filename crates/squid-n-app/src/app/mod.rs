@@ -659,23 +659,26 @@ pub fn install_japanese_fonts(ctx: &egui::Context) {
     eprintln!("[info] 日本語フォントを読み込みました: {path}");
 }
 
-/// `sync_slab_loads_action` が固定荷重（DL）の同期先とする専用荷重ケース名
-/// （レビュー §1.1）。スラブの `loads`（仕上げ等の固定荷重）を分配する。
-pub const SLAB_AUTO_LOAD_CASE_NAME: &str = "床荷重(自動)";
+/// 標準荷重ケース名（DL・LL(架構用)・LL(地震用)・EX・EY）。
+/// `squid_n_core::model` の定数を単一ソースオブトゥルースとして再公開する。
+///
+/// - `DL_CASE_NAME`: `sync_gravity_load_cases_action` がスラブの固定荷重
+///   （仕上げ等）の分配と躯体自重（柱梁・壁・ダンパー・フレーム外雑壁）を
+///   合算して同期する（レビュー §1.1・照合レビュー③梁自重/②壁荷重）。
+/// - `LL_FRAME_CASE_NAME`: スラブ用途（`SlabUsage`）から令別表第1 の
+///   骨組用積載を分配する（長期骨組解析用。令85条1項）。
+/// - `LL_SEISMIC_CASE_NAME`（kind=LiveSeismic）: スラブ用途から令別表第1 の
+///   **地震用**積載を分配する。地震用重量の集計
+///   （`gravity_cases_for_seismic_weight` が LiveSeismic を優先採用）に
+///   用いる（令85条1項・令88条）。
+/// - `EX_CASE_NAME`/`EY_CASE_NAME`（kind=Seismic）:
+///   `sync_seismic_load_cases_action` が階定義から Ai 分布の水平力を同期する。
+pub use squid_n_core::model::{
+    DL_CASE_NAME, EX_CASE_NAME, EY_CASE_NAME, LL_FRAME_CASE_NAME, LL_SEISMIC_CASE_NAME,
+};
 
-/// `sync_slab_loads_action` が積載荷重（LL・骨組用）の同期先とする専用荷重
-/// ケース名。スラブ用途（`SlabUsage`）から令別表第1 の骨組用積載を分配する
-/// （長期骨組解析用。令85条1項）。
-pub const SLAB_LIVE_AUTO_LOAD_CASE_NAME: &str = "床積載(自動)";
-
-/// `sync_slab_loads_action` が地震用積載荷重（LL・地震用）の同期先とする専用
-/// 荷重ケース名（kind=LiveSeismic）。スラブ用途から令別表第1 の**地震用**積載を
-/// 分配する。地震用重量の集計（`gravity_cases_for_seismic_weight` が
-/// LiveSeismic を優先採用）に用いる（令85条1項・令88条）。
-pub const SLAB_LIVE_SEISMIC_AUTO_LOAD_CASE_NAME: &str = "床地震用積載(自動)";
-
-/// `sync_self_weight_action` が同期先とする専用荷重ケース名。
-/// `squid_n_load::self_weight` の定数を単一ソースオブトゥルースとして再公開する。
+/// 旧スキーマの自重自動生成ケース名（読込時に DL へ移行される。
+/// 未移行モデルに対する二重計上防止の除外判定にのみ使う）。
 pub const SELF_WEIGHT_AUTO_LOAD_CASE_NAME: &str =
     squid_n_load::self_weight::SELF_WEIGHT_AUTO_LOAD_CASE_NAME;
 
@@ -725,18 +728,19 @@ pub fn column_live_load_factors(model: &squid_n_core::model::Model) -> Vec<(Elem
 
 /// 地震用重量に算入する重力ケースを `LoadCaseKind` から選択する（レビュー §1.7）。
 ///
-/// - `kind == Dead` の全ケースを対象とする。ただし「自重(自動)」
-///   （[`SELF_WEIGHT_AUTO_LOAD_CASE_NAME`]）は除外する。階の自動生成
-///   （`story_gen`）が自重を密度から直接集計するため、自動生成された
-///   自重ケースを含めると二重計上になる。
+/// - `kind == Dead` の全ケースを対象とする（標準構成では「DL」に躯体自重＋
+///   スラブ固定荷重が自動同期される）。ただし旧スキーマの「自重(自動)」
+///   （[`SELF_WEIGHT_AUTO_LOAD_CASE_NAME`]。未移行の場合のみ存在）は除外する
+///   （その場合は密度からの自重直接算入と二重計上になるため。
+///   [`density_self_weight_for_stories`] 参照）。
 /// - `kind == LiveSeismic`（地震用積載）のケースがあれば併せて対象とする。
 ///   無ければ `kind == Live`（長期用積載）で代用する
 ///   （地震用の積載荷重には地震用の値を用いる（令85条）。地震用の値が
 ///   個別に定義されていなければ長期用の値をそのまま使う）。ただし
-///   スラブ自動生成の骨組用積載ケース（[`SLAB_LIVE_AUTO_LOAD_CASE_NAME`]）は
+///   スラブ自動生成の骨組用積載ケース（[`LL_FRAME_CASE_NAME`]）は
 ///   **骨組用**の値を持つため、この代用対象から除外する（地震用値が明示的に
 ///   0 の用途で骨組用値へフォールバックし地震用重量が過大になるのを防ぐ。
-///   スラブの地震用積載は常に [`SLAB_LIVE_SEISMIC_AUTO_LOAD_CASE_NAME`] が担う）。
+///   スラブの地震用積載は常に [`LL_SEISMIC_CASE_NAME`] が担う）。
 /// - いずれのケースも `kind` が設定されていない（全ケースが既定値 `Other`）
 ///   場合は、旧スキーマ・後方互換のため先頭ケースのみを返す
 ///   （並び順に依存する旧規約。新規モデルは kind 設定を推奨）。
@@ -771,13 +775,25 @@ fn gravity_cases_for_seismic_weight(model: &squid_n_core::model::Model) -> Vec<L
             model
                 .load_cases
                 .iter()
-                .filter(|lc| {
-                    lc.kind == LoadCaseKind::Live && lc.name != SLAB_LIVE_AUTO_LOAD_CASE_NAME
-                })
+                .filter(|lc| lc.kind == LoadCaseKind::Live && lc.name != LL_FRAME_CASE_NAME)
                 .map(|lc| lc.id),
         );
     }
+
     result
+}
+
+/// 階の自動生成で自重を材料密度から直接算入すべきか（地震用重量の二重計上防止）。
+///
+/// 標準構成では躯体自重は「DL」（kind=Dead・[`DL_CASE_NAME`]）へ自動同期され、
+/// `gravity_cases_for_seismic_weight` が DL を重力ケースに含めるため、密度からの
+/// 直接算入は行わない（`false`）。DL ケースが無い旧モデル・手動構成では従来
+/// どおり密度から直接算入する（`true`）。
+fn density_self_weight_for_stories(model: &squid_n_core::model::Model) -> bool {
+    !model
+        .load_cases
+        .iter()
+        .any(|lc| lc.kind == squid_n_core::model::LoadCaseKind::Dead && lc.name == DL_CASE_NAME)
 }
 
 /// 波形 CSV/テキストの内容を解析する（ヘッドレステスト可能な純粋関数）。
@@ -1270,7 +1286,8 @@ impl eframe::App for App {
         ui.horizontal(|ui| {
             ui.menu_button("ファイル", |ui| {
                 if ui.button("📄 新規").clicked() {
-                    self.load_model(squid_n_core::model::Model::default());
+                    // 新規モデルは標準荷重ケース（DL・LL(架構用)・LL(地震用)・EX・EY）付き。
+                    self.load_model(squid_n_core::model::Model::with_default_load_cases());
                     self.project_path = None;
                     ui.close();
                 }

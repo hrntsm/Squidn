@@ -324,7 +324,7 @@ pub fn slabs_table(ui: &mut egui::Ui, app: &mut App) {
 
     ui.horizontal(|ui| {
         ui.label("用途（積載荷重）:")
-            .on_hover_text("令別表第1 の積載荷重（骨組用）を「床積載(自動)」ケースへ分配します");
+            .on_hover_text("令別表第1 の積載荷重（骨組用）を「LL(架構用)」ケースへ分配します");
         egui::ComboBox::from_id_salt("slab_draft_usage")
             .selected_text(usage_label(app.slab_draft.usage))
             .show_ui(ui, |ui| {

@@ -84,6 +84,25 @@ pub(super) fn precheck_model(model: &Model) -> Result<(), SolveError> {
             }
         }
     }
+    // 床（スラブ境界・小梁支持点）・二次部材（小梁・間柱）が参照する節点は、
+    // 要素が接続しなくても意図的な幾何節点（荷重伝達点）なので孤立扱いしない。
+    // これらは `DofMap::build` が解析自由度から自動的に除外するため、
+    // 零剛性の自由度にはならない。
+    for slab in &model.slabs {
+        for n in &slab.boundary {
+            referenced[n.index()] = true;
+        }
+        for j in &slab.joists {
+            for n in &j.support {
+                referenced[n.index()] = true;
+            }
+        }
+    }
+    for sm in &model.secondary_members {
+        for n in &sm.nodes {
+            referenced[n.index()] = true;
+        }
+    }
     let isolated: Vec<u32> = model
         .nodes
         .iter()

@@ -82,6 +82,10 @@ pub struct Model {
     /// （ハンチ端・継手位置、§6.2.3）と数量拾いに用いる。
     #[serde(default)]
     pub member_detail_attrs: Vec<MemberDetailAttr>,
+    /// 二次部材（小梁・間柱）。全体解析（剛性）には算入せず、床荷重・自重を
+    /// 主架構への荷重（CMQ）として伝達する（[`SecondaryMember`]）。
+    #[serde(default)]
+    pub secondary_members: Vec<SecondaryMember>,
     /// 一本部材の指定（断面検定の採用応力。一本部材指定時の採用応力の扱い）。
     /// 各エントリは**軸方向に連続する梁要素の ID を並び順**で持ち、
     /// 断面検定の採用応力（端部・中央モーメント、部材長、内法長、せん断スパン比
@@ -230,6 +234,34 @@ impl Model {
             |m| m.id.0,
         )?;
 
+        // 二次部材（小梁・間柱）の参照整合。
+        for (i, sm) in self.secondary_members.iter().enumerate() {
+            for &nid in &sm.nodes {
+                if nid.index() >= self.nodes.len() || self.nodes[nid.index()].id != nid {
+                    return Err(CoreError::DanglingRef(format!(
+                        "SecondaryMember {} -> Node {}",
+                        i, nid.0
+                    )));
+                }
+            }
+            if let Some(sid) = sm.section {
+                if sid.index() >= self.sections.len() || self.sections[sid.index()].id != sid {
+                    return Err(CoreError::DanglingRef(format!(
+                        "SecondaryMember {} -> Section {}",
+                        i, sid.0
+                    )));
+                }
+            }
+            if let Some(mid) = sm.material {
+                if mid.index() >= self.materials.len() || self.materials[mid.index()].id != mid {
+                    return Err(CoreError::DanglingRef(format!(
+                        "SecondaryMember {} -> Material {}",
+                        i, mid.0
+                    )));
+                }
+            }
+        }
+
         Ok(())
     }
 
@@ -250,6 +282,10 @@ impl Model {
             || self.slabs.iter().any(|sl| {
                 sl.boundary.contains(&id) || sl.joists.iter().any(|j| j.support.contains(&id))
             })
+            || self
+                .secondary_members
+                .iter()
+                .any(|sm| sm.nodes.contains(&id))
             || self.constraints.iter().any(|c| match c {
                 Constraint::RigidDiaphragm { master, slaves, .. } => {
                     *master == id || slaves.contains(&id)
@@ -425,5 +461,96 @@ impl Model {
                 .push(MemberHysteresisAttr { elem, rule });
         }
         old
+    }
+
+    /// 標準荷重ケース一式（DL・LL(架構用)・LL(地震用)・EX・EY）を持つ
+    /// 空モデルを作る（新規作成の既定。[`default_load_cases`] 参照）。
+    pub fn with_default_load_cases() -> Self {
+        Model {
+            load_cases: default_load_cases(),
+            ..Model::default()
+        }
+    }
+
+    /// 旧スキーマの自動生成荷重ケース名を標準ケース名へ移行する（読込時の後方互換）。
+    ///
+    /// - 「床荷重(自動)」→「DL」、「床積載(自動)」→「LL(架構用)」、
+    ///   「床地震用積載(自動)」→「LL(地震用)」に改名する
+    ///   （移行先の名前が既に使われている場合は改名しない）。
+    /// - 「自重(自動)」は DL へ統合する（自重は DL の同期内容に含まれるように
+    ///   なったため）。DL ケースが存在する場合は「自重(自動)」を削除し、
+    ///   荷重組合せの参照は DL へ付け替える（同一組合せが既に DL を参照して
+    ///   いる場合は項を除去して二重計上を防ぐ）。DL が無い場合は
+    ///   「自重(自動)」自体を「DL」へ改名する。
+    ///
+    /// ケースの内容は改名/削除のみで書き換えない（自動生成ケースの内容は
+    /// 解析実行前の同期アクションが毎回再計算して全置換する）。
+    /// 削除時は `LoadCaseId` の「id == 添字」規約を保つよう後続ケースの ID と
+    /// 組合せの参照を詰め直す。
+    pub fn migrate_legacy_auto_load_cases(&mut self) {
+        const LEGACY_SELF_WEIGHT: &str = "自重(自動)";
+        let renames = [
+            ("床荷重(自動)", DL_CASE_NAME),
+            ("床積載(自動)", LL_FRAME_CASE_NAME),
+            ("床地震用積載(自動)", LL_SEISMIC_CASE_NAME),
+        ];
+        for (old, new) in renames {
+            if self.load_cases.iter().any(|lc| lc.name == new) {
+                continue;
+            }
+            if let Some(lc) = self.load_cases.iter_mut().find(|lc| lc.name == old) {
+                lc.name = new.to_string();
+            }
+        }
+
+        let Some(sw_idx) = self
+            .load_cases
+            .iter()
+            .position(|lc| lc.name == LEGACY_SELF_WEIGHT)
+        else {
+            return;
+        };
+        let sw_id = self.load_cases[sw_idx].id;
+        match self
+            .load_cases
+            .iter()
+            .find(|lc| lc.name == DL_CASE_NAME)
+            .map(|lc| lc.id)
+        {
+            None => {
+                // DL が無ければ「自重(自動)」を DL として引き継ぐ。
+                self.load_cases[sw_idx].name = DL_CASE_NAME.to_string();
+                self.load_cases[sw_idx].kind = LoadCaseKind::Dead;
+            }
+            Some(dl_id) => {
+                // 組合せの参照を DL へ付け替え（既に DL を含む組合せでは項を除去）。
+                for combo in &mut self.combinations {
+                    let has_dl = combo.terms.iter().any(|(id, _)| *id == dl_id);
+                    if has_dl {
+                        combo.terms.retain(|(id, _)| *id != sw_id);
+                    } else {
+                        for (id, _) in &mut combo.terms {
+                            if *id == sw_id {
+                                *id = dl_id;
+                            }
+                        }
+                    }
+                }
+                // ケースを削除し、id == 添字の規約を保つよう後続 ID を詰める。
+                self.load_cases.remove(sw_idx);
+                for lc in &mut self.load_cases {
+                    if lc.id.0 > sw_id.0 {
+                        lc.id.0 -= 1;
+                    }
+                }
+                for combo in &mut self.combinations {
+                    for (id, _) in &mut combo.terms {
+                        if id.0 > sw_id.0 {
+                            id.0 -= 1;
+                        }
+                    }
+                }
+            }
+        }
     }
 }
