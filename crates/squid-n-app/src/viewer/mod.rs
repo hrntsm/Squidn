@@ -1564,13 +1564,15 @@ fn draw_cmq_diagram(
                 if peak_px < MIN_DIAGRAM_PX {
                     continue;
                 }
-                // C 図（モーメント）: 両端の合算 c_i, c_j を結ぶ折れ線ポリゴン（-ey 側=梁下側）。
+                // C 図（モーメント）: 両端の合算 c_i, c_j を結ぶ折れ線ポリゴン。M図の規約
+                // （引張側に描く。sagging 正=-ey側=下、hogging 負=+ey側=上）に合わせ、
+                // 固定端モーメント（hogging=引張は上端）は +ey 側=梁上側に描く。
                 // c_i/c_j は固定端モーメントの符号規約上、両端で逆符号（i端+, j端-）で
-                // 保持されているため、j 端は符号反転して i 端と同じ側（-ey 側）に描く。
+                // 保持されているため、j 端は符号反転して i 端と同じ側（+ey 側）に描く。
                 let c_poly = vec![
                     p0,
-                    project_offset(p_i, ey, -c_i * c_amp, center3, cam, scale, screen_center),
-                    project_offset(p_j, ey, c_j * c_amp, center3, cam, scale, screen_center),
+                    project_offset(p_i, ey, c_i * c_amp, center3, cam, scale, screen_center),
+                    project_offset(p_j, ey, -c_j * c_amp, center3, cam, scale, screen_center),
                     p1,
                 ];
                 // C 図（モーメント）= 通常データ（青）
