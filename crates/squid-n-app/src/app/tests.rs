@@ -472,16 +472,24 @@ fn test_seismic_flow_requires_then_uses_stories() {
     app.nav.focus_result = Some(StaticKey::Case(StaticCaseKey::Seismic(SeismicDir::X)));
     assert_eq!(app.current_static().unwrap().disp, seismic_disp);
 
-    // undo で自重(自動)の同期 → 階定義の順に戻る
-    // （run_linear_static が自重(自動)ケースの同期を undo 履歴に積むため 2 回）
-    app.undo.undo(&mut app.model);
+    // undo で EY・EX の同期 → 階定義 → DL(自重)の同期の順に戻る
+    // （generate_stories_action が DL 同期 → 階適用 → EX/EY 同期の順に
+    // undo 履歴を積む。以降の解析実行時の同期は冪等で履歴を積まない）
+    app.undo.undo(&mut app.model); // EY
+    app.undo.undo(&mut app.model); // EX
     assert!(app
         .model
         .load_cases
         .iter()
-        .all(|lc| lc.name != SELF_WEIGHT_AUTO_LOAD_CASE_NAME));
-    app.undo.undo(&mut app.model);
+        .all(|lc| lc.name != EX_CASE_NAME && lc.name != EY_CASE_NAME));
+    app.undo.undo(&mut app.model); // 階定義
     assert!(app.model.stories.is_empty());
+    app.undo.undo(&mut app.model); // DL(自重)
+    assert!(app
+        .model
+        .load_cases
+        .iter()
+        .all(|lc| lc.name != DL_CASE_NAME));
 }
 
 /// 剛床代表節点は慣性力重心に自動生成される。再度自動生成しても
@@ -981,7 +989,13 @@ fn test_export_and_import_stbridge_roundtrip() {
 
     let mut app2 = App::default();
     app2.import_stbridge_from(path.clone());
-    assert!(app2.last_error.is_none(), "{:?}", app2.last_error);
+    // ST-Bridge は支点を持たないため、支点の自動設定の通知だけが出る
+    // （それ以外の欠落警告は無い）。
+    let msg = app2.last_error.as_deref().unwrap_or("");
+    assert!(
+        msg.contains("ピン支点に設定"),
+        "支点自動設定の通知が出るはず: {msg}"
+    );
     assert!(app2.model.validate().is_ok());
     // ST-Bridge プロジェクト(.scz)とは別物なので project_path は更新されない。
     assert!(app2.project_path.is_none());
@@ -1042,10 +1056,16 @@ fn test_stbridge_standard_mode_roundtrip_through_app() {
 
     let mut app2 = App::default();
     app2.import_stbridge_from(path.clone());
+    // 支点の自動設定の通知以外の警告（欠落・断面未解決など）が無いこと
+    // ＝標準モードのファイルを読み戻せることを確認する。
+    let msg = app2.last_error.as_deref().unwrap_or("");
     assert!(
-        app2.last_error.is_none(),
-        "標準モードのファイルを読み戻せる: {:?}",
-        app2.last_error
+        msg.is_empty() || msg.contains("ピン支点に設定"),
+        "標準モードのファイルを読み戻せる: {msg}"
+    );
+    assert!(
+        !msg.contains("スキップ") && !msg.contains("破棄"),
+        "欠落警告は無いはず: {msg}"
     );
     assert!(app2.model.validate().is_ok());
     assert_eq!(app2.model.sections.len(), n_sections);
@@ -1984,12 +2004,26 @@ fn test_refresh_beam_loads_maps_edges_to_members() {
         );
     }
 
-    // 梁が1本欠けたモデルでは、対応する辺の荷重が捨てられ3件になる
+    // 梁が1本欠けたモデルでも荷重は捨てず、対応する辺は節点対（Span）として
+    // 保持される（slab_load_case_content が主架構へ変換する。二次部材対応）。
     let mut missing = app.model.clone();
     missing.elements.pop();
     app.model = missing;
     app.refresh_beam_loads();
-    assert_eq!(app.beam_loads.len(), 3);
+    assert_eq!(app.beam_loads.len(), 4);
+    let unresolved: Vec<_> = app
+        .beam_loads
+        .iter()
+        .filter(|bl| {
+            matches!(bl.target, squid_n_load::floor::LoadTarget::Span(_))
+                && bl.elem == ElemId(u32::MAX)
+        })
+        .collect();
+    assert_eq!(
+        unresolved.len(),
+        1,
+        "欠けた辺は未解決の節点対として残るはず"
+    );
 }
 
 /// 正方形スラブ（4000×4000）+ 外周4本の梁を持つモデル
@@ -2059,12 +2093,12 @@ fn make_square_slab_test_model() -> squid_n_core::model::Model {
     }
 }
 
-/// レビュー §1.1（最重要）: スラブ荷重が `sync_slab_loads_action` で
-/// 「床荷重(自動)」荷重ケースへ実際に書き込まれ、応力解析から参照可能に
+/// レビュー §1.1（最重要）: スラブ荷重が `sync_gravity_load_cases_action` で
+/// 「DL」荷重ケースへ実際に書き込まれ、応力解析から参照可能に
 /// なることを確認する。正方形スラブは全辺三角形分布（2区間）になるため
 /// `MemberLoadKind::Distributed` への変換規則を直接検算できる。
 #[test]
-fn test_sync_slab_loads_action_square_slab_triangle_distribution() {
+fn test_sync_gravity_load_cases_action_square_slab_triangle_distribution() {
     use squid_n_core::model::{LoadCaseKind, MemberLoadKind};
 
     let model = make_square_slab_test_model();
@@ -2076,14 +2110,14 @@ fn test_sync_slab_loads_action_square_slab_triangle_distribution() {
         ..App::default()
     };
 
-    app.sync_slab_loads_action();
+    app.sync_gravity_load_cases_action();
 
     let case = app
         .model
         .load_cases
         .iter()
-        .find(|lc| lc.name == SLAB_AUTO_LOAD_CASE_NAME)
-        .expect("床荷重(自動)ケースが作られるはず");
+        .find(|lc| lc.name == DL_CASE_NAME)
+        .expect("DLケースが作られるはず");
     assert_eq!(case.kind, LoadCaseKind::Dead);
     assert_eq!(case.member.len(), 8, "4辺 × 2区間（三角形分布）= 8件");
     assert!(case.nodal.is_empty(), "小梁が無いので節点荷重は空のはず");
@@ -2117,12 +2151,12 @@ fn test_sync_slab_loads_action_square_slab_triangle_distribution() {
     );
 
     // 再同期しても重複しない（全置換）
-    app.sync_slab_loads_action();
+    app.sync_gravity_load_cases_action();
     let cases: Vec<_> = app
         .model
         .load_cases
         .iter()
-        .filter(|lc| lc.name == SLAB_AUTO_LOAD_CASE_NAME)
+        .filter(|lc| lc.name == DL_CASE_NAME)
         .collect();
     assert_eq!(cases.len(), 1, "再同期でケースが重複してはいけない");
     assert_eq!(cases[0].member.len(), 8, "再同期で荷重が重複してはいけない");
@@ -2133,17 +2167,17 @@ fn test_sync_slab_loads_action_square_slab_triangle_distribution() {
         !app.model
             .load_cases
             .iter()
-            .any(|lc| lc.name == SLAB_AUTO_LOAD_CASE_NAME),
-        "undo で「床荷重(自動)」ケースが消えるはず"
+            .any(|lc| lc.name == DL_CASE_NAME),
+        "undo で「DL」ケースが消えるはず"
     );
 }
 
-/// 床 Phase A-2: 用途（`SlabUsage`）を設定したスラブは、`sync_slab_loads_action`
-/// で固定荷重（DL・「床荷重(自動)」kind=Dead）と積載荷重（LL・「床積載(自動)」
+/// 床 Phase A-2: 用途（`SlabUsage`）を設定したスラブは、`sync_gravity_load_cases_action`
+/// で固定荷重（DL・「DL」kind=Dead）と積載荷重（LL・「床積載(自動)」
 /// kind=Live）の 2 ケースに分離されることを確認する。LL は令別表第1 の
 /// **骨組用**積載（事務室=1800 N/m²）を用い、DL とは独立に総和保存する。
 #[test]
-fn test_sync_slab_loads_action_separates_dead_and_live() {
+fn test_sync_gravity_load_cases_action_separates_dead_and_live() {
     use squid_n_core::model::{LoadCaseKind, MemberLoadKind, SlabUsage};
 
     let mut model = make_square_slab_test_model();
@@ -2157,7 +2191,7 @@ fn test_sync_slab_loads_action_separates_dead_and_live() {
         ..App::default()
     };
 
-    app.sync_slab_loads_action();
+    app.sync_gravity_load_cases_action();
 
     fn sum_vertical(model: &squid_n_core::model::Model, name: &str) -> f64 {
         model
@@ -2181,27 +2215,27 @@ fn test_sync_slab_loads_action_separates_dead_and_live() {
         .model
         .load_cases
         .iter()
-        .find(|lc| lc.name == SLAB_AUTO_LOAD_CASE_NAME)
-        .expect("床荷重(自動)ケースが作られるはず");
+        .find(|lc| lc.name == DL_CASE_NAME)
+        .expect("DLケースが作られるはず");
     assert_eq!(dl.kind, LoadCaseKind::Dead);
     let area = 4000.0 * 4000.0;
-    assert!((sum_vertical(&app.model, SLAB_AUTO_LOAD_CASE_NAME) - 0.005 * area).abs() < 1e-6);
+    assert!((sum_vertical(&app.model, DL_CASE_NAME) - 0.005 * area).abs() < 1e-6);
 
     // LL ケース: 骨組用積載 1.8e-3 N/mm² を分配（DL とは別ケース・kind=Live）。
     let ll = app
         .model
         .load_cases
         .iter()
-        .find(|lc| lc.name == SLAB_LIVE_AUTO_LOAD_CASE_NAME)
-        .expect("床積載(自動)ケースが作られるはず");
+        .find(|lc| lc.name == LL_FRAME_CASE_NAME)
+        .expect("LL(架構用)ケースが作られるはず");
     assert_eq!(ll.kind, LoadCaseKind::Live);
-    assert!((sum_vertical(&app.model, SLAB_LIVE_AUTO_LOAD_CASE_NAME) - 1.8e-3 * area).abs() < 1e-6);
+    assert!((sum_vertical(&app.model, LL_FRAME_CASE_NAME) - 1.8e-3 * area).abs() < 1e-6);
 
     // 用途を外すと LL ケースは空同期され、寄与が無くなる（新規なら作られない）。
     app.model.slabs[0].usage = None;
-    app.sync_slab_loads_action();
+    app.sync_gravity_load_cases_action();
     assert!(
-        (sum_vertical(&app.model, SLAB_LIVE_AUTO_LOAD_CASE_NAME)).abs() < 1e-12,
+        (sum_vertical(&app.model, LL_FRAME_CASE_NAME)).abs() < 1e-12,
         "用途を外したら積載寄与は 0 になるはず"
     );
 }
@@ -2350,7 +2384,7 @@ fn test_slab_grillage_node_reactions_total_and_gate() {
 /// 骨組用 Live ではなく地震用 LiveSeismic を採用することを確認する
 /// （令85条1項の地震用値〔事務室=800 N/m²〕を地震用重量に用いる）。
 #[test]
-fn test_sync_slab_loads_action_seismic_live_case() {
+fn test_sync_gravity_load_cases_action_seismic_live_case() {
     use squid_n_core::model::{LoadCaseKind, MemberLoadKind, SlabUsage};
 
     let mut model = make_square_slab_test_model();
@@ -2362,7 +2396,7 @@ fn test_sync_slab_loads_action_seismic_live_case() {
         model,
         ..App::default()
     };
-    app.sync_slab_loads_action();
+    app.sync_gravity_load_cases_action();
 
     let sum_vertical = |name: &str| -> f64 {
         app.model
@@ -2387,10 +2421,10 @@ fn test_sync_slab_loads_action_seismic_live_case() {
         .model
         .load_cases
         .iter()
-        .find(|lc| lc.name == SLAB_LIVE_SEISMIC_AUTO_LOAD_CASE_NAME)
-        .expect("床地震用積載(自動)ケースが作られるはず");
+        .find(|lc| lc.name == LL_SEISMIC_CASE_NAME)
+        .expect("LL(地震用)ケースが作られるはず");
     assert_eq!(ls.kind, LoadCaseKind::LiveSeismic);
-    assert!((sum_vertical(SLAB_LIVE_SEISMIC_AUTO_LOAD_CASE_NAME) - 8e-4 * area).abs() < 1e-6);
+    assert!((sum_vertical(LL_SEISMIC_CASE_NAME) - 8e-4 * area).abs() < 1e-6);
 
     // 地震用重量の重力ケース: DL(床荷重) と LiveSeismic(床地震用積載) を含み、
     // 骨組用 Live(床積載) は含まない（LiveSeismic 優先）。
@@ -2398,14 +2432,14 @@ fn test_sync_slab_loads_action_seismic_live_case() {
         .model
         .load_cases
         .iter()
-        .find(|lc| lc.name == SLAB_AUTO_LOAD_CASE_NAME)
+        .find(|lc| lc.name == DL_CASE_NAME)
         .unwrap()
         .id;
     let live_id = app
         .model
         .load_cases
         .iter()
-        .find(|lc| lc.name == SLAB_LIVE_AUTO_LOAD_CASE_NAME)
+        .find(|lc| lc.name == LL_FRAME_CASE_NAME)
         .unwrap()
         .id;
     let ls_id = ls.id;
@@ -2443,23 +2477,23 @@ fn test_gravity_cases_excludes_auto_frame_live_when_no_seismic() {
         model,
         ..App::default()
     };
-    app.sync_slab_loads_action();
+    app.sync_gravity_load_cases_action();
 
     // 地震用値 0 なので LiveSeismic ケースは生成されない。
     assert!(
         !app.model
             .load_cases
             .iter()
-            .any(|lc| lc.name == SLAB_LIVE_SEISMIC_AUTO_LOAD_CASE_NAME),
-        "地震用値 0 なら床地震用積載(自動)は作られないはず"
+            .any(|lc| lc.name == LL_SEISMIC_CASE_NAME),
+        "地震用値 0 ならLL(地震用)は作られないはず"
     );
     // 骨組用 Live ケースは生成される。
     let live_id = app
         .model
         .load_cases
         .iter()
-        .find(|lc| lc.name == SLAB_LIVE_AUTO_LOAD_CASE_NAME)
-        .expect("床積載(自動)は作られるはず")
+        .find(|lc| lc.name == LL_FRAME_CASE_NAME)
+        .expect("LL(架構用)は作られるはず")
         .id;
     // 地震用重量の重力ケースに、骨組用 Live(床積載)を含めてはならない。
     let gravity = gravity_cases_for_seismic_weight(&app.model);
@@ -3321,4 +3355,707 @@ fn test_compute_cft_ultimate_checks() {
         .expect("CFT 柱があれば Ok のはず");
     assert_eq!(checks.len(), 1);
     assert!(checks[0].ncu > 0.0 && checks[0].ntu > 0.0);
+}
+
+// ------------------------------------------------------------------
+// 標準荷重ケース（DL・LL(架構用)・LL(地震用)・EX・EY）
+// ------------------------------------------------------------------
+
+/// 新規モデル（`Model::with_default_load_cases`）は標準5ケースを持ち、
+/// `load_model` を通しても保持されることを確認する。
+#[test]
+fn test_new_model_has_default_load_cases() {
+    let mut app = App::default();
+    app.load_model(squid_n_core::model::Model::with_default_load_cases());
+    let names: Vec<&str> = app
+        .model
+        .load_cases
+        .iter()
+        .map(|c| c.name.as_str())
+        .collect();
+    assert_eq!(
+        names,
+        vec![
+            DL_CASE_NAME,
+            LL_FRAME_CASE_NAME,
+            LL_SEISMIC_CASE_NAME,
+            EX_CASE_NAME,
+            EY_CASE_NAME
+        ]
+    );
+}
+
+/// DL の自動同期にスラブ固定荷重と躯体自重の両方が含まれることを確認する
+/// （DL＝自重＋スラブ重量の自動計算。「自重(自動)」ケースは作られない）。
+#[test]
+fn test_sync_gravity_dl_includes_self_weight_and_slab() {
+    use squid_n_core::ids::{MaterialId, SectionId};
+    use squid_n_core::model::{Material, MemberLoadKind, Section};
+
+    let mut model = make_square_slab_test_model();
+    // 全梁に断面・材料（密度あり）を与え、自重を発生させる。
+    model.sections.push(Section {
+        id: SectionId(0),
+        name: "RC400x600".into(),
+        area: 400.0 * 600.0,
+        iy: 1.0e8,
+        iz: 1.0e8,
+        j: 1.0e8,
+        depth: 600.0,
+        width: 400.0,
+        as_y: 0.0,
+        as_z: 0.0,
+        panel_thickness: None,
+        thickness: None,
+        shape: None,
+    });
+    model.materials.push(Material {
+        concrete_class: Default::default(),
+        id: MaterialId(0),
+        name: "Fc24".into(),
+        young: 22000.0,
+        poisson: 0.2,
+        density: 2.4e-9,
+        shear: None,
+        fc: Some(24.0),
+        fy: None,
+    });
+    for e in &mut model.elements {
+        e.section = Some(SectionId(0));
+        e.material = Some(MaterialId(0));
+    }
+    model
+        .validate()
+        .expect("テストモデルは validate を通るはず");
+    let mut app = App {
+        model,
+        ..App::default()
+    };
+    app.sync_gravity_load_cases_action();
+
+    let dl = app
+        .model
+        .load_cases
+        .iter()
+        .find(|lc| lc.name == DL_CASE_NAME)
+        .expect("DLケースが作られるはず");
+    let total: f64 = dl
+        .member
+        .iter()
+        .map(|m| match m.kind {
+            MemberLoadKind::Distributed { a, b, w1, w2 } => (w1 + w2) / 2.0 * (b - a),
+            MemberLoadKind::Point { p, .. } => p,
+        })
+        .sum::<f64>()
+        + dl.nodal.iter().map(|nl| -nl.values[2]).sum::<f64>();
+    let slab_dl = 0.005 * 4000.0 * 4000.0;
+    let (sw_nodal, sw_member) = squid_n_load::self_weight::self_weight_case_content(
+        &app.model,
+        &squid_n_core::model::LoadCfg::default(),
+    );
+    let self_weight: f64 = sw_member
+        .iter()
+        .map(|m| match m.kind {
+            MemberLoadKind::Distributed { a, b, w1, w2 } => (w1 + w2) / 2.0 * (b - a),
+            MemberLoadKind::Point { p, .. } => p,
+        })
+        .sum::<f64>()
+        + sw_nodal.iter().map(|nl| -nl.values[2]).sum::<f64>();
+    assert!(self_weight > 0.0, "自重が発生しているはず");
+    assert!(
+        (total - (slab_dl + self_weight)).abs() < 1e-6,
+        "DL 合計 {total} = スラブ {slab_dl} + 自重 {self_weight} のはず"
+    );
+    // 旧「自重(自動)」ケースは作られない。
+    assert!(app
+        .model
+        .load_cases
+        .iter()
+        .all(|lc| lc.name != SELF_WEIGHT_AUTO_LOAD_CASE_NAME));
+}
+
+/// 地震用重量が二重計上されないことを確認する: DL に自重が含まれる構成での
+/// 階の自動生成の階重量 = 自重総量 + 手動重力ケースの鉛直荷重総量。
+/// 再生成しても同じ値になる（冪等）。
+#[test]
+fn test_generate_stories_seismic_weight_no_double_count() {
+    use squid_n_core::model::MemberLoadKind;
+
+    let mut app = App::default();
+    app.load_model(crate::sample::portal_frame());
+    app.generate_stories_action();
+    assert!(app.last_error.is_none(), "{:?}", app.last_error);
+
+    // 自重の節点配分（等分布荷重の静定反力 = 両端 1/2 ずつ）のうち、
+    // 階レベル（z=3500 の節点 2,3）へ配分される分だけが階重量に算入される
+    // （柱の下半分は基部 z=0 へ配分され階に属さない）。
+    let (sw_nodal, sw_member) = squid_n_load::self_weight::self_weight_case_content(
+        &app.model,
+        &squid_n_core::model::LoadCfg::default(),
+    );
+    let mut node_share = vec![0.0_f64; app.model.nodes.len()];
+    for nl in &sw_nodal {
+        node_share[nl.node.index()] += -nl.values[2];
+    }
+    for ml in &sw_member {
+        let elem = app.model.elements.iter().find(|e| e.id == ml.elem).unwrap();
+        let total = match ml.kind {
+            MemberLoadKind::Distributed { a, b, w1, w2 } => (w1 + w2) / 2.0 * (b - a),
+            MemberLoadKind::Point { p, .. } => p,
+        };
+        node_share[elem.nodes[0].index()] += total / 2.0;
+        node_share[elem.nodes[1].index()] += total / 2.0;
+    }
+    let self_weight_at_story: f64 = app
+        .model
+        .nodes
+        .iter()
+        .filter(|n| n.coord[2] > 0.0)
+        .map(|n| node_share[n.id.index()])
+        .sum();
+    assert!(self_weight_at_story > 0.0, "自重が発生しているはず");
+    // サンプル LC0「長期」（kind=Dead）: 梁等分布 10 N/mm × 6000 mm = 60 kN。
+    let case_loads = 10.0 * 6000.0;
+    let w = app.model.stories[0].seismic_weight.unwrap();
+    assert!(
+        (w - (self_weight_at_story + case_loads)).abs() < 1e-6,
+        "階重量 {w} = 自重(階配分) {self_weight_at_story} + ケース荷重 {case_loads} のはず（二重計上なし）"
+    );
+
+    // 再生成しても増えない（冪等）。
+    app.generate_stories_action();
+    assert!(app.last_error.is_none(), "{:?}", app.last_error);
+    let w2 = app.model.stories[0].seismic_weight.unwrap();
+    assert!((w2 - w).abs() < 1e-6, "再生成で階重量が変わってはいけない");
+}
+
+/// 階の自動生成後に EX・EY ケースへ Ai 分布の水平力が同期されることを確認する。
+#[test]
+fn test_generate_stories_syncs_ex_ey_cases() {
+    use squid_n_core::model::LoadCaseKind;
+
+    let mut app = App::default();
+    app.load_model(crate::sample::portal_frame());
+    app.generate_stories_action();
+    assert!(app.last_error.is_none(), "{:?}", app.last_error);
+
+    let ex = app
+        .model
+        .load_cases
+        .iter()
+        .find(|lc| lc.name == EX_CASE_NAME)
+        .expect("EXケースが作られるはず");
+    assert_eq!(ex.kind, LoadCaseKind::Seismic);
+    let fx: f64 = ex.nodal.iter().map(|nl| nl.values[0]).sum();
+    assert!(fx > 0.0, "EX は +X 方向の水平力を持つはず: {fx}");
+    assert!(
+        ex.nodal.iter().all(|nl| nl.values[1] == 0.0),
+        "EX に Y 成分は無いはず"
+    );
+
+    let ey = app
+        .model
+        .load_cases
+        .iter()
+        .find(|lc| lc.name == EY_CASE_NAME)
+        .expect("EYケースが作られるはず");
+    let fy: f64 = ey.nodal.iter().map(|nl| nl.values[1]).sum();
+    assert!(fy > 0.0, "EY は +Y 方向の水平力を持つはず: {fy}");
+    // 層せん断力の総和は方向によらず同じ（同じ Ai 分布）。
+    assert!((fx - fy).abs() < 1e-9, "fx={fx} fy={fy}");
+}
+
+/// `load_model` が旧スキーマの自動生成ケース名を標準名へ移行することを確認する
+/// （床荷重(自動)→DL、自重(自動)は DL へ統合、床積載(自動)→LL(架構用)）。
+#[test]
+fn test_load_model_migrates_legacy_case_names() {
+    use squid_n_core::model::{LoadCase, LoadCaseKind};
+
+    let mut model = crate::sample::portal_frame();
+    model.load_cases.clear();
+    let mk = |i: u32, name: &str, kind: LoadCaseKind| LoadCase {
+        id: LoadCaseId(i),
+        name: name.into(),
+        nodal: Vec::new(),
+        member: Vec::new(),
+        kind,
+    };
+    model
+        .load_cases
+        .push(mk(0, "床荷重(自動)", LoadCaseKind::Dead));
+    model
+        .load_cases
+        .push(mk(1, "自重(自動)", LoadCaseKind::Dead));
+    model
+        .load_cases
+        .push(mk(2, "床積載(自動)", LoadCaseKind::Live));
+
+    let mut app = App::default();
+    app.load_model(model);
+    let names: Vec<&str> = app
+        .model
+        .load_cases
+        .iter()
+        .map(|c| c.name.as_str())
+        .collect();
+    assert_eq!(names, vec![DL_CASE_NAME, LL_FRAME_CASE_NAME]);
+    assert!(app.model.validate().is_ok());
+}
+
+/// 空の地震荷重ケース（未生成の EX 等）を参照する荷重組合せは実行せず、
+/// 案内エラーになることを確認する（地震項が黙って 0 になるのを防ぐ）。
+#[test]
+fn test_run_combination_errors_on_empty_seismic_case() {
+    use squid_n_core::model::{LoadCase, LoadCaseKind, LoadCombination};
+
+    let mut model = crate::sample::portal_frame();
+    // 空の EX ケース（階未生成のため内容なし）と、それを参照する組合せ。
+    let ex_id = LoadCaseId(model.load_cases.len() as u32);
+    model.load_cases.push(LoadCase {
+        id: ex_id,
+        name: EX_CASE_NAME.into(),
+        nodal: Vec::new(),
+        member: Vec::new(),
+        kind: LoadCaseKind::Seismic,
+    });
+    model.combinations.push(LoadCombination {
+        name: "G + P + Kx".into(),
+        terms: vec![(LoadCaseId(0), 1.0), (ex_id, 1.0)],
+    });
+
+    let mut app = App::default();
+    app.load_model(model);
+    app.run_combination(0);
+    let err = app.last_error.as_deref().unwrap_or("");
+    assert!(
+        err.contains("EX") && err.contains("空"),
+        "空の EX 参照はエラーで案内するはず: {err}"
+    );
+}
+
+/// ST-Bridge が荷重情報を持たない場合、読込時に標準荷重ケース
+/// （DL・LL(架構用)・LL(地震用)・EX・EY）が自動作成されることを確認する
+/// （本実装のエクスポートは幾何サブセットで荷重を書き出さないため、
+/// 書き出し→読み戻しで確認できる）。
+#[test]
+fn test_import_stbridge_without_loads_creates_default_cases() {
+    let dir = std::env::temp_dir().join("squid_n_app_test_stbridge_default_lc");
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("no_loads.stb");
+
+    let mut app = App::default();
+    app.load_model(crate::sample::portal_frame());
+    app.export_stbridge_to(path.clone());
+    assert!(app.last_error.is_none(), "{:?}", app.last_error);
+
+    let mut app2 = App::default();
+    app2.import_stbridge_from(path.clone());
+    // 支点の自動設定の通知は出る（欠落警告ではない）。
+    let msg = app2.last_error.as_deref().unwrap_or("");
+    assert!(msg.is_empty() || msg.contains("ピン支点に設定"), "{msg}");
+    let names: Vec<&str> = app2
+        .model
+        .load_cases
+        .iter()
+        .map(|c| c.name.as_str())
+        .collect();
+    assert_eq!(
+        names,
+        vec![
+            DL_CASE_NAME,
+            LL_FRAME_CASE_NAME,
+            LL_SEISMIC_CASE_NAME,
+            EX_CASE_NAME,
+            EY_CASE_NAME
+        ],
+        "荷重の無い STB は標準荷重ケースが自動作成されるはず"
+    );
+    assert!(app2.model.validate().is_ok());
+
+    std::fs::remove_file(&path).ok();
+}
+
+/// ST-Bridge が荷重ケース（`StbLoadCase`）を持つ場合は、ファイルの荷重ケースを
+/// そのまま採用し、標準荷重ケースを追加しないことを確認する。
+#[test]
+fn test_import_stbridge_with_loads_keeps_file_cases() {
+    let xml = r#"<?xml version="1.0"?>
+<ST_BRIDGE version="2.0.0"><StbModel>
+  <StbNodes>
+    <StbNode id="0" X="0" Y="0" Z="0"/>
+    <StbNode id="1" X="0" Y="0" Z="3000"/>
+  </StbNodes>
+  <StbSections>
+    <StbSecColumn_S id="0" name="C">
+      <StbSecSteelFigureColumn_S><StbSecSteelColumn_S_Same shape="H1"/></StbSecSteelFigureColumn_S>
+    </StbSecColumn_S>
+    <StbSecSteel>
+      <StbSecRoll-H name="H1" A="300" B="150" t1="6.5" t2="9"/>
+    </StbSecSteel>
+  </StbSections>
+  <StbMembers>
+    <StbColumns>
+      <StbColumn id="0" name="C1" id_node_bottom="0" id_node_top="1" id_section="0" kind_structure="S"/>
+    </StbColumns>
+  </StbMembers>
+  <StbLoads>
+    <StbLoadCase id="0" name="L1">
+      <StbNodalLoad id_node="1" fz="-5000"/>
+    </StbLoadCase>
+  </StbLoads>
+</StbModel></ST_BRIDGE>"#;
+    let dir = std::env::temp_dir().join("squid_n_app_test_stbridge_with_lc");
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("with_loads.stb");
+    std::fs::write(&path, xml).unwrap();
+
+    let mut app = App::default();
+    app.import_stbridge_from(path.clone());
+    assert_eq!(
+        app.model.load_cases.len(),
+        1,
+        "STB 自身の荷重ケースを採用し、標準ケースは追加しない: {:?}",
+        app.last_error
+    );
+    assert_eq!(app.model.load_cases[0].name, "L1");
+
+    std::fs::remove_file(&path).ok();
+}
+
+/// 報告された問題の再発防止: 支点情報の無い ST-Bridge を読み込んだ直後に
+/// DL の線形静的解析がそのまま実行できる（支点の自動設定（ピン）＋標準荷重
+/// ケースの自動作成＋DL 自重同期のエンドツーエンド）。
+///
+/// モデルは 1 層の立体フレーム（柱4本＋外周梁4本）。支点をピンにする既定では
+/// 平面フレーム（支点が一直線）は面外の機構になり解けないため、実建物と同じく
+/// 支点が平面的に分布する立体モデルで確認する。
+#[test]
+fn test_import_stbridge_then_run_dl_succeeds() {
+    use squid_n_core::ids::{MaterialId, SectionId};
+    use squid_n_core::model::{
+        ElementData, ElementKind, EndCondition, ForceRegime, LocalAxis, Material, Model, Node,
+    };
+    use squid_n_section::shape::SectionShape;
+
+    let dir = std::env::temp_dir().join("squid_n_app_test_stbridge_run_dl");
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("run_dl.stb");
+
+    // 1 層立体フレーム: 柱脚 4 節点（矩形配置, z=0）＋柱頭 4 節点（z=3000）。
+    let mut model = Model::default();
+    let plan = [(0.0, 0.0), (6000.0, 0.0), (6000.0, 4000.0), (0.0, 4000.0)];
+    for (k, z) in [0.0, 3000.0].into_iter().enumerate() {
+        for (i, (x, y)) in plan.iter().enumerate() {
+            model.nodes.push(Node {
+                id: NodeId((i + 4 * k) as u32),
+                coord: [*x, *y, z],
+                restraint: squid_n_core::dof::Dof6Mask::FREE,
+                mass: None,
+                story: None,
+            });
+        }
+    }
+    let col_shape = SectionShape::SteelH {
+        height: 300.0,
+        width: 300.0,
+        web_thick: 10.0,
+        flange_thick: 15.0,
+    };
+    model
+        .sections
+        .push(col_shape.to_section(SectionId(0), "柱".into()));
+    model.materials.push(Material {
+        concrete_class: Default::default(),
+        id: MaterialId(0),
+        name: "SN400B".into(),
+        young: 205000.0,
+        poisson: 0.3,
+        density: 7.85e-9,
+        shear: None,
+        fc: None,
+        fy: Some(235.0),
+    });
+    // 柱 4 本（i→i+4）＋外周梁 4 本（柱頭を一周）。
+    let conn: [(u32, u32); 8] = [
+        (0, 4),
+        (1, 5),
+        (2, 6),
+        (3, 7),
+        (4, 5),
+        (5, 6),
+        (6, 7),
+        (7, 4),
+    ];
+    for (i, (a, b)) in conn.iter().enumerate() {
+        let vertical = *b == *a + 4;
+        model.elements.push(ElementData {
+            id: ElemId(i as u32),
+            kind: ElementKind::Beam,
+            nodes: [NodeId(*a), NodeId(*b)].into_iter().collect(),
+            section: Some(SectionId(0)),
+            material: Some(MaterialId(0)),
+            local_axis: LocalAxis {
+                ref_vector: if vertical {
+                    [1.0, 0.0, 0.0]
+                } else {
+                    [0.0, 0.0, 1.0]
+                },
+            },
+            end_cond: [EndCondition::Fixed, EndCondition::Fixed],
+            force_regime: ForceRegime::Auto,
+            rigid_zone: Default::default(),
+            plastic_zone: None,
+            spring: None,
+        });
+    }
+    model
+        .validate()
+        .expect("テストモデルは validate を通るはず");
+
+    let mut app = App::default();
+    app.load_model(model);
+    app.export_stbridge_to(path.clone());
+    assert!(app.last_error.is_none(), "{:?}", app.last_error);
+
+    let mut app2 = App::default();
+    app2.import_stbridge_from(path.clone());
+    let dl_id = app2
+        .model
+        .load_cases
+        .iter()
+        .find(|lc| lc.name == DL_CASE_NAME)
+        .expect("標準荷重ケース DL が自動作成されるはず")
+        .id;
+
+    app2.run_linear_static(dl_id);
+    assert!(
+        app2.last_error.is_none(),
+        "支点自動設定により DL 解析が成功するはず: {:?}",
+        app2.last_error
+    );
+    let results = app2.results.as_ref().expect("解析結果が格納されるはず");
+    assert!(results
+        .statics
+        .iter()
+        .any(|(k, _)| *k == StaticCaseKey::User(dl_id)));
+    // DL には自重が同期され、柱に軸力（鉛直変位）が生じている。
+    let dl = app2
+        .model
+        .load_cases
+        .iter()
+        .find(|lc| lc.id == dl_id)
+        .unwrap();
+    assert!(
+        !(dl.nodal.is_empty() && dl.member.is_empty()),
+        "DL に自重が同期されているはず"
+    );
+
+    std::fs::remove_file(&path).ok();
+}
+
+/// 二次部材（小梁）と、その節点で区切られたパネルスラブを持つモデル
+/// （ST-Bridge 取り込みの典型形）の DL 同期と解析:
+///
+/// - 小梁は解析要素ではなく、その支持節点（大梁スパン中間・要素非接続）に
+///   落ちる床荷重・小梁自重は大梁の**中間集中荷重（CMQ）**へ変換される。
+/// - 実梁が無いスラブ辺（小梁上の辺・大梁の中間区間）の荷重も捨てられず
+///   主架構へ伝達され、鉛直荷重の総和が保存される。
+/// - そのまま線形静的解析が成功する（小梁支持節点は解析自由度から除外）。
+#[test]
+fn test_secondary_joist_panel_slab_dl_cmq_and_solve() {
+    use squid_n_core::ids::{MaterialId, SectionId, SlabId};
+    use squid_n_core::model::{
+        AreaLoad, DistributionMethod, ElementData, ElementKind, EndCondition, ForceRegime,
+        LocalAxis, Material, MemberLoadKind, Model, Node, SecondaryMember, SecondaryMemberKind,
+        Section, Slab,
+    };
+
+    let mk_node = |id: u32, x: f64, y: f64, z: f64, fixed: bool| Node {
+        id: NodeId(id),
+        coord: [x, y, z],
+        restraint: if fixed {
+            squid_n_core::dof::Dof6Mask::FIXED
+        } else {
+            squid_n_core::dof::Dof6Mask::FREE
+        },
+        mass: None,
+        story: None,
+    };
+    // 柱脚 0-3（固定）、柱頭 4-7、小梁支持点 8-9（大梁スパン中間・要素非接続）。
+    let plan = [(0.0, 0.0), (8000.0, 0.0), (8000.0, 6000.0), (0.0, 6000.0)];
+    let mut nodes = Vec::new();
+    for (i, (x, y)) in plan.iter().enumerate() {
+        nodes.push(mk_node(i as u32, *x, *y, 0.0, true));
+    }
+    for (i, (x, y)) in plan.iter().enumerate() {
+        nodes.push(mk_node(4 + i as u32, *x, *y, 3500.0, false));
+    }
+    nodes.push(mk_node(8, 4000.0, 0.0, 3500.0, false));
+    nodes.push(mk_node(9, 4000.0, 6000.0, 3500.0, false));
+
+    let mk_beam = |id: u32, i: u32, j: u32| ElementData {
+        id: ElemId(id),
+        kind: ElementKind::Beam,
+        nodes: [NodeId(i), NodeId(j)].into_iter().collect(),
+        section: Some(SectionId(0)),
+        material: Some(MaterialId(0)),
+        local_axis: LocalAxis {
+            ref_vector: if i + 4 == j {
+                [1.0, 0.0, 0.0]
+            } else {
+                [0.0, 0.0, 1.0]
+            },
+        },
+        end_cond: [EndCondition::Fixed, EndCondition::Fixed],
+        force_regime: ForceRegime::Auto,
+        rigid_zone: Default::default(),
+        plastic_zone: None,
+        spring: None,
+    };
+    // 柱 4 本 + 外周大梁 4 本（大梁 y=0 は ElemId(4)、節点 4→5）。
+    let elements = vec![
+        mk_beam(0, 0, 4),
+        mk_beam(1, 1, 5),
+        mk_beam(2, 2, 6),
+        mk_beam(3, 3, 7),
+        mk_beam(4, 4, 5),
+        mk_beam(5, 5, 6),
+        mk_beam(6, 6, 7),
+        mk_beam(7, 7, 4),
+    ];
+    let mk_slab = |id: u32, boundary: Vec<u32>| Slab {
+        id: SlabId(id),
+        boundary: boundary.into_iter().map(NodeId).collect(),
+        joists: vec![],
+        loads: vec![AreaLoad {
+            kind: "DL".into(),
+            value: 0.005,
+        }],
+        method: DistributionMethod::TriTrapezoid,
+        usage: None,
+        edge_supported: None,
+        thickness: None,
+        kind: Default::default(),
+        one_way: None,
+    };
+    let model = Model {
+        nodes,
+        elements,
+        sections: vec![Section {
+            id: SectionId(0),
+            name: "RC400x600".into(),
+            area: 400.0 * 600.0,
+            iy: 1.0e9,
+            iz: 1.0e9,
+            j: 1.0e9,
+            depth: 600.0,
+            width: 400.0,
+            as_y: 0.0,
+            as_z: 0.0,
+            panel_thickness: None,
+            thickness: None,
+            shape: None,
+        }],
+        materials: vec![Material {
+            concrete_class: Default::default(),
+            id: MaterialId(0),
+            name: "Fc24".into(),
+            young: 22000.0,
+            poisson: 0.2,
+            density: 2.4e-9,
+            shear: None,
+            fc: Some(24.0),
+            fy: None,
+        }],
+        // 小梁: 大梁 y=0 の中間 (4000,0) と大梁 y=6000 の中間 (4000,6000) を結ぶ。
+        secondary_members: vec![SecondaryMember {
+            kind: SecondaryMemberKind::Joist,
+            nodes: [NodeId(8), NodeId(9)],
+            section: Some(SectionId(0)),
+            material: Some(MaterialId(0)),
+            name: "B1".into(),
+        }],
+        // 小梁で区切られた 2 枚のパネルスラブ（計 8000×6000）。
+        slabs: vec![mk_slab(0, vec![4, 8, 9, 7]), mk_slab(1, vec![8, 5, 6, 9])],
+        ..Default::default()
+    };
+    model
+        .validate()
+        .expect("テストモデルは validate を通るはず");
+
+    let mut app = App::default();
+    app.load_model(model);
+    app.sync_gravity_load_cases_action();
+
+    let dl = app
+        .model
+        .load_cases
+        .iter()
+        .find(|lc| lc.name == DL_CASE_NAME)
+        .expect("DLケースが作られるはず");
+
+    // 鉛直荷重の総和保存: スラブ DL + 躯体自重（小梁自重を含む）。
+    let dl_total: f64 = dl
+        .member
+        .iter()
+        .map(|m| match m.kind {
+            MemberLoadKind::Distributed { a, b, w1, w2 } => (w1 + w2) / 2.0 * (b - a),
+            MemberLoadKind::Point { p, .. } => p,
+        })
+        .sum::<f64>()
+        + dl.nodal.iter().map(|nl| -nl.values[2]).sum::<f64>();
+    let (sw_nodal, sw_member) = squid_n_load::self_weight::self_weight_case_content(
+        &app.model,
+        &squid_n_core::model::LoadCfg::default(),
+    );
+    let sw_total: f64 = sw_member
+        .iter()
+        .map(|m| match m.kind {
+            MemberLoadKind::Distributed { a, b, w1, w2 } => (w1 + w2) / 2.0 * (b - a),
+            MemberLoadKind::Point { p, .. } => p,
+        })
+        .sum::<f64>()
+        + sw_nodal.iter().map(|nl| -nl.values[2]).sum::<f64>();
+    let slab_dl = 0.005 * 8000.0 * 6000.0;
+    assert!(
+        (dl_total - (slab_dl + sw_total)).abs() < 1e-6 * (slab_dl + sw_total),
+        "DL 合計 {dl_total} = スラブ {slab_dl} + 自重 {sw_total} のはず（荷重を捨てない）"
+    );
+
+    // 小梁反力（+小梁自重の半分）が大梁 y=0（ElemId(4)）の中間集中荷重 a=4000 に載る。
+    let point_on_girder = dl
+        .member
+        .iter()
+        .filter(|m| m.elem == ElemId(4))
+        .find_map(|m| match m.kind {
+            MemberLoadKind::Point { a, p } => Some((a, p)),
+            _ => None,
+        })
+        .expect("大梁 y=0 に小梁反力の中間集中荷重（CMQ）が載るはず");
+    assert!(
+        (point_on_girder.0 - 4000.0).abs() < 1.0,
+        "集中荷重位置はスパン中央 4000mm のはず: {}",
+        point_on_girder.0
+    );
+    assert!(point_on_girder.1 > 0.0);
+
+    // 要素非接続の小梁支持節点（8, 9）への節点荷重は残らない（全て CMQ 変換済み）。
+    assert!(
+        dl.nodal
+            .iter()
+            .all(|nl| nl.node != NodeId(8) && nl.node != NodeId(9)),
+        "小梁支持節点への節点荷重は大梁の集中荷重へ変換されるはず"
+    );
+
+    // そのまま線形静的解析が成功する（小梁支持節点は解析自由度から除外される）。
+    let dl_id = dl.id;
+    app.run_linear_static(dl_id);
+    assert!(app.last_error.is_none(), "{:?}", app.last_error);
+    assert!(app
+        .results
+        .as_ref()
+        .unwrap()
+        .statics
+        .iter()
+        .any(|(k, _)| *k == StaticCaseKey::User(dl_id)));
 }

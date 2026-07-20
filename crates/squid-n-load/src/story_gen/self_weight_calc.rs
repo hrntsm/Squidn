@@ -45,6 +45,10 @@ pub(crate) enum SelfWeightItem {
     Damper { ni: usize, nj: usize, total: f64 },
     /// 壁・シェルの自重の頂点配分（`model.nodes` 添字 → [N]）。
     Panel { shares: Vec<(usize, f64)> },
+    /// 二次部材（小梁・間柱）の自重（総量 [N]）。両端節点（`model.nodes` 添字）へ
+    /// 1/2 ずつ。要素ではないため部材荷重にはならず、節点荷重（→ 主架構梁上の
+    /// 節点なら CMQ 変換）として扱う。
+    SecondaryLine { ni: usize, nj: usize, total: f64 },
 }
 
 /// モデル全要素の自重を列挙する（§柱梁自重・§壁自重・§ダンパー自重）。
@@ -255,6 +259,37 @@ pub(crate) fn enumerate_self_weight(model: &Model, load_cfg: &LoadCfg) -> Vec<Se
             _ => {}
         }
     }
+
+    // 二次部材（小梁・間柱）の自重: ρ·A·L·g（節点間距離。解析部材ではないため
+    // 柱面間控除・スラブ厚控除は行わない簡易則）。鋼材は鉄骨重量割増率を乗じる。
+    // 両端節点へ 1/2 ずつ帰属する（[`SelfWeightItem::SecondaryLine`]）。
+    for sm in &model.secondary_members {
+        let (Some(sec_id), Some(mat_id)) = (sm.section, sm.material) else {
+            continue;
+        };
+        let (Some(sec), Some(mat)) = (
+            model.sections.get(sec_id.index()),
+            model.materials.get(mat_id.index()),
+        ) else {
+            continue;
+        };
+        let ni = sm.nodes[0].index();
+        let nj = sm.nodes[1].index();
+        let (Some(n0), Some(n1)) = (model.nodes.get(ni), model.nodes.get(nj)) else {
+            continue;
+        };
+        let len = dist3(n0.coord, n1.coord);
+        let factor = if mat.fc.is_some() {
+            1.0
+        } else {
+            load_cfg.effective_steel_factor()
+        };
+        let total = mat.density * sec.area * len * GRAVITY_MM_S2 * factor;
+        if total > 0.0 {
+            items.push(SelfWeightItem::SecondaryLine { ni, nj, total });
+        }
+    }
+
     items
 }
 

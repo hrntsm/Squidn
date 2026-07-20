@@ -36,9 +36,31 @@ pub struct StoryGenResult {
 /// - `gravity_lcs` に指定した各ケースの鉛直下向き荷重を地震重量に算入する
 ///   （自重は材料密度から常に算入）。重複 ID は 1 回だけ処理する
 ///   （固定荷重＋地震用積載荷重など複数ケースの合算に対応する下準備）。
+///
+/// 自重が「DL」ケースへ自動同期されるモデル（標準構成）では、密度からの
+/// 自重直接算入と二重計上になるため [`generate_stories_with_opts`] を
+/// `include_density_self_weight = false` で使うこと。
 pub fn generate_stories_multi(
     model: &Model,
     gravity_lcs: &[LoadCaseId],
+) -> Result<StoryGenResult, String> {
+    generate_stories_with_opts(model, gravity_lcs, true)
+}
+
+/// [`generate_stories_multi`] の自重算入方法を選べる版。
+///
+/// `include_density_self_weight`:
+/// - `true`: 従来どおり自重（柱梁・壁・ダンパー・フレーム外雑壁）を材料密度から
+///   直接算入する（自重が重力ケースに含まれないモデル向け）。
+/// - `false`: 密度からの自重・フレーム外雑壁の直接算入を行わず、`gravity_lcs` の
+///   ケース内容だけを算入する。自重同期ケース
+///   （[`crate::self_weight::self_weight_case_content`] の内容を含む「DL」）が
+///   重力ケースに含まれるモデル向け（自重・雑壁ともケース側に含まれるため、
+///   直接算入すると二重計上になる）。
+pub fn generate_stories_with_opts(
+    model: &Model,
+    gravity_lcs: &[LoadCaseId],
+    include_density_self_weight: bool,
 ) -> Result<StoryGenResult, String> {
     if model.nodes.is_empty() {
         return Err("節点がありません".into());
@@ -97,51 +119,70 @@ pub fn generate_stories_multi(
         }
     }
 
+    // §K型ブレース（BaseNodesOnly）: 総重量（または部材荷重の両端反力）を
+    // 基準節点のみへ再配分する共通則。両端とも基準節点は各自の分をそのまま、
+    // 片端が内部節点ならその分も基準節点側へ全量、両端とも内部節点は
+    // フォールバックで元の配分のまま。
+    let k_brace_redistribute =
+        |node_weight: &mut Vec<f64>, ni: usize, nj: usize, wi: f64, wj: f64| match (
+            is_base_node[ni],
+            is_base_node[nj],
+        ) {
+            (true, false) => node_weight[ni] += wi + wj,
+            (false, true) => node_weight[nj] += wi + wj,
+            (true, true) | (false, false) => {
+                node_weight[ni] += wi;
+                node_weight[nj] += wj;
+            }
+        };
+
     // 自重（算定規則は enumerate_self_weight に一元化。§柱梁自重・§壁自重・§ダンパー自重）。
     // - 線材: 総重量を両端に半分ずつ（対称等分布荷重の静定反力。
     //   K型ブレースは §K型ブレースの規則で再配分）。
     // - ダンパー: 両端節点へ 1/2 ずつ（鉛直配置は上下階へ、水平配置は同一階の
     //   両節点へ、が節点標高から自然に成立する）。
     // - 壁・シェル: 頂点配分（三方スリットは最上位標高の頂点へ全量）。
-    for item in enumerate_self_weight(model, &load_cfg) {
-        match item {
-            SelfWeightItem::Damper { ni, nj, total } => {
-                node_weight[ni] += total / 2.0;
-                node_weight[nj] += total / 2.0;
-            }
-            SelfWeightItem::Line { elem_idx, total } => {
-                let elem = &model.elements[elem_idx];
-                let ni = elem.nodes[0].index();
-                let nj = elem.nodes[1].index();
-                if matches!(elem.kind, ElementKind::Brace { .. })
-                    && load_cfg.k_brace_rule == KBraceWeightRule::BaseNodesOnly
-                {
-                    // §K型ブレース: 基準節点のみへ配分。両端とも基準節点は 1/2 ずつ、
-                    // 片端が内部節点ならその分も基準節点側へ全量、両端とも内部節点は
-                    // フォールバックで従来どおり 1/2 ずつ。
-                    match (is_base_node[ni], is_base_node[nj]) {
-                        (true, false) => node_weight[ni] += total,
-                        (false, true) => node_weight[nj] += total,
-                        (true, true) | (false, false) => {
-                            node_weight[ni] += total / 2.0;
-                            node_weight[nj] += total / 2.0;
-                        }
+    //
+    // 自重が重力ケース（「DL」自動同期）側に含まれる場合は、二重計上を避ける
+    // ため密度からの直接算入を行わない（include_density_self_weight = false）。
+    if include_density_self_weight {
+        for item in enumerate_self_weight(model, &load_cfg) {
+            match item {
+                SelfWeightItem::Damper { ni, nj, total } => {
+                    node_weight[ni] += total / 2.0;
+                    node_weight[nj] += total / 2.0;
+                }
+                SelfWeightItem::Line { elem_idx, total } => {
+                    let elem = &model.elements[elem_idx];
+                    let ni = elem.nodes[0].index();
+                    let nj = elem.nodes[1].index();
+                    if matches!(elem.kind, ElementKind::Brace { .. })
+                        && load_cfg.k_brace_rule == KBraceWeightRule::BaseNodesOnly
+                    {
+                        k_brace_redistribute(&mut node_weight, ni, nj, total / 2.0, total / 2.0);
+                    } else {
+                        node_weight[ni] += total / 2.0;
+                        node_weight[nj] += total / 2.0;
                     }
-                } else {
+                }
+                SelfWeightItem::Panel { shares } => {
+                    for (i, w) in shares {
+                        node_weight[i] += w;
+                    }
+                }
+                // 二次部材（小梁・間柱）: 両端節点へ 1/2 ずつ（節点は所属階の
+                // レベルでクラスタリングされるため、階重量へ自然に算入される）。
+                SelfWeightItem::SecondaryLine { ni, nj, total } => {
                     node_weight[ni] += total / 2.0;
                     node_weight[nj] += total / 2.0;
                 }
             }
-            SelfWeightItem::Panel { shares } => {
-                for (i, w) in shares {
-                    node_weight[i] += w;
-                }
-            }
         }
-    }
 
-    // §フレーム外雑壁: 部材としてモデル化しない壁の重量を近傍節点へ集計する。
-    accumulate_misc_wall_weight(model, &mut node_weight);
+        // §フレーム外雑壁: 部材としてモデル化しない壁の重量を近傍節点へ集計する。
+        // （false の場合は自重同期ケースの節点荷重に雑壁分が含まれるため行わない）
+        accumulate_misc_wall_weight(model, &mut node_weight);
+    }
 
     // 指定荷重ケース（複数可）の鉛直下向き成分。
     // §1.4: 部材荷重は単純梁の静定反力（`static_reactions`）で両端に配分する
@@ -180,8 +221,16 @@ pub fn generate_stories_multi(
                 .sqrt();
             let (ri, rj) = static_reactions(&ml.kind, len);
             let scale = -dz;
-            node_weight[ni] += ri * scale;
-            node_weight[nj] += rj * scale;
+            // ブレースに載る鉛直荷重（自重同期ケースの等分布など）にも
+            // §K型ブレースの配分規則を適用する（密度直接算入と同じ規約）。
+            if matches!(elem.kind, ElementKind::Brace { .. })
+                && load_cfg.k_brace_rule == KBraceWeightRule::BaseNodesOnly
+            {
+                k_brace_redistribute(&mut node_weight, ni, nj, ri * scale, rj * scale);
+            } else {
+                node_weight[ni] += ri * scale;
+                node_weight[nj] += rj * scale;
+            }
         }
     }
 

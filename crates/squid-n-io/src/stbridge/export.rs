@@ -212,9 +212,63 @@ fn members_body(
         }
     }
 
+    // 二次部材（小梁 StbBeam・間柱 StbPost）。全体解析の対象外だが往復のため
+    // 書き出す。member id は要素 id と別空間なので要素数の次から採番する。
+    let secondary_member_base = model.elements.len() as u32;
+    let mut sec_beams = String::new();
+    let mut posts = String::new();
+    for (i, sm) in model.secondary_members.iter().enumerate() {
+        let mid = secondary_member_base + i as u32;
+        let sec = sm
+            .section
+            .map(|s| {
+                beam_map
+                    .get(&s.0)
+                    .or_else(|| col_map.get(&s.0))
+                    .copied()
+                    .unwrap_or(s.0) as i64
+            })
+            .unwrap_or(-1);
+        let ks = sm
+            .material
+            .and_then(|m| model.materials.get(m.index()))
+            .map(|m| {
+                if m.fc.is_some() {
+                    "RC".to_string()
+                } else {
+                    "S".to_string()
+                }
+            })
+            .unwrap_or_else(|| "S".to_string());
+        match sm.kind {
+            squid_n_core::model::SecondaryMemberKind::Joist => {
+                sec_beams.push_str(&format!(
+                    "        <StbBeam id=\"{}\" name=\"B{}\" id_node_start=\"{}\" id_node_end=\"{}\" \
+                     rotate=\"0\" id_section=\"{}\" kind_structure=\"{}\" isFoundation=\"false\"/>\n",
+                    sid(mid), sid(mid), sid(sm.nodes[0].0), sid(sm.nodes[1].0), sec_ref(sec), ks,
+                ));
+            }
+            squid_n_core::model::SecondaryMemberKind::Post => {
+                // 下端→上端の順（Z で並べ替え）。
+                let n0 = &model.nodes[sm.nodes[0].index()];
+                let n1 = &model.nodes[sm.nodes[1].index()];
+                let (bot, top) = if n0.coord[2] <= n1.coord[2] {
+                    (sm.nodes[0], sm.nodes[1])
+                } else {
+                    (sm.nodes[1], sm.nodes[0])
+                };
+                posts.push_str(&format!(
+                    "        <StbPost id=\"{}\" name=\"P{}\" id_node_bottom=\"{}\" id_node_top=\"{}\" \
+                     rotate=\"0\" id_section=\"{}\" kind_structure=\"{}\"/>\n",
+                    sid(mid), sid(mid), sid(bot.0), sid(top.0), sec_ref(sec), ks,
+                ));
+            }
+        }
+    }
+
     // スラブ（StbSlab）。境界節点ループ＋断面参照。member id は要素 id と別空間なので
-    // 要素数の次から採番する（1 始まり）。
-    let slab_member_base = model.elements.len() as u32;
+    // 要素数の次から採番する（1 始まり。二次部材の後）。
+    let slab_member_base = model.elements.len() as u32 + model.secondary_members.len() as u32;
     let slab_sec_base = col_map
         .values()
         .chain(beam_map.values())
@@ -279,17 +333,28 @@ fn members_body(
     }
 
     // 複数形コンテナはスキーマ上、子を 1 つ以上持つ必要がある。空なら出力しない。
-    // 順序はスキーマの sequence（Columns→Girders→Braces→Slabs→Walls）に合わせる。
+    // 順序はスキーマの sequence（Columns→Posts→Girders→Beams→Braces→Slabs→Walls）
+    // に合わせる。
     let mut body = String::new();
     if !columns.is_empty() {
         body.push_str("      <StbColumns>\n");
         body.push_str(&columns);
         body.push_str("      </StbColumns>\n");
     }
+    if !posts.is_empty() {
+        body.push_str("      <StbPosts>\n");
+        body.push_str(&posts);
+        body.push_str("      </StbPosts>\n");
+    }
     if !girders.is_empty() {
         body.push_str("      <StbGirders>\n");
         body.push_str(&girders);
         body.push_str("      </StbGirders>\n");
+    }
+    if !sec_beams.is_empty() {
+        body.push_str("      <StbBeams>\n");
+        body.push_str(&sec_beams);
+        body.push_str("      </StbBeams>\n");
     }
     if !braces.is_empty() {
         body.push_str("      <StbBraces>\n");

@@ -77,6 +77,48 @@ pub struct LoadCase {
     pub kind: LoadCaseKind,
 }
 
+/// 固定荷重（DL）の標準荷重ケース名。躯体自重（柱・梁・ブレース・壁・ダンパー）と
+/// スラブの固定荷重（仕上げ等）が解析実行前の同期アクションで自動集計される。
+/// このケースの内容は自動計算で全置換されるため、手入力の追加荷重は別ケースに
+/// 定義すること。
+pub const DL_CASE_NAME: &str = "DL";
+
+/// 積載荷重（LL・架構用）の標準荷重ケース名。スラブ用途（令別表第1）の
+/// 骨組用積載が自動分配される（長期骨組解析用。令85条1項）。
+pub const LL_FRAME_CASE_NAME: &str = "LL(架構用)";
+
+/// 積載荷重（LL・地震用）の標準荷重ケース名。スラブ用途（令別表第1）の
+/// 地震用積載が自動分配され、地震用重量の集計に用いる（令85条1項・令88条）。
+pub const LL_SEISMIC_CASE_NAME: &str = "LL(地震用)";
+
+/// 地震荷重（X 方向・Ai 分布）の標準荷重ケース名。階の定義があるとき、
+/// 解析実行前の同期アクションで水平力（Ai 分布）が自動生成される。
+pub const EX_CASE_NAME: &str = "EX";
+
+/// 地震荷重（Y 方向・Ai 分布）の標準荷重ケース名。[`EX_CASE_NAME`] の Y 方向版。
+pub const EY_CASE_NAME: &str = "EY";
+
+/// 新規モデルにデフォルトで用意する標準荷重ケース一式
+/// （DL・LL(架構用)・LL(地震用)・EX・EY。内容は空で、解析実行前の
+/// 同期アクションが自動計算値を書き込む）。ID は 0 起点の連番
+/// （`Model::validate` の「id == 添字」規約に従う）。
+pub fn default_load_cases() -> Vec<LoadCase> {
+    let make = |i: u32, name: &str, kind: LoadCaseKind| LoadCase {
+        id: LoadCaseId(i),
+        name: name.to_string(),
+        nodal: Vec::new(),
+        member: Vec::new(),
+        kind,
+    };
+    vec![
+        make(0, DL_CASE_NAME, LoadCaseKind::Dead),
+        make(1, LL_FRAME_CASE_NAME, LoadCaseKind::Live),
+        make(2, LL_SEISMIC_CASE_NAME, LoadCaseKind::LiveSeismic),
+        make(3, EX_CASE_NAME, LoadCaseKind::Seismic),
+        make(4, EY_CASE_NAME, LoadCaseKind::Seismic),
+    ]
+}
+
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct LoadCombination {
     pub name: String,

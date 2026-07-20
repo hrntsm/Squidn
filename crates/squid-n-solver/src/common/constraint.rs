@@ -330,24 +330,28 @@ mod tests {
                     story: None,
                 },
             ],
-            elements: vec![ElementData {
-                id: ElemId(0),
-                kind: ElementKind::Beam,
-                nodes: smallvec::smallvec![NodeId(0), NodeId(1)],
-                section: Some(SectionId(0)),
-                material: Some(MaterialId(0)),
-                local_axis: LocalAxis {
-                    ref_vector: [0.0, 0.0, 1.0],
-                },
-                end_cond: [
-                    squid_n_core::model::EndCondition::Fixed,
-                    squid_n_core::model::EndCondition::Fixed,
-                ],
-                force_regime: squid_n_core::model::ForceRegime::Auto,
-                rigid_zone: Default::default(),
-                plastic_zone: None,
-                spring: None,
-            }],
+            // 全節点に要素を接続する（要素が接続しない節点は DofMap が解析自由度
+            // から除外するため、拘束縮約のテスト対象にならない）。
+            elements: (0..2)
+                .map(|i| ElementData {
+                    id: ElemId(i),
+                    kind: ElementKind::Beam,
+                    nodes: smallvec::smallvec![NodeId(i), NodeId(i + 1)],
+                    section: Some(SectionId(0)),
+                    material: Some(MaterialId(0)),
+                    local_axis: LocalAxis {
+                        ref_vector: [0.0, 0.0, 1.0],
+                    },
+                    end_cond: [
+                        squid_n_core::model::EndCondition::Fixed,
+                        squid_n_core::model::EndCondition::Fixed,
+                    ],
+                    force_regime: squid_n_core::model::ForceRegime::Auto,
+                    rigid_zone: Default::default(),
+                    plastic_zone: None,
+                    spring: None,
+                })
+                .collect(),
             sections: vec![Section {
                 id: SectionId(0),
                 name: "sec".to_string(),

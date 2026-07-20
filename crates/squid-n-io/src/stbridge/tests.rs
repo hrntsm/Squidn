@@ -1859,9 +1859,11 @@ fn test_import_report_warns_unresolved_steel_ref() {
 
 // ===== レビュー指摘の回帰テスト =====
 
-/// [高] StbPost（間柱, bottom/top）を含むファイルが取り込みエラーで中断しない。
+/// [高] StbPost（間柱, bottom/top）を含むファイルが取り込みエラーで中断せず、
+/// 間柱は二次部材（解析対象外・CMQ 用）として取り込まれる。
 #[test]
 fn test_import_stbpost_bottom_top() {
+    use squid_n_core::model::SecondaryMemberKind;
     let xml = r#"<?xml version="1.0"?>
 <ST_BRIDGE version="2.0.0"><StbModel>
   <StbNodes>
@@ -1871,8 +1873,10 @@ fn test_import_stbpost_bottom_top() {
   <StbMembers><StbPost id="0" id_node_bottom="0" id_node_top="1"/></StbMembers>
 </StbModel></ST_BRIDGE>"#;
     let m = import_stbridge(xml).expect("StbPost で中断しない");
-    assert_eq!(m.elements.len(), 1);
-    assert_eq!(m.elements[0].nodes.as_slice(), &[NodeId(0), NodeId(1)]);
+    assert!(m.elements.is_empty(), "間柱は解析要素にしない");
+    assert_eq!(m.secondary_members.len(), 1);
+    assert_eq!(m.secondary_members[0].kind, SecondaryMemberKind::Post);
+    assert_eq!(m.secondary_members[0].nodes, [NodeId(0), NodeId(1)]);
 }
 
 /// [高] SRC 内蔵鉄骨の参照が未解決なら警告する（無言のゼロ鉄骨を防ぐ）。
@@ -2052,5 +2056,195 @@ fn test_import_report_lists_stbopen() {
         report.warnings.iter().any(|w| w.contains("StbOpen")),
         "StbOpen の欠落を報告: {:?}",
         report.warnings
+    );
+}
+
+/// ST-Bridge は境界条件（支点）を持たないため、取り込み時に最下レベル
+/// （Z 最小、許容差 1mm）の節点をピン支点（並進固定・回転自由）に自動設定し、notes で通知する。
+/// notes は欠落警告ではないため `is_clean` には影響しない。
+#[test]
+fn test_import_auto_fixes_base_level_supports() {
+    let xml = r#"<?xml version="1.0"?>
+<ST_BRIDGE version="2.0.0"><StbModel>
+  <StbNodes>
+    <StbNode id="0" X="0" Y="0" Z="100"/>
+    <StbNode id="1" X="6000" Y="0" Z="100.5"/>
+    <StbNode id="2" X="0" Y="0" Z="3500"/>
+    <StbNode id="3" X="6000" Y="0" Z="3500"/>
+  </StbNodes>
+  <StbSections>
+    <StbSecColumn_S id="0" name="C">
+      <StbSecSteelFigureColumn_S><StbSecSteelColumn_S_Same shape="H1"/></StbSecSteelFigureColumn_S>
+    </StbSecColumn_S>
+    <StbSecSteel>
+      <StbSecRoll-H name="H1" A="300" B="150" t1="6.5" t2="9"/>
+    </StbSecSteel>
+  </StbSections>
+  <StbMembers>
+    <StbColumns>
+      <StbColumn id="0" name="C1" id_node_bottom="0" id_node_top="2" id_section="0" kind_structure="S"/>
+      <StbColumn id="1" name="C2" id_node_bottom="1" id_node_top="3" id_section="0" kind_structure="S"/>
+    </StbColumns>
+  </StbMembers>
+</StbModel></ST_BRIDGE>"#;
+    let (m, report) = import_stbridge_with_report(xml).expect("import");
+
+    use squid_n_core::dof::Dof6Mask;
+    // 最下レベル: Z=100 と Z=100.5（許容差 1mm 以内）の 2 節点がピン支点になる。
+    assert_eq!(m.nodes[0].restraint, Dof6Mask::PINNED);
+    assert_eq!(m.nodes[1].restraint, Dof6Mask::PINNED);
+    // 上部節点は自由のまま。
+    assert_eq!(m.nodes[2].restraint, Dof6Mask::FREE);
+    assert_eq!(m.nodes[3].restraint, Dof6Mask::FREE);
+    // notes で通知され、欠落警告（is_clean）には影響しない。
+    assert!(
+        report
+            .notes
+            .iter()
+            .any(|n| n.contains("ピン支点に設定") && n.contains("2 箇所")),
+        "notes: {:?}",
+        report.notes
+    );
+    assert!(report.is_clean(), "warnings: {:?}", report.warnings);
+}
+
+/// 小梁（StbBeam）は二次部材（解析対象外・CMQ 用）として取り込まれ、
+/// 大梁（StbGirder）は従来どおり解析要素になる。断面・材料（グレード伝播）も
+/// 二次部材へ解決される。
+#[test]
+fn test_import_stbbeam_as_secondary_member() {
+    use squid_n_core::model::SecondaryMemberKind;
+    let xml = r#"<?xml version="1.0"?>
+<ST_BRIDGE version="2.0.0"><StbModel>
+  <StbNodes>
+    <StbNode id="0" X="0" Y="0" Z="0"/>
+    <StbNode id="1" X="6000" Y="0" Z="0"/>
+    <StbNode id="2" X="2000" Y="0" Z="0"/>
+    <StbNode id="3" X="2000" Y="4000" Z="0"/>
+  </StbNodes>
+  <StbSections>
+    <StbSecBeam_S id="0" name="G">
+      <StbSecSteelFigureBeam_S><StbSecSteelBeam_S_Straight shape="H1" strength_main="SN400B"/></StbSecSteelFigureBeam_S>
+    </StbSecBeam_S>
+    <StbSecSteel>
+      <StbSecRoll-H name="H1" A="300" B="150" t1="6.5" t2="9"/>
+    </StbSecSteel>
+  </StbSections>
+  <StbMembers>
+    <StbGirders>
+      <StbGirder id="0" name="G1" id_node_start="0" id_node_end="1" id_section="0" kind_structure="S"/>
+    </StbGirders>
+    <StbBeams>
+      <StbBeam id="1" name="B1" id_node_start="2" id_node_end="3" id_section="0" kind_structure="S"/>
+    </StbBeams>
+  </StbMembers>
+</StbModel></ST_BRIDGE>"#;
+    let (m, report) = import_stbridge_with_report(xml).expect("import");
+    assert_eq!(m.elements.len(), 1, "大梁のみ解析要素");
+    assert_eq!(m.secondary_members.len(), 1);
+    let sm = &m.secondary_members[0];
+    assert_eq!(sm.kind, SecondaryMemberKind::Joist);
+    assert_eq!(sm.nodes, [NodeId(2), NodeId(3)]);
+    assert!(sm.section.is_some(), "断面参照が解決されるはず");
+    assert!(sm.material.is_some(), "グレード材料が伝播されるはず");
+    assert!(
+        report.notes.iter().any(|n| n.contains("小梁 1 本")),
+        "二次部材の取り込みを通知: {:?}",
+        report.notes
+    );
+    assert!(m.validate().is_ok());
+}
+
+/// 二次部材（小梁・間柱）が ST-Bridge 書き出し（StbBeam/StbPost）→再取り込みで
+/// 保存されること（往復）。
+#[test]
+fn test_secondary_members_roundtrip() {
+    use squid_n_core::ids::MaterialId;
+    use squid_n_core::model::{SecondaryMember, SecondaryMemberKind};
+
+    let mut m = frame_nodes();
+    let h = SectionShape::SteelH {
+        height: 300.0,
+        width: 150.0,
+        web_thick: 6.5,
+        flange_thick: 9.0,
+    };
+    m.sections.push(h.to_section(SectionId(0), "G".into()));
+    m.elements.push(member(0, false, 0));
+    // 小梁と間柱を 1 本ずつ（節点は既存節点を使う）。
+    m.secondary_members.push(SecondaryMember {
+        kind: SecondaryMemberKind::Joist,
+        nodes: [NodeId(0), NodeId(1)],
+        section: Some(SectionId(0)),
+        material: Some(MaterialId(0)),
+        name: "B1".into(),
+    });
+    m.secondary_members.push(SecondaryMember {
+        kind: SecondaryMemberKind::Post,
+        nodes: [NodeId(0), NodeId(2)],
+        section: Some(SectionId(0)),
+        material: Some(MaterialId(0)),
+        name: "P1".into(),
+    });
+    m.validate().expect("元モデルは validate を通る");
+
+    let xml = export_stbridge(&m).expect("export");
+    assert!(xml.contains("<StbBeams>"), "小梁を書き出す: {xml}");
+    assert!(xml.contains("<StbPosts>"), "間柱を書き出す: {xml}");
+
+    let (back, _report) = import_stbridge_with_report(&xml).expect("re-import");
+    assert_eq!(back.secondary_members.len(), 2);
+    let kinds: Vec<SecondaryMemberKind> = back.secondary_members.iter().map(|s| s.kind).collect();
+    assert!(kinds.contains(&SecondaryMemberKind::Joist));
+    assert!(kinds.contains(&SecondaryMemberKind::Post));
+    assert_eq!(back.elements.len(), 1, "大梁は解析要素のまま");
+    assert!(back.validate().is_ok());
+}
+
+/// 厚さが分かるスラブ（StbSecSlab_RC）には、取り込み時に自重
+/// （厚さ×γRC=24kN/m³）が固定荷重として自動設定される（ST-Bridge は
+/// 床荷重を持たないため、DL・CMQ・地震用重量への算入の出発点にする）。
+#[test]
+fn test_import_slab_auto_self_weight_from_thickness() {
+    let xml = r#"<?xml version="1.0"?>
+<ST_BRIDGE version="2.0.0"><StbModel>
+  <StbNodes>
+    <StbNode id="0" X="0" Y="0" Z="0"/>
+    <StbNode id="1" X="4000" Y="0" Z="0"/>
+    <StbNode id="2" X="4000" Y="3000" Z="0"/>
+    <StbNode id="3" X="0" Y="3000" Z="0"/>
+  </StbNodes>
+  <StbSections>
+    <StbSecSlab_RC id="0" name="S150">
+      <StbSecFigureSlab_RC><StbSecSlab_RC_Straight depth="150"/></StbSecFigureSlab_RC>
+    </StbSecSlab_RC>
+  </StbSections>
+  <StbMembers>
+    <StbSlabs>
+      <StbSlab id="0" name="S1" id_section="0" kind_structure="RC">
+        <StbNodeIdOrder>0 1 2 3</StbNodeIdOrder>
+      </StbSlab>
+    </StbSlabs>
+  </StbMembers>
+</StbModel></ST_BRIDGE>"#;
+    let (m, report) = import_stbridge_with_report(xml).expect("import");
+    assert_eq!(m.slabs.len(), 1);
+    let slab = &m.slabs[0];
+    assert_eq!(slab.thickness, Some(150.0));
+    assert_eq!(slab.loads.len(), 1, "自重が床荷重として自動設定される");
+    // 150 mm × 24 kN/m³ = 3.6 kN/m² = 3.6e-3 N/mm²
+    assert!(
+        (slab.loads[0].value - 3.6e-3).abs() < 1e-12,
+        "value={}",
+        slab.loads[0].value
+    );
+    assert!(
+        (slab.dead_intensity() - 3.6e-3).abs() < 1e-12,
+        "分配強度に自重が乗る"
+    );
+    assert!(
+        report.notes.iter().any(|n| n.contains("スラブ 1 枚に自重")),
+        "自動設定を通知: {:?}",
+        report.notes
     );
 }

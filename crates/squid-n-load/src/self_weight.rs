@@ -1,4 +1,4 @@
-//! 自重の荷重ケース（自重(自動)）生成。
+//! 自重の荷重ケース内容の生成（標準構成では「DL」ケースへ同期される）。
 //!
 //! 柱梁自重・壁自重・ダンパー自重の重量算定規則
 //! （[`crate::story_gen::enumerate_self_weight`] に一元化）を、長期応力解析用の
@@ -10,16 +10,17 @@
 //! 従来は自重が地震用重量（階の集計）にしか算入されず、長期応力解析には
 //! 手動入力しない限り自重が載らなかった（照合レビューでの最重要指摘）。
 //!
-//! **地震用重量との関係:** 階の自動生成（`story_gen`）は自重を密度から直接
-//! 集計するため、この自動生成ケースを地震用重量の重力ケースに **含めてはならない**
-//! （二重計上になる）。ケースの識別は [`SELF_WEIGHT_AUTO_LOAD_CASE_NAME`] による。
+//! **地震用重量との関係:** 本内容（自重・フレーム外雑壁）を含む「DL」ケースを
+//! 地震用重量の重力ケースに算入する場合は、階の自動生成で密度からの自重直接
+//! 算入を無効にすること（[`crate::story_gen::generate_stories_with_opts`] の
+//! `include_density_self_weight = false`。両方行うと二重計上になる）。
 
 use squid_n_core::model::{LoadCfg, MemberLoad, MemberLoadKind, Model, NodalLoad};
 
 use crate::story_gen::{enumerate_self_weight, misc_wall_weight_shares, SelfWeightItem};
 
-/// 自重の自動生成荷重ケース名。地震用重量の重力ケース選択からはこの名前で
-/// 除外する（`story_gen` が自重を密度から直接集計するため）。
+/// 旧スキーマの自重自動生成荷重ケース名（現行は自重を「DL」ケースへ統合して
+/// 同期する。読込時の移行 `Model::migrate_legacy_auto_load_cases` が参照する）。
 pub const SELF_WEIGHT_AUTO_LOAD_CASE_NAME: &str = "自重(自動)";
 
 /// 重力方向（全体座標系 −Z）。
@@ -85,6 +86,14 @@ pub fn self_weight_case_content(
                 for (i, w) in shares {
                     node_force[i] += w;
                 }
+            }
+            // 二次部材（小梁・間柱）: 要素ではないため部材荷重にできず、
+            // 両端節点への節点荷重とする。支持点が主架構梁のスパン上にある場合は
+            // 呼び出し側（同期アクション）が `crate::secondary::resolve_nodal_to_primary`
+            // で梁の中間集中荷重（CMQ）へ変換する。
+            SelfWeightItem::SecondaryLine { ni, nj, total } => {
+                node_force[ni] += total / 2.0;
+                node_force[nj] += total / 2.0;
             }
         }
     }
@@ -249,6 +258,7 @@ mod tests {
             .map(|item| match item {
                 crate::story_gen::SelfWeightItem::Line { total, .. } => *total,
                 crate::story_gen::SelfWeightItem::Damper { total, .. } => *total,
+                crate::story_gen::SelfWeightItem::SecondaryLine { total, .. } => *total,
                 crate::story_gen::SelfWeightItem::Panel { shares } => {
                     shares.iter().map(|(_, w)| w).sum()
                 }

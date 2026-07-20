@@ -99,6 +99,19 @@ struct PendingMember {
     end_cond: [EndCondition; 2],
 }
 
+/// 取り込み途中の二次部材（小梁 `StbBeam`・間柱 `StbPost`。id 正規化前）。
+/// 全体解析の対象外で、床荷重・自重を主架構へ CMQ として伝達する部材
+/// （`squid_n_core::model::SecondaryMember`）として取り込む。
+struct PendingSecondary {
+    kind: squid_n_core::model::SecondaryMemberKind,
+    n_i: u32,
+    n_j: u32,
+    section: Option<u32>,
+    material: Option<u32>,
+    has_material_attr: bool,
+    name: String,
+}
+
 /// 取り込み途中の節点（id 正規化前）。
 struct RawNode {
     file_id: u32,
@@ -210,10 +223,15 @@ enum CurSec {
 pub struct ImportReport {
     /// 人間可読の警告メッセージ（未対応要素のスキップ、断面欠落、参照解決失敗など）。
     pub warnings: Vec<String>,
+    /// 取り込み時に自動補完した仮定の通知（支点の自動設定など）。
+    /// データ欠損ではないため [`is_clean`](Self::is_clean) には影響しないが、
+    /// ユーザーへ明示すべき内容として呼び出し側で表示する。
+    pub notes: Vec<String>,
 }
 
 impl ImportReport {
     /// 警告が 1 件も無い（＝取り込みで欠落が無かった）か。
+    /// 自動補完の通知（`notes`）は欠落ではないため判定に含めない。
     pub fn is_clean(&self) -> bool {
         self.warnings.is_empty()
     }
@@ -330,6 +348,7 @@ pub fn import_stbridge_with_report(xml: &str) -> Result<(Model, ImportReport), S
     let mut raw_load_cases: Vec<RawLoadCase> = Vec::new();
     let mut pending_secs: Vec<PendingSec> = Vec::new();
     let mut pending_members: Vec<PendingMember> = Vec::new();
+    let mut pending_secondaries: Vec<PendingSecondary> = Vec::new();
     let mut steel_lib: HashMap<String, SectionShape> = HashMap::new();
     let mut cur = CurSec::None;
     // スラブ・壁関連の中間状態。
@@ -605,18 +624,36 @@ pub fn import_stbridge_with_report(xml: &str) -> Result<(Model, ImportReport), S
                         let top = get_u32(&a, "id_node_top")?;
                         pending_members.push(make_member(&a, bot, top, PendingMemberKind::Beam)?);
                     }
-                    "StbGirder" | "StbBeam" => {
+                    "StbGirder" => {
                         let st = get_u32(&a, "id_node_start")?;
                         let en = get_u32(&a, "id_node_end")?;
                         pending_members.push(make_member(&a, st, en, PendingMemberKind::Beam)?);
                     }
-                    // 間柱（鉛直材）は柱と同じく bottom/top を持つ（start/end も許容）。
+                    // 小梁（StbBeam）は二次部材: 全体解析の対象外とし、床荷重・自重を
+                    // 大梁へ CMQ（中間集中荷重）として伝達する部材として取り込む。
+                    "StbBeam" => {
+                        let st = get_u32(&a, "id_node_start")?;
+                        let en = get_u32(&a, "id_node_end")?;
+                        pending_secondaries.push(make_secondary(
+                            &a,
+                            st,
+                            en,
+                            squid_n_core::model::SecondaryMemberKind::Joist,
+                        ));
+                    }
+                    // 間柱（StbPost）も二次部材（鉛直材。柱と同じく bottom/top を持つ。
+                    // start/end も許容）。
                     "StbPost" => {
                         let bot = get_u32(&a, "id_node_bottom")
                             .or_else(|_| get_u32(&a, "id_node_start"))?;
                         let top =
                             get_u32(&a, "id_node_top").or_else(|_| get_u32(&a, "id_node_end"))?;
-                        pending_members.push(make_member(&a, bot, top, PendingMemberKind::Beam)?);
+                        pending_secondaries.push(make_secondary(
+                            &a,
+                            bot,
+                            top,
+                            squid_n_core::model::SecondaryMemberKind::Post,
+                        ));
                     }
                     "StbBrace" => {
                         let st = get_u32(&a, "id_node_start")?;
@@ -1170,6 +1207,55 @@ pub fn import_stbridge_with_report(xml: &str) -> Result<(Model, ImportReport), S
         });
     }
 
+    // 二次部材（小梁・間柱）を格納する（節点・断面・材料の参照は部材と同じ規則で
+    // 正規化・伝播する）。全体解析の対象外（CMQ 用）のため `model.elements` には
+    // 入れず `model.secondary_members` に入れる。
+    let mut n_joists = 0usize;
+    let mut n_posts = 0usize;
+    for s in pending_secondaries {
+        let (Some(&ni), Some(&nj)) = (node_index.get(&s.n_i), node_index.get(&s.n_j)) else {
+            skipped_members += 1;
+            continue;
+        };
+        let section = s.section.and_then(|fid| match section_index.get(&fid) {
+            Some(&idx) => Some(SectionId(idx)),
+            None => {
+                dangling_section += 1;
+                None
+            }
+        });
+        let own_material = s.material.and_then(|fid| match material_index.get(&fid) {
+            Some(&idx) => Some(idx),
+            None => {
+                dangling_material += 1;
+                None
+            }
+        });
+        let material = own_material
+            .or_else(|| {
+                if s.has_material_attr {
+                    None
+                } else {
+                    s.section
+                        .and_then(|sfid| section_material.get(&sfid).copied())
+                }
+            })
+            .map(MaterialId);
+        match s.kind {
+            squid_n_core::model::SecondaryMemberKind::Joist => n_joists += 1,
+            squid_n_core::model::SecondaryMemberKind::Post => n_posts += 1,
+        }
+        model
+            .secondary_members
+            .push(squid_n_core::model::SecondaryMember {
+                kind: s.kind,
+                nodes: [NodeId(ni), NodeId(nj)],
+                section,
+                material,
+                name: s.name,
+            });
+    }
+
     if skipped_members > 0 {
         warnings.push(format!(
             "存在しない節点を参照する部材を {skipped_members} 件スキップしました"
@@ -1188,7 +1274,13 @@ pub fn import_stbridge_with_report(xml: &str) -> Result<(Model, ImportReport), S
 
     // スラブ（StbSlab）。境界節点を正規化し、断面参照から厚さを解決する。
     // 3 頂点未満・存在しない節点を含むスラブはスキップして報告する。
+    //
+    // ST-Bridge は床荷重（仕上げ・積載）を持たないため、厚さが分かるスラブには
+    // 自重（厚さ × γRC=24kN/m³。デッキ合成もコンクリート主体の近似）を固定荷重
+    // として自動設定する（DL・CMQ・地震用重量へスラブ自重が算入される出発点。
+    // 仕上げ・用途（積載）は荷重タブでの設定が必要。notes で通知する）。
     let mut skipped_slabs = 0u32;
+    let mut slab_self_weight_count = 0usize;
     for rs in raw_slabs {
         let mut boundary = Vec::with_capacity(rs.boundary.len());
         let mut resolved = true;
@@ -1208,12 +1300,22 @@ pub fn import_stbridge_with_report(xml: &str) -> Result<(Model, ImportReport), S
         let thickness = rs
             .section_fid
             .and_then(|fid| slab_sec_thickness.get(&fid).copied());
+        let loads = match thickness {
+            Some(t) if t > 0.0 => {
+                slab_self_weight_count += 1;
+                vec![squid_n_core::model::AreaLoad {
+                    kind: "自重(自動)".into(),
+                    value: t * squid_n_core::units::to_internal::unit_weight_kn_per_m3(24.0),
+                }]
+            }
+            _ => Vec::new(),
+        };
         let new_id = SlabId(model.slabs.len() as u32);
         model.slabs.push(Slab {
             id: new_id,
             boundary,
             joists: Vec::new(),
-            loads: Vec::new(),
+            loads,
             method: DistributionMethod::TriTrapezoid,
             kind: Default::default(),
             one_way: None,
@@ -1344,7 +1446,48 @@ pub fn import_stbridge_with_report(xml: &str) -> Result<(Model, ImportReport), S
         warnings.push(format!("未対応の要素をスキップしました: {list}"));
     }
 
-    Ok((model, ImportReport { warnings }))
+    // 支点の自動設定: ST-Bridge は境界条件（支点）を持たないため、支点が 1 つも
+    // 無いモデルは最下レベル（Z 最小、許容差 1mm）の節点をピン支点
+    // （並進固定・回転自由）に設定する（柱脚ピンの仮定＝基礎の回転拘束を
+    // 期待しない安全側の既定。解析可能な出発点にする）。
+    // 仮定した内容は notes で通知する。拘束を 1 つでも持つモデル（将来の方言
+    // 拡張等で取り込んだ場合）はそのまま尊重して何もしない。
+    let mut notes: Vec<String> = Vec::new();
+    if n_joists + n_posts > 0 {
+        notes.push(format!(
+            "小梁 {n_joists} 本・間柱 {n_posts} 本を二次部材として取り込みました\
+            （全体解析の対象外。床荷重・自重は大梁への集中荷重（CMQ）として伝達します）"
+        ));
+    }
+    if slab_self_weight_count > 0 {
+        notes.push(format!(
+            "スラブ {slab_self_weight_count} 枚に自重（厚さ×24kN/m³）を床荷重として設定しました\
+            （仕上げ荷重・用途（積載）は荷重タブで設定してください）"
+        ));
+    }
+    {
+        use squid_n_core::dof::Dof6Mask;
+        if !model.nodes.is_empty() && model.nodes.iter().all(|n| n.restraint == Dof6Mask::FREE) {
+            const BASE_LEVEL_TOL_MM: f64 = 1.0;
+            let z_min = model
+                .nodes
+                .iter()
+                .map(|n| n.coord[2])
+                .fold(f64::INFINITY, f64::min);
+            let mut fixed = 0usize;
+            for n in &mut model.nodes {
+                if (n.coord[2] - z_min).abs() <= BASE_LEVEL_TOL_MM {
+                    n.restraint = Dof6Mask::PINNED;
+                    fixed += 1;
+                }
+            }
+            notes.push(format!(
+                "支点情報が無いため、最下レベル（Z={z_min:.0} mm）の節点 {fixed} 箇所をピン支点に設定しました（モデルタブ→境界条件で変更できます）"
+            ));
+        }
+    }
+
+    Ok((model, ImportReport { warnings, notes }))
 }
 
 /// file id が一意であることを検証する（fail-loud）。要素数が重複排除後の
@@ -1571,6 +1714,34 @@ fn make_member(
         rotate,
         end_cond,
     })
+}
+
+/// 二次部材（小梁 `StbBeam`・間柱 `StbPost`）の中間表現を作る
+/// （[`make_member`] の二次部材版。端部接合条件・回転角は解析に使わないため持たない）。
+fn make_secondary(
+    a: &HashMap<String, String>,
+    n_i: u32,
+    n_j: u32,
+    kind: squid_n_core::model::SecondaryMemberKind,
+) -> PendingSecondary {
+    let section = match get_i64(a, "id_section") {
+        Some(s) if s >= 0 => Some(s as u32),
+        _ => None,
+    };
+    let has_material_attr = a.contains_key("id_material");
+    let material = match get_i64(a, "id_material") {
+        Some(m) if m >= 0 => Some(m as u32),
+        _ => None,
+    };
+    PendingSecondary {
+        kind,
+        n_i,
+        n_j,
+        section,
+        material,
+        has_material_attr,
+        name: a.get("name").cloned().unwrap_or_default(),
+    }
 }
 
 /// 部材端の接合条件属性（`FIX`/`PIN`）を [`EndCondition`] へ写す。既定・未知は `Fixed`。

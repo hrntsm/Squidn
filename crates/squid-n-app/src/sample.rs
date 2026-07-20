@@ -100,9 +100,9 @@ pub fn portal_frame() -> Model {
         });
     }
 
-    // 荷重ケース
+    // 荷重ケース（kind を設定し、地震用重量の重力ケース選択（kind 基準）に乗せる）
     model.load_cases.push(LoadCase {
-        kind: Default::default(),
+        kind: squid_n_core::model::LoadCaseKind::Dead,
         id: LoadCaseId(0),
         name: "長期".into(),
         nodal: Vec::new(),
@@ -118,7 +118,7 @@ pub fn portal_frame() -> Model {
         }],
     });
     model.load_cases.push(LoadCase {
-        kind: Default::default(),
+        kind: squid_n_core::model::LoadCaseKind::Seismic,
         id: LoadCaseId(1),
         name: "地震X".into(),
         nodal: vec![

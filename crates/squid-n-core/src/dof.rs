@@ -50,11 +50,48 @@ pub struct DofMap {
 
 impl DofMap {
     pub fn build(model: &Model) -> Self {
+        // 解析自由度を持つ節点 = 要素（部材）が接続する節点、または拘束
+        // （剛床・剛リンク・MPC）のマスター節点。どちらでもない節点
+        // （二次部材（小梁・間柱）の支持点・床境界専用の幾何節点など）は
+        // 剛性が一切組み上がらず零剛性の自由度＝特異行列の原因になるため、
+        // 全自由度を不活性にする（解析上は存在しない扱い。変位は 0 で出力され、
+        // そこへの節点荷重は無視される。荷重は同期側で主架構へ変換する規約）。
+        let mut structural = vec![false; model.nodes.len()];
+        for e in &model.elements {
+            for n in &e.nodes {
+                if let Some(slot) = structural.get_mut(n.index()) {
+                    *slot = true;
+                }
+            }
+        }
+        for c in &model.constraints {
+            use crate::model::Constraint;
+            match c {
+                Constraint::RigidDiaphragm { master, .. }
+                | Constraint::RigidLink { master, .. } => {
+                    if let Some(slot) = structural.get_mut(master.index()) {
+                        *slot = true;
+                    }
+                }
+                // MPC は `master` フィールドがスレーブ節点、`terms` がマスター側。
+                Constraint::Mpc { terms, .. } => {
+                    for (n, _, _) in terms {
+                        if let Some(slot) = structural.get_mut(n.index()) {
+                            *slot = true;
+                        }
+                    }
+                }
+            }
+        }
+
         let n_global = model.nodes.len() * DOF_PER_NODE;
         let mut active_of = vec![None; n_global];
         let mut global_of = Vec::new();
         let mut counter = 0u32;
         for (ni, node) in model.nodes.iter().enumerate() {
+            if !structural[ni] {
+                continue;
+            }
             for d in 0..DOF_PER_NODE {
                 let g = ni * DOF_PER_NODE + d;
                 let dof = match d {
@@ -103,14 +140,39 @@ mod tests {
             .enumerate()
             .map(|(i, &r)| Node {
                 id: NodeId(i as u32),
-                coord: [0.0; 3],
+                coord: [i as f64 * 1000.0, 0.0, 0.0],
                 restraint: r,
                 mass: None,
                 story: None,
             })
             .collect();
+        // 要素が接続しない節点は解析自由度から除外されるため、拘束マスキングの
+        // 検証用に全節点を鎖状の梁要素でつなぐ（1 節点のみの場合は自己参照でよい）。
+        let elements: Vec<ElementData> = (0..restraints.len().max(2) - 1)
+            .map(|i| ElementData {
+                id: ElemId(i as u32),
+                kind: ElementKind::Beam,
+                nodes: [
+                    NodeId(i as u32),
+                    NodeId(((i + 1) % restraints.len()) as u32),
+                ]
+                .into_iter()
+                .collect(),
+                section: None,
+                material: None,
+                local_axis: LocalAxis {
+                    ref_vector: [0.0, 0.0, 1.0],
+                },
+                end_cond: [EndCondition::Fixed, EndCondition::Fixed],
+                force_regime: ForceRegime::Auto,
+                rigid_zone: Default::default(),
+                plastic_zone: None,
+                spring: None,
+            })
+            .collect();
         Model {
             nodes,
+            elements,
             ..Default::default()
         }
     }
@@ -167,5 +229,32 @@ mod tests {
         let model = make_model_with_restraints(&[Dof6Mask::FREE, Dof6Mask::PINNED]);
         let map = DofMap::build(&model);
         assert_eq!(map.n_active(), 6 + 3);
+    }
+
+    /// 要素が接続しない節点（二次部材の支持点など）は解析自由度から除外される。
+    /// 拘束（剛床）のマスター節点は要素非接続でも自由度を持つ。
+    #[test]
+    fn test_unreferenced_node_is_inactive() {
+        let mut model = make_model_with_restraints(&[Dof6Mask::FREE, Dof6Mask::FREE]);
+        // 要素が接続しない自由節点を追加 → 自由度は増えない。
+        model.nodes.push(Node {
+            id: NodeId(2),
+            coord: [500.0, 0.0, 0.0],
+            restraint: Dof6Mask::FREE,
+            mass: None,
+            story: None,
+        });
+        let map = DofMap::build(&model);
+        assert_eq!(map.n_active(), 12, "孤立自由節点は自由度を持たない");
+        assert!(map.active(2 * DOF_PER_NODE).is_none());
+
+        // 剛床マスターに指定すると自由度を持つ（拘束されない DOF 分）。
+        model.constraints.push(Constraint::RigidDiaphragm {
+            story: StoryId(0),
+            master: NodeId(2),
+            slaves: vec![NodeId(0), NodeId(1)],
+        });
+        let map = DofMap::build(&model);
+        assert_eq!(map.n_active(), 18, "拘束マスターは自由度を持つ");
     }
 }
