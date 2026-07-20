@@ -2183,6 +2183,8 @@ impl App {
     /// これにより、小梁の点反力・大梁中間区間の部分分布荷重が主架構の大梁へ集約された
     /// 状態（大梁1本=部材荷重の集合）で描画でき、実部材化された小梁やスラブは
     /// 自然に描画対象から外れる（小梁・柱には `MemberLoad` が付かないため）。
+    /// 呼び出し元（ビューア）が gui フィーチャ限定のため、gui 無効時は dead_code になる。
+    #[cfg(feature = "gui")]
     pub(crate) fn cmq_display_member_loads(&self) -> Vec<squid_n_core::model::MemberLoad> {
         self.slab_load_case_content(&self.beam_loads).1
     }
