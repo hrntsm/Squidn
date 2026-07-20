@@ -1,5 +1,7 @@
 use crate::app::App;
 use crate::theme;
+
+mod viewcube;
 use squid_n_core::dof::{Dof, Dof6Mask};
 use squid_n_core::ids::SectionId;
 
@@ -161,6 +163,26 @@ impl CameraState {
     pub(crate) fn turntable_drag(&mut self, dx_px: f32, dy_px: f32) {
         self.yaw += dx_px * Self::ROT_SENS;
         self.pitch = (self.pitch + dy_px * Self::ROT_SENS).clamp(-std::f32::consts::PI, 0.0);
+        self.rot = Self::rot_from(self.yaw, self.pitch);
+    }
+
+    /// 視点方向 `d`（ワールド座標、原点から視点位置へ向かうベクトル）へ即時スナップする。
+    /// ViewCube の面・コーナークリックから呼ばれる。`d` が鉛直（真上/真下）の場合、
+    /// 旋回角は方位角から定まらないため 0 とし、X 軸が画面右を向く正対の平面ビューにする。
+    pub(crate) fn snap_to_direction(&mut self, d: [f32; 3]) {
+        let n = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
+        if n < 1e-6 {
+            return;
+        }
+        let (dx, dy, dz) = (d[0] / n, d[1] / n, d[2] / n);
+        // ターンテーブル rot = R_x(pitch)∘R_z(yaw) で q_rotate(rot, d) = [0,0,1]（視線正面）
+        // となる角度: yaw は方位角 φ=atan2(dy,dx) から、pitch は仰角から定まる。
+        self.yaw = if dx.abs() > 1e-6 || dy.abs() > 1e-6 {
+            -std::f32::consts::FRAC_PI_2 - dy.atan2(dx)
+        } else {
+            0.0
+        };
+        self.pitch = dz.clamp(-1.0, 1.0).asin() - std::f32::consts::FRAC_PI_2;
         self.rot = Self::rot_from(self.yaw, self.pitch);
     }
 }
@@ -339,7 +361,7 @@ fn draw_support_symbol(
     }
 }
 
-/// 支持条件シンボルの凡例をビュー右下に描く。
+/// 支持条件シンボルの凡例をビュー左下に描く。
 fn draw_support_legend(painter: &egui::Painter) {
     let rect = painter.clip_rect();
     let x0 = rect.min.x + 10.0;
@@ -661,6 +683,29 @@ pub fn viewer_panel(ui: &mut egui::Ui, app: &mut App) {
     }
     cam.zoom = cam.zoom.clamp(0.5, 10.0);
 
+    // ViewCube（右上）: 面クリック=標準ビュー / コーナークリック=アイソメへ即時スナップ。
+    // モデルより手前の固定 UI のため、当たり判定を部材ピックより先に行い、
+    // キューブ上のクリックはピック処理へ流さない。
+    let cube_layout = viewcube::Layout {
+        center: egui::pos2(rect.max.x - 55.0, rect.min.y + 55.0),
+        scale: 22.0,
+    };
+    let cube_hover = response
+        .hover_pos()
+        .and_then(|p| viewcube::hit_test(&cam, &cube_layout, p));
+    if cube_hover.is_some() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    let mut cube_clicked = false;
+    if response.clicked() {
+        if let Some(pos) = response.interact_pointer_pos() {
+            if let Some(hit) = viewcube::hit_test(&cam, &cube_layout, pos) {
+                cam.snap_to_direction(viewcube::hit_direction(hit));
+                cube_clicked = true;
+            }
+        }
+    }
+
     let painter = ui.painter_at(rect);
     // §3-2: 3D 背景は白を避け淡いグレー（立体感・奥行きのため）
     painter.rect_filled(rect, 0.0, theme::VIEW_BG);
@@ -748,8 +793,8 @@ pub fn viewer_panel(ui: &mut egui::Ui, app: &mut App) {
         })
         .collect();
 
-    // --- クリック処理 ---
-    if response.clicked() {
+    // --- クリック処理（ViewCube 上のクリックはスナップ済みのため除外） ---
+    if response.clicked() && !cube_clicked {
         if let Some(click_pos) = response.interact_pointer_pos() {
             if app.beam_draw_mode {
                 // 梁作成モード：クリック位置に最も近い節点を選ぶ
@@ -1024,7 +1069,9 @@ pub fn viewer_panel(ui: &mut egui::Ui, app: &mut App) {
         draw_support_legend(&painter);
     }
 
-    // 左下にカメラ追従の座標系アイコン（常に手前に表示）
+    // 右上に ViewCube、右下にカメラ追従の座標系アイコン（常に手前に表示。
+    // 左下は支持条件凡例が使うため、これらは右側へ配置する）
+    viewcube::draw(&painter, &cam, &cube_layout, cube_hover);
     draw_axis_gadget(&painter, &cam);
 
     // カメラ状態を保存
@@ -1466,14 +1513,15 @@ fn draw_grid_and_axes(
     );
 }
 
-/// ビューポート左下にカメラの向きへ追従する座標系アイコン（XYZ 軸ガジェット）を描く。
+/// ビューポート右下にカメラの向きへ追従する座標系アイコン（XYZ 軸ガジェット）を描く。
 ///
 /// CAD ソフトで一般的な、画面端に固定された小さな座標系。各軸をカメラの回転
 /// クォータニオンで投影し、Z（手前）成分でソートして奥から描くことで
 /// 手前の軸が上に重なる。軸色は 3D ビューと同一（赤=X / 緑=Y / 青=Z）。
+/// 左下は支持条件凡例、右上は ViewCube が使うため右下に置く。
 fn draw_axis_gadget(painter: &egui::Painter, cam: &CameraState) {
     let rect = painter.clip_rect();
-    let center = egui::pos2(rect.min.x + 40.0, rect.max.y - 40.0);
+    let center = egui::pos2(rect.max.x - 45.0, rect.max.y - 45.0);
     const LEN: f32 = 28.0;
 
     let axes: [([f32; 3], egui::Color32, &str); 3] = [
