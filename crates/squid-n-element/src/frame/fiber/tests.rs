@@ -987,13 +987,14 @@ fn test_fiber_rigid_rotation_produces_no_force() {
     }
 }
 
-/// 回帰テスト: 弾性状態の初期横剛性が Euler-Bernoulli 理論値と一致すること。
+/// 回帰テスト: 弾性状態の初期横剛性が Timoshenko 理論値と一致すること。
 /// かつての並列せん断ばね（GAs/L を並進 DOF へ直接加算）は片持ち先端剛性を
 /// 理論値の数十倍にしていた。本テストは i 端固定の片持ち縮約剛性
-/// k = 1/(L³/3EI)（先端モーメントフリー）を照合し、GAs/L オーダーの
-/// 過大剛性の再混入を検出する。
+/// k = 1/(L³/3EI + L/GAs)（先端モーメントフリー、曲げ＋せん断の直列）を
+/// 照合し、GAs/L オーダーの過大剛性の再混入と、せん断柔性の欠落
+/// （Euler 化 = 理論比 1+φ/... の過大）の両方を検出する。
 #[test]
-fn test_fiber_initial_lateral_stiffness_matches_euler_theory() {
+fn test_fiber_initial_lateral_stiffness_matches_timoshenko_theory() {
     let mut model = build_test_model(Some(78846.15));
     model.sections[0].as_y = 208333.0;
     model.sections[0].as_z = 208333.0;
@@ -1019,13 +1020,204 @@ fn test_fiber_initial_lateral_stiffness_matches_euler_theory() {
     let k_tip = (a * c - b * b) / c;
 
     let e = 205000.0;
+    let g = 78846.15;
     let l: f64 = 3000.0;
     let ei = e * 5.2083333e9;
-    let k_euler = 3.0 * ei / l.powi(3);
+    let gas = g * 208333.0;
+    let k_timo = 1.0 / (l.powi(3) / (3.0 * ei) + l / gas);
     // ファイバー離散化（12x20 格子の図心集中）による EI の僅かな目減り
     // （1−1/nd² ≈ 0.9975）を含めて 1% 以内で一致すること。
-    // 旧実装の並列せん断ばね混入時は k_tip ≈ GAs/L ≈ 46×k_euler となり大きく外れる。
-    approx::assert_relative_eq!(k_tip, k_euler, max_relative = 0.01);
+    // 旧実装の並列せん断ばね混入時は k_tip ≈ GAs/L ≈ 47×k_timo で大きく外れ、
+    // せん断柔性の欠落（Euler 化）時は約 +9% 外れる（いずれも許容 1% 超）。
+    approx::assert_relative_eq!(k_tip, k_timo, max_relative = 0.01);
+}
+
+/// 受け入れテスト（Timoshenko 適合内挿）: 弾性状態の 12×12 接線剛性が
+/// 弾性 Timoshenko 梁 `BeamElement` と厳密一致すること。
+/// **非対称断面**（幅 300×せい 600、as_y≠as_z）を用い、断面レイヤ→要素座標系の
+/// クロス変換（強軸 (uy,rz) ← 断面 iy・as_z / 弱軸 (uz,ry) ← 断面 iz・as_y）の
+/// 取り違えも検出する。
+/// ファイバー格子は面積を図心集中させるため EI が僅かに目減りする
+/// （格子回転後の要素座標系で、強軸 1−1/nd²、弱軸 1−1/nw²）。比較対象の
+/// BeamElement には格子の離散 EI と同じ値（要素座標系）を与え、離散化誤差と
+/// 定式化誤差を分離して定式化の厳密一致を検証する。許容値は max|K| を基準と
+/// した絶対許容 1e-9·max|K|（実測差は ~1e-16·max|K| で機械精度一致）。
+#[test]
+fn test_fiber_elastic_stiffness_matches_timoshenko_beam_element() {
+    let g = 78846.15;
+    let (b_w, d_h): (f64, f64) = (300.0, 600.0);
+    let (nw, nd) = (12.0, 20.0);
+    let area = b_w * d_h;
+    // 格子の離散断面二次モーメント（要素座標系。格子は 90° 回転され
+    // 要素 y=せい方向・z=幅方向となるため、強軸＝要素 z 軸まわり（∫y²dA）は
+    // せい方向分割 nd、弱軸＝要素 y 軸まわり（∫z²dA）は幅方向分割 nw が効く）
+    let iz_elem = b_w * d_h.powi(3) / 12.0 * (1.0 - 1.0 / (nd * nd)); // 強軸 (uy,rz)
+    let iy_elem = d_h * b_w.powi(3) / 12.0 * (1.0 - 1.0 / (nw * nw)); // 弱軸 (uz,ry)
+                                                                      // 要素座標系のせん断有効断面積（意図的に非対称）
+    let as_y_elem = 120000.0; // (uy,rz) 面
+    let as_z_elem = 80000.0; // (uz,ry) 面
+    let j = 1.0e6;
+
+    let mut model = build_test_model(Some(g));
+    model.sections[0].depth = d_h;
+    model.sections[0].width = b_w;
+    model.sections[0].area = area;
+    // 断面レイヤ諸元（クロス変換で要素座標系に対応: iy_sec→要素(uy,rz)、
+    // as_z_sec→要素(uy,rz)。BeamElement 側は要素座標系の値を直接持たせる）
+    model.sections[0].iy = iz_elem;
+    model.sections[0].iz = iy_elem;
+    model.sections[0].as_z = as_y_elem;
+    model.sections[0].as_y = as_z_elem;
+    model.sections[0].j = j;
+
+    let mut fiber = FiberBeam::new(&model.elements[0], &model);
+    let ctx = Ctx { model: &model };
+    let zero = LocalVec {
+        data: SmallVec::from_elem(0.0, 12),
+    };
+    fiber.update_state(&zero, false, &ctx);
+    let k_fb = fiber.tangent_stiffness(&ElemState::default(), &ctx);
+
+    let mut be = make_test_beam_element(as_y_elem);
+    be.a = area;
+    be.a_mass = area;
+    be.iy = iy_elem;
+    be.iz = iz_elem;
+    be.j = j;
+    be.as_y = as_y_elem;
+    be.as_z = as_z_elem;
+    let k_be = be.tangent_stiffness(&ElemState::default(), &ctx);
+
+    let kmax = (0..12)
+        .flat_map(|i| (0..12).map(move |j| (i, j)))
+        .map(|(i, j)| k_be.get(i, j).abs())
+        .fold(0.0_f64, f64::max);
+    for i in 0..12 {
+        for j in 0..12 {
+            let diff = (k_fb.get(i, j) - k_be.get(i, j)).abs();
+            assert!(
+                diff <= 1e-9 * kmax,
+                "K({i},{j}) が Timoshenko 梁と不一致: fiber={}, beam={}, 差={diff:.3e}",
+                k_fb.get(i, j),
+                k_be.get(i, j)
+            );
+        }
+    }
+}
+
+/// 500角・as_y/as_z 付き（φ>0）の断面パラメータをテストモデルへ設定する。
+fn set_square500_shear_section(model: &mut Model) {
+    model.sections[0].depth = 500.0;
+    model.sections[0].width = 500.0;
+    model.sections[0].area = 250000.0;
+    model.sections[0].iy = 5.2083333e9;
+    model.sections[0].iz = 5.2083333e9;
+    model.sections[0].as_y = 208333.0;
+    model.sections[0].as_z = 208333.0;
+}
+
+/// 塑性化域考慮モデルでも φ>0 の Timoshenko 適合内挿が機能すること:
+/// (1) 剛体回転で内力ゼロ（客観性）、(2) 接線と内力の FD 整合、
+/// (3) 片持ち先端剛性が Timoshenko 理論値の近傍にあること。
+/// 端部を 1 点端点則で積分するため厳密一致はせず（曲げ剛性が数%過大）、
+/// (3) は「理論値の 0.95〜1.15 倍」の帯で判定する（GAs/L 混入時は ~47 倍、
+/// せん断柔性欠落（Euler 化）時は 1+φ/4 ≈ 1.09 倍＋端点則の過大が乗るため
+/// 帯の上限は端点則ぶんを含む値とする）。
+#[test]
+fn test_plastic_zone_phi_positive_timoshenko_behavior() {
+    let mut model = build_test_model(Some(78846.15));
+    set_square500_shear_section(&mut model);
+    model.elements[0].plastic_zone = Some(250.0);
+    let ctx = Ctx { model: &model };
+    let state = ElemState::default();
+    let build = || FiberBeam::with_plastic_zone(&model.elements[0], &model, 250.0);
+
+    // (1) 剛体回転の客観性
+    let theta = 1.0e-4;
+    let l = 3000.0;
+    let mut fb = build();
+    let du = LocalVec {
+        data: SmallVec::from_slice(&[
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            theta,
+            0.0,
+            theta * l,
+            0.0,
+            0.0,
+            0.0,
+            theta,
+        ]),
+    };
+    fb.update_state(&du, false, &ctx);
+    let f = fb.internal_force(&state, &ctx);
+    for (i, v) in f.data.iter().enumerate() {
+        assert!(v.abs() < 1.0, "塑性化域+φ>0 で客観性違反: dof {i} = {v}");
+    }
+
+    // (2) FD 整合（弾性域の代表変形状態）
+    let h = 1e-6;
+    let u0: [f64; 12] = [
+        0.1, 0.2, -0.1, 0.0005, 0.001, -0.0005, -0.05, 0.15, 0.1, -0.0005, 0.0008, 0.0002,
+    ];
+    let mut b0 = build();
+    b0.update_state(
+        &LocalVec {
+            data: SmallVec::from_slice(&u0),
+        },
+        false,
+        &ctx,
+    );
+    let f0 = b0.internal_force(&state, &ctx);
+    let k = b0.tangent_stiffness(&state, &ctx);
+    let kmax = (0..12)
+        .flat_map(|i| (0..12).map(move |j| (i, j)))
+        .map(|(i, j)| k.get(i, j).abs())
+        .fold(0.0_f64, f64::max);
+    for j in 0..12 {
+        let mut up = u0;
+        up[j] += h;
+        let mut bp = build();
+        bp.update_state(
+            &LocalVec {
+                data: SmallVec::from_slice(&up),
+            },
+            false,
+            &ctx,
+        );
+        let fp = bp.internal_force(&state, &ctx);
+        for i in 0..12 {
+            let fd = (fp.data[i] - f0.data[i]) / h;
+            let err = (fd - k.get(i, j)).abs() / kmax;
+            assert!(
+                err < 1e-6,
+                "塑性化域+φ>0 で K≠∂f/∂u: ({i},{j}) 誤差={err:.3e}"
+            );
+        }
+    }
+
+    // (3) 片持ち先端剛性が Timoshenko 理論値の近傍（端点則の過大を許容）
+    let mut fb2 = build();
+    let zero = LocalVec {
+        data: SmallVec::from_elem(0.0, 12),
+    };
+    fb2.update_state(&zero, false, &ctx);
+    let k2 = fb2.tangent_stiffness(&state, &ctx);
+    let a = k2.get(7, 7);
+    let b = k2.get(7, 11);
+    let c = k2.get(11, 11);
+    let k_tip = (a * c - b * b) / c;
+    let ei = 205000.0 * 5.2083333e9;
+    let gas = 78846.15 * 208333.0;
+    let k_timo = 1.0 / (l.powi(3) / (3.0 * ei) + l / gas);
+    let ratio = k_tip / k_timo;
+    assert!(
+        (0.95..1.15).contains(&ratio),
+        "塑性化域+φ>0 の先端剛性が理論値帯を外れた: ratio={ratio}"
+    );
 }
 
 /// 整合性テスト: 接線剛性 K が内力 f_int の微分 ∂f/∂u と一致すること

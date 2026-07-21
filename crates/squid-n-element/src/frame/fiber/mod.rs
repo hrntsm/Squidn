@@ -193,10 +193,24 @@ impl GaussPoint {
     }
 }
 
-/// ファイバー梁要素（変位法、Euler-Bernoulli 曲げ＋Saint-Venant ねじり）。
+/// ファイバー梁要素（変位法、Timoshenko 適合内挿＋Saint-Venant ねじり）。
 ///
-/// せん断変形は現在モデル化していない（弾性 Timoshenko 梁比で
-/// φ = 12EI/(GAs·L²) だけ剛。既知の制約は calc_basis 4.9.2 を参照）。
+/// せん断変形は Timoshenko 適合内挿（φ 依存の曲率形状関数＋一定せん断ひずみ場
+/// による変位法内挿）で直列に合成する。
+/// 曲率場を 1/(1+φ) で補正し、曲げ面ごとの一定せん断ひずみ
+/// （γy・γz、符号規約は `compute_shear_stiffness` の doc 参照。剛体回転で
+/// 恒等的にゼロ）に弾性せん断剛性 GAs を作用させることで、断面剛性が φ の
+/// 算定基礎と一致する一様弾性断面では弾性 Timoshenko 梁（`BeamElement`）の
+/// 剛性と厳密に一致する。
+/// φ = 12EI/(GAs·L²) は**公称断面諸元**（Section.iy/iz・as_y/as_z と
+/// Material.young/shear_modulus）から算定して凍結する（降伏後も内挿は
+/// 弾性時の配分を保つ。曲げの Hermite 内挿と同型の近似）。凍結の方針は
+/// OpenSees と同じだが、OpenSees がファイバー断面の初期接線から算定するのに
+/// 対し、本実装は線形解析（`BeamElement`）の φ と一致させるため公称値を
+/// 用いる（RC 等でファイバー実効初期剛性が公称値と乖離する場合、φ は
+/// 公称値ベースの近似となる）。
+/// GAs ≤ 0（せん断有効断面積が未設定等）の場合は φ=0（せん断剛直 =
+/// Euler-Bernoulli）へフォールバックする。
 pub struct FiberBeam {
     pub length: f64,
     pub nodes: [NodeId; 2],
@@ -208,6 +222,17 @@ pub struct FiberBeam {
     /// せん断弾性係数 G [N/mm²]（Material.shear_modulus）。
     /// ねじり剛性の計算に用いる。
     pub g: f64,
+    /// せん断変形係数 φy（局所 y 並進－rz 回転＝強軸曲げ面）。クロス変換規約
+    /// （beam/construct.rs と同一）により断面 iy（強軸）・as_z（ウェブ）から
+    /// φy = 12E·iy_sec/(G·as_z_sec·L²) として算定して凍結。
+    /// GAs ≤ 0 なら 0（Euler フォールバック）。
+    pub phi_y: f64,
+    /// せん断変形係数 φz（局所 z 並進－ry 回転＝弱軸曲げ面）。クロス変換規約に
+    /// より断面 iz（弱軸）・as_y（フランジ）から φz = 12E·iz_sec/(G·as_y_sec·L²)。
+    pub phi_z: f64,
+    /// せん断ひずみ場の弾性剛性寄与（ローカル系 12×12、両曲げ面の
+    /// GAs·L·Bγᵀ·Bγ の和）。γ は一定場のため定数行列として前計算する。
+    pub k_shear: LocalMat,
     /// 要素ローカル系→グローバル系の回転（柱・斜材で必須）。
     /// 内部状態（trial_disp 等）はローカル系で保持し、トレイト境界で回転する。
     pub axis: crate::transform::LocalFrame,
@@ -241,6 +266,29 @@ impl FiberBeam {
         let depth = sec.map(|s| s.depth).unwrap_or(200.0);
         let torsion_j = sec.map(|s| s.j).unwrap_or(0.0);
 
+        // Timoshenko 適合内挿の φ（弾性断面諸元から算定して凍結）。
+        // 断面レイヤ→要素座標系のクロス変換（beam/construct.rs・ファイバ格子の
+        // 90°回転と同一規約）: (uy, rz) ブロック＝強軸曲げ（Mz 面）には
+        // 断面 iy（強軸）と as_z（ウェブ）、(uz, ry) ブロック＝弱軸曲げ（My 面）
+        // には 断面 iz（弱軸）と as_y（フランジ）を対応させる。
+        // GAs ≤ 0（未設定等）は φ=0（Euler フォールバック）。
+        let sec_iy = sec.map(|s| s.iy).unwrap_or(0.0);
+        let sec_iz = sec.map(|s| s.iz).unwrap_or(0.0);
+        let sec_as_y = sec.map(|s| s.as_y).unwrap_or(0.0);
+        let sec_as_z = sec.map(|s| s.as_z).unwrap_or(0.0);
+        let phi_of = |ei: f64, gas: f64| {
+            if gas > 0.0 && ei > 0.0 && length > 0.0 {
+                12.0 * ei / (gas * length * length)
+            } else {
+                0.0
+            }
+        };
+        // 要素 (uy,rz) 面 ← 断面 iy・as_z / 要素 (uz,ry) 面 ← 断面 iz・as_y
+        let phi_y = phi_of(e * sec_iy, g * sec_as_z);
+        let phi_z = phi_of(e * sec_iz, g * sec_as_y);
+        let k_shear =
+            Self::compute_shear_stiffness(length, phi_y, phi_z, g * sec_as_z, g * sec_as_y);
+
         let nw = 12;
         let nd = 20;
         let shape = sec.and_then(|s| s.shape.as_ref());
@@ -267,11 +315,62 @@ impl FiberBeam {
             density,
             torsion_j,
             g,
+            phi_y,
+            phi_z,
+            k_shear,
             axis,
             k_mid: None,
             committed_disp: [0.0; 12],
             trial_disp: [0.0; 12],
         }
+    }
+
+    /// せん断ひずみ場（一定）の弾性剛性 Σ GAs·L·Bγᵀ·Bγ を前計算する。
+    ///
+    /// γy = φy/(2(1+φy))·(rz_i + rz_j − 2(uy_j − uy_i)/L)（uy–rz 面）、
+    /// γz = φz/(2(1+φz))·(ry_i + ry_j + 2(uz_j − uz_i)/L)（uz–ry 面）。
+    /// いずれも剛体回転（回転角＝弦回転）で恒等的にゼロとなる客観的な測度。
+    /// φ 補正後の曲率剛性と合算すると一様弾性断面で Timoshenko 厳密剛性になる。
+    fn compute_shear_stiffness(l: f64, phi_y: f64, phi_z: f64, gas_y: f64, gas_z: f64) -> LocalMat {
+        let mut k = LocalMat::zeros(12);
+        if l <= 0.0 {
+            return k;
+        }
+        // (Bγ の非零成分, GAs) を面ごとに組み立てて GAs·L·Bγᵀ·Bγ を加算
+        let planes: [([(usize, f64); 4], f64); 2] = [
+            (
+                [
+                    (1, 2.0 * phi_y / (2.0 * (1.0 + phi_y) * l)),
+                    (7, -2.0 * phi_y / (2.0 * (1.0 + phi_y) * l)),
+                    (5, phi_y / (2.0 * (1.0 + phi_y))),
+                    (11, phi_y / (2.0 * (1.0 + phi_y))),
+                ],
+                gas_y,
+            ),
+            (
+                [
+                    (2, -2.0 * phi_z / (2.0 * (1.0 + phi_z) * l)),
+                    (8, 2.0 * phi_z / (2.0 * (1.0 + phi_z) * l)),
+                    (4, phi_z / (2.0 * (1.0 + phi_z))),
+                    (10, phi_z / (2.0 * (1.0 + phi_z))),
+                ],
+                gas_z,
+            ),
+        ];
+        for (bg, gas) in planes {
+            if gas <= 0.0 {
+                continue;
+            }
+            for &(i, bi) in &bg {
+                for &(j, bj) in &bg {
+                    let v = gas * l * bi * bj;
+                    if v != 0.0 {
+                        k.set(i, j, k.get(i, j) + v);
+                    }
+                }
+            }
+        }
+        k
     }
 
     /// 塑性化域考慮のファイバー要素（材端剛塑性ばねモデルと適合する
@@ -338,7 +437,7 @@ impl FiberBeam {
         for sgn in [-1.0, 1.0] {
             let xi = sgn * h / 3.0_f64.sqrt();
             let w_phys = h * l / 2.0;
-            let b = Self::compute_b_matrix(xi, l);
+            let b = Self::compute_b_matrix(xi, l, fb.phi_y, fb.phi_z);
             for i in 0..12 {
                 for j in 0..12 {
                     let mut val = 0.0;
@@ -390,20 +489,32 @@ impl FiberBeam {
         (force, stiff)
     }
 
-    fn compute_b_matrix(xi: f64, l: f64) -> [[f64; 12]; 3] {
+    /// ひずみ－変位行列（行 0: 軸ひずみ、行 1: κy、行 2: κz）。
+    ///
+    /// 曲率行は Timoshenko 適合内挿（φ 依存形状関数）: Euler-Bernoulli の
+    /// Hermite 曲率場に対し、回転 DOF の定数項を (1±3ξ) → (1±3ξ+φ) とし
+    /// 全体を 1/(1+φ) 倍する。φ=0 で従来の Hermite 曲率場へ厳密に退化する。
+    /// 一定せん断ひずみ場（`compute_shear_stiffness`）と合算すると、
+    /// 一様弾性断面で Timoshenko 厳密剛性を再現する（被積分関数は ξ の
+    /// 2 次のままなので 2 点 Gauss で厳密）。
+    fn compute_b_matrix(xi: f64, l: f64, phi_y: f64, phi_z: f64) -> [[f64; 12]; 3] {
         let inv_l = 1.0 / l;
         let inv_l2 = 1.0 / (l * l);
         let mut b = [[0.0; 12]; 3];
         b[0][0] = -inv_l;
         b[0][6] = inv_l;
-        b[1][2] = 6.0 * xi * inv_l2;
-        b[1][4] = (1.0 - 3.0 * xi) * inv_l;
-        b[1][8] = -6.0 * xi * inv_l2;
-        b[1][10] = -(1.0 + 3.0 * xi) * inv_l;
-        b[2][1] = -6.0 * xi * inv_l2;
-        b[2][5] = (1.0 - 3.0 * xi) * inv_l;
-        b[2][7] = 6.0 * xi * inv_l2;
-        b[2][11] = -(1.0 + 3.0 * xi) * inv_l;
+        // κy（uz–ry 面、φz）
+        let cz = 1.0 / (1.0 + phi_z);
+        b[1][2] = 6.0 * xi * inv_l2 * cz;
+        b[1][4] = (1.0 - 3.0 * xi + phi_z) * inv_l * cz;
+        b[1][8] = -6.0 * xi * inv_l2 * cz;
+        b[1][10] = -(1.0 + 3.0 * xi + phi_z) * inv_l * cz;
+        // κz（uy–rz 面、φy）
+        let cy = 1.0 / (1.0 + phi_y);
+        b[2][1] = -6.0 * xi * inv_l2 * cy;
+        b[2][5] = (1.0 - 3.0 * xi + phi_y) * inv_l * cy;
+        b[2][7] = 6.0 * xi * inv_l2 * cy;
+        b[2][11] = -(1.0 + 3.0 * xi + phi_y) * inv_l * cy;
         b
     }
 }
@@ -428,7 +539,7 @@ impl ElementBehavior for FiberBeam {
         for gp in &self.gauss_points {
             let (_, d) = Self::section_response_from_cache(gp);
             let w = gp.weight * half;
-            let b = Self::compute_b_matrix(gp.xi, l);
+            let b = Self::compute_b_matrix(gp.xi, l, self.phi_y, self.phi_z);
 
             for i in 0..12 {
                 for p in 0..3 {
@@ -460,6 +571,17 @@ impl ElementBehavior for FiberBeam {
             }
         }
 
+        // せん断ひずみ場（一定 γ、弾性 GAs）の剛性を加算。
+        // φ 補正済み曲率剛性との和で一様弾性断面の Timoshenko 厳密剛性になる。
+        for i in 0..12 {
+            for j in 0..12 {
+                let v = self.k_shear.get(i, j);
+                if v != 0.0 {
+                    k.set(i, j, k.get(i, j) + v);
+                }
+            }
+        }
+
         // ねじり剛性（Saint-Venant）を rx DOF (index 3, 9) に付加
         if self.torsion_j > 0.0 && l > 0.0 {
             let kt = self.g * self.torsion_j / l;
@@ -486,7 +608,7 @@ impl ElementBehavior for FiberBeam {
         for gp in &self.gauss_points {
             let (force, _) = Self::section_response_from_cache(gp);
             let w = gp.weight * half;
-            let b = Self::compute_b_matrix(gp.xi, l);
+            let b = Self::compute_b_matrix(gp.xi, l, self.phi_y, self.phi_z);
             let n = force[0];
             let my = force[1];
             let mz = force[2];
@@ -506,6 +628,16 @@ impl ElementBehavior for FiberBeam {
                 }
                 f.data[i] += si;
             }
+        }
+
+        // せん断ひずみ場の内力（線形弾性: K_shear·u。γ は剛体運動でゼロの
+        // 客観的測度なので、trial 変位との積で偽内力は生じない）
+        for i in 0..12 {
+            let mut si = 0.0;
+            for j in 0..12 {
+                si += self.k_shear.get(i, j) * self.trial_disp[j];
+            }
+            f.data[i] += si;
         }
 
         // ねじり内力（Saint-Venant）
@@ -538,7 +670,7 @@ impl ElementBehavior for FiberBeam {
         }
 
         for gp in &mut self.gauss_points {
-            let b = Self::compute_b_matrix(gp.xi, l);
+            let b = Self::compute_b_matrix(gp.xi, l, self.phi_y, self.phi_z);
             let eps0 = b[0][0] * self.trial_disp[0] + b[0][6] * self.trial_disp[6];
             let ky = b[1][2] * self.trial_disp[2]
                 + b[1][4] * self.trial_disp[4]
@@ -747,7 +879,7 @@ impl ElementBehavior for FiberBeam {
         // 曲率が最大のガウス点（危険断面）を選ぶ。
         let mut best: Option<(f64, usize, f64, f64, f64)> = None; // (|κ|, idx, eps0, ky, kz)
         for (gi, gp) in self.gauss_points.iter().enumerate() {
-            let b = Self::compute_b_matrix(gp.xi, l);
+            let b = Self::compute_b_matrix(gp.xi, l, self.phi_y, self.phi_z);
             let eps0 = b[0][0] * td[0] + b[0][6] * td[6];
             let ky = b[1][2] * td[2] + b[1][4] * td[4] + b[1][8] * td[8] + b[1][10] * td[10];
             let kz = b[2][1] * td[1] + b[2][5] * td[5] + b[2][7] * td[7] + b[2][11] * td[11];

@@ -224,6 +224,87 @@ mod tests {
         assert!(zs.len() >= 2, "バネはせい方向にも分布する");
     }
 
+    /// MS 要素でも φ>0（G>0・as>0）の Timoshenko 適合内挿が機能すること:
+    /// 剛体回転で内力ゼロ（客観性）と、接線と内力の FD 整合を検証する。
+    /// 実体は FiberBeam への委譲だが、「委譲により同一定式化に乗る」ことを
+    /// MS 経由でも回帰テストとして固定する。
+    #[test]
+    fn test_ms_phi_positive_objectivity_and_tangent_consistency() {
+        let mut model = make_model(Some(295.0), None);
+        // shear: Some(0.0) → None にして G = E/(2(1+ν)) > 0（φ>0）にする
+        model.materials[0].shear = None;
+        let ctx = Ctx { model: &model };
+        let state = ElemState::default();
+        let build = || MultiSpringElement::new(&model.elements[0], &model);
+
+        // φ>0 になっていること（前提の自己検証）
+        assert!(build().inner.phi_y > 0.0 && build().inner.phi_z > 0.0);
+
+        // 剛体回転の客観性
+        let theta = 1.0e-4;
+        let l = 3000.0;
+        let mut ms = build();
+        let du = LocalVec {
+            data: smallvec::smallvec![
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                theta,
+                0.0,
+                theta * l,
+                0.0,
+                0.0,
+                0.0,
+                theta
+            ],
+        };
+        ms.update_state(&du, false, &ctx);
+        let f = ms.internal_force(&state, &ctx);
+        for (i, v) in f.data.iter().enumerate() {
+            assert!(v.abs() < 1.0, "MS+φ>0 で客観性違反: dof {i} = {v}");
+        }
+
+        // FD 整合（弾性域の代表変形状態）
+        let h = 1e-6;
+        let u0: [f64; 12] = [
+            0.1, 0.2, -0.1, 0.0005, 0.001, -0.0005, -0.05, 0.15, 0.1, -0.0005, 0.0008, 0.0002,
+        ];
+        let mut b0 = build();
+        b0.update_state(
+            &LocalVec {
+                data: SmallVec::from_slice(&u0),
+            },
+            false,
+            &ctx,
+        );
+        let f0 = b0.internal_force(&state, &ctx);
+        let k = b0.tangent_stiffness(&state, &ctx);
+        let kmax = (0..12)
+            .flat_map(|i| (0..12).map(move |j| (i, j)))
+            .map(|(i, j)| k.get(i, j).abs())
+            .fold(0.0_f64, f64::max);
+        for j in 0..12 {
+            let mut up = u0;
+            up[j] += h;
+            let mut bp = build();
+            bp.update_state(
+                &LocalVec {
+                    data: SmallVec::from_slice(&up),
+                },
+                false,
+                &ctx,
+            );
+            let fp = bp.internal_force(&state, &ctx);
+            for i in 0..12 {
+                let fd = (fp.data[i] - f0.data[i]) / h;
+                let err = (fd - k.get(i, j)).abs() / kmax;
+                assert!(err < 1e-6, "MS+φ>0 で K≠∂f/∂u: ({i},{j}) 誤差={err:.3e}");
+            }
+        }
+    }
+
     #[test]
     fn test_ms_axial_force_reduces_moment_capacity() {
         // N-M 相関: 軸圧縮を与えた状態では端部モーメントの頭打ちが下がる
