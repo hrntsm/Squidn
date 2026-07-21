@@ -277,7 +277,8 @@ impl Default for AnalysisSettings {
             seismic_dir: SeismicDir::X,
             // 既定は略算周期 T = h(0.02+0.01α)（令88条・昭55建告1793号）。
             // 固有値解析を要しないため、地震荷重の同期が暗黙の解析を伴わない。
-            // 精算（SemiPrecise）は固有値解析の明示実行を前提とするオプトイン。
+            // 精算（SemiPrecise）は固有値解析の明示実行を前提とするオプトインで、
+            // 必要な場合に UI（解析タブ「T算定」）で選択する。
             ai_mode: AiMode::Approx,
             z: 1.0,
             soil: squid_n_load::ai::SoilClass::II,

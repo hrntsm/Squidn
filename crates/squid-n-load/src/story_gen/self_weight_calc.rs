@@ -6,8 +6,53 @@
 //! - [`finish_perimeter`] — 仕上げ周長 φ
 //! - [`wall_clear_area_factor`] — 耐震壁の内法係数
 
+use std::collections::HashMap;
+
 use super::geom::{dist3, is_vertical_pair, polygon_area_3d};
 use super::*;
+
+/// 節点対の順不同キー（`(min,max)`）。`node_adjacency`/`beam_pair_map` で
+/// ノード順に依存しない同じキーを使うための共通ヘルパー。
+fn ordered_pair(a: NodeId, b: NodeId) -> (NodeId, NodeId) {
+    if a.0 <= b.0 {
+        (a, b)
+    } else {
+        (b, a)
+    }
+}
+
+/// 節点 → その節点に取り付く線材（`Beam`/`Brace`、2 節点以上）の `model.elements`
+/// 添字一覧。`has_column_below`/`max_depth`（柱脚に接続する部材の探索）を
+/// O(柱数×要素数) から O(1) 参照へ落とすための事前索引（`enumerate_self_weight`
+/// の主ループ前に 1 回だけ構築する）。
+fn node_adjacency(model: &Model) -> HashMap<NodeId, Vec<usize>> {
+    let mut adj: HashMap<NodeId, Vec<usize>> = HashMap::new();
+    for (idx, e) in model.elements.iter().enumerate() {
+        if matches!(e.kind, ElementKind::Beam | ElementKind::Brace { .. }) && e.nodes.len() >= 2 {
+            for &n in &e.nodes {
+                adj.entry(n).or_default().push(idx);
+            }
+        }
+    }
+    adj
+}
+
+/// 節点対 (min,max)（辺の両端。線材が3節点以上でも先頭・末尾を辺とみなす。
+/// `wall_clear_area_factor` の元の照合と同じ）→ `Beam` 要素の `model.elements`
+/// 添字。壁の各辺→柱梁対応付けを O(壁の辺数×要素数) から O(1) 参照へ落とすための
+/// 事前索引（`enumerate_self_weight` で1回構築し使い回す）。同一節点対に複数の
+/// 候補がある場合は要素順で最初に見つかったものを採用する（元の
+/// `elements.iter().find` の挙動を保つため `entry().or_insert` を使う）。
+fn beam_pair_map(model: &Model) -> HashMap<(NodeId, NodeId), usize> {
+    let mut map = HashMap::new();
+    for (idx, e) in model.elements.iter().enumerate() {
+        if e.kind == ElementKind::Beam && e.nodes.len() >= 2 {
+            let (a, b) = (e.nodes[0], e.nodes[e.nodes.len() - 1]);
+            map.entry(ordered_pair(a, b)).or_insert(idx);
+        }
+    }
+    map
+}
 
 /// 鋼材単位体積重量（γs=77kN/m³、実務慣用値）を内部単位系の質量密度
 /// [ton/mm³] に換算した値（≈7.85e-9）。ダンパー支持部重量（§ダンパー自重）に用いる。
@@ -85,6 +130,11 @@ pub(crate) enum SelfWeightItem {
 ///   自重を考慮しない部材に相当する）。
 pub(crate) fn enumerate_self_weight(model: &Model, load_cfg: &LoadCfg) -> Vec<SelfWeightItem> {
     let mut items = Vec::new();
+    // 柱脚探索（`has_column_below`/`max_depth`）・壁の辺→柱梁対応付け
+    // （`wall_clear_area_factor`）を要素数分の走査から索引参照へ落とすため、
+    // 主ループの前に 1 回だけ構築する（性能。走査順・判定条件は変更しない）。
+    let node_adj = node_adjacency(model);
+    let beam_pairs = beam_pair_map(model);
     for (elem_idx, elem) in model.elements.iter().enumerate() {
         // ダンパー自重（§ダンパー自重）: 対象部材は断面からの自重計算をスキップし、
         // 装置重量＋支持部断面積×(節点間距離−装置長さ)×鋼材単位体積重量で置き換える。
@@ -135,33 +185,31 @@ pub(crate) fn enumerate_self_weight(model: &Model, load_cfg: &LoadCfg) -> Vec<Se
                     let bottom_local = if ci[2] <= cj[2] { 0 } else { 1 };
                     let bottom_id = elem.nodes[bottom_local];
                     let bottom_z = model.nodes[bottom_id.index()].coord[2];
-                    let has_column_below = model.elements.iter().any(|e2| {
-                        e2.id != elem.id
-                            && matches!(e2.kind, ElementKind::Beam | ElementKind::Brace { .. })
-                            && e2.nodes.len() >= 2
-                            && e2.nodes.contains(&bottom_id)
-                            && {
-                                let (a, b) = (
-                                    model.nodes[e2.nodes[0].index()].coord,
-                                    model.nodes[e2.nodes[1].index()].coord,
-                                );
-                                is_vertical_pair(a, b) && {
-                                    let other = if e2.nodes[0] == bottom_id { b } else { a };
-                                    other[2] < bottom_z - LEVEL_TOL_MM
-                                }
+                    let adj_at_bottom = node_adj
+                        .get(&bottom_id)
+                        .map(|v| v.as_slice())
+                        .unwrap_or(&[]);
+                    let has_column_below = adj_at_bottom.iter().any(|&idx| {
+                        let e2 = &model.elements[idx];
+                        e2.id != elem.id && {
+                            let (a, b) = (
+                                model.nodes[e2.nodes[0].index()].coord,
+                                model.nodes[e2.nodes[1].index()].coord,
+                            );
+                            is_vertical_pair(a, b) && {
+                                let other = if e2.nodes[0] == bottom_id { b } else { a };
+                                other[2] < bottom_z - LEVEL_TOL_MM
                             }
+                        }
                     });
                     if !has_column_below {
-                        let max_depth = model
-                            .elements
+                        let max_depth = adj_at_bottom
                             .iter()
-                            .filter(|e2| {
-                                e2.kind == ElementKind::Beam
-                                    && e2.id != elem.id
-                                    && e2.nodes.len() >= 2
-                                    && e2.nodes.contains(&bottom_id)
-                            })
-                            .filter_map(|e2| {
+                            .filter_map(|&idx| {
+                                let e2 = &model.elements[idx];
+                                if e2.kind != ElementKind::Beam || e2.id == elem.id {
+                                    return None;
+                                }
                                 let (a, b) = (
                                     model.nodes[e2.nodes[0].index()].coord,
                                     model.nodes[e2.nodes[1].index()].coord,
@@ -226,7 +274,8 @@ pub(crate) fn enumerate_self_weight(model: &Model, load_cfg: &LoadCfg) -> Vec<Se
                     .map(|n| model.nodes[n.index()].coord)
                     .collect();
                 // §壁自重: 耐震壁は周辺柱梁の内法寸法で面積を評価する。
-                let area = polygon_area_3d(&pts) * wall_clear_area_factor(model, elem, &pts);
+                let area =
+                    polygon_area_3d(&pts) * wall_clear_area_factor(model, elem, &pts, &beam_pairs);
 
                 // §壁自重: 開口控除・開口重量。三方スリットは全量を最上位標高の頂点へ。
                 let attr = model.wall_attrs.iter().find(|a| a.elem == elem.id);
@@ -305,7 +354,15 @@ pub(crate) fn enumerate_self_weight(model: &Model, load_cfg: &LoadCfg) -> Vec<Se
 ///
 /// ハンチ・セットバック等で柱梁が斜めの場合の個別考慮は行わない。控除相手の
 /// 部材が見つからない辺は控除なし（芯々のまま＝保守側）。
-fn wall_clear_area_factor(model: &Model, elem: &ElementData, pts: &[[f64; 3]]) -> f64 {
+///
+/// `beam_pairs` は `beam_pair_map` が返す節点対→`Beam` 要素添字の索引（呼び出し側
+/// `enumerate_self_weight` が壁ループの前に 1 回だけ構築したものを使い回す）。
+fn wall_clear_area_factor(
+    model: &Model,
+    elem: &ElementData,
+    pts: &[[f64; 3]],
+    beam_pairs: &HashMap<(NodeId, NodeId), usize>,
+) -> f64 {
     if elem.kind != ElementKind::Wall || elem.nodes.len() != 4 || pts.len() != 4 {
         return 1.0;
     }
@@ -326,16 +383,9 @@ fn wall_clear_area_factor(model: &Model, elem: &ElementData, pts: &[[f64; 3]]) -
             continue;
         }
         // 辺の節点対に一致する線材（柱・梁）の断面。
-        let member_sec = model
-            .elements
-            .iter()
-            .find(|e| {
-                e.kind == ElementKind::Beam && e.nodes.len() >= 2 && {
-                    let (m0, m1) = (e.nodes[0], e.nodes[e.nodes.len() - 1]);
-                    (m0 == a && m1 == b) || (m0 == b && m1 == a)
-                }
-            })
-            .and_then(|e| e.section)
+        let member_sec = beam_pairs
+            .get(&ordered_pair(a, b))
+            .and_then(|&idx| model.elements[idx].section)
             .and_then(|sid| model.sections.get(sid.index()));
         if dz > dh {
             // 鉛直辺 = 側柱候補

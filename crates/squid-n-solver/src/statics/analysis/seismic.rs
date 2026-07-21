@@ -248,6 +248,11 @@ impl Analysis<'_> {
                 Ok(squid_n_load::ai::approx_t(height_m, steel_ratio))
             }
             AiMode::SemiPrecise => {
+                // 固有周期は載荷方向に依存しないため、同一 Analysis 上での
+                // 2 回目以降（EX→EY 等）はキャッシュを返し固有値解析を省く。
+                if let Some(&t) = self.semi_precise_t.get() {
+                    return Ok(t);
+                }
                 let modal = eigen::solve_eigen_with_solver(
                     self.model,
                     &self.dofmap,
@@ -255,7 +260,9 @@ impl Analysis<'_> {
                     1,
                     &*self.solver,
                 )?;
-                Ok(modal.period.first().copied().unwrap_or(0.3))
+                let t = modal.period.first().copied().unwrap_or(0.3);
+                let _ = self.semi_precise_t.set(t);
+                Ok(t)
             }
         }
     }

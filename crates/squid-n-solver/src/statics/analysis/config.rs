@@ -33,6 +33,7 @@ impl Default for SeismicCfg {
     fn default() -> Self {
         Self {
             dir: SeismicDir::X,
+            // 既定は略算 T（告示式）。固有値 T は呼び出し側が明示的に指定する。
             mode: AiMode::Approx,
             z: 1.0,
             soil: squid_n_load::ai::SoilClass::II,

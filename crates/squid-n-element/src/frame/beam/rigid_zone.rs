@@ -69,21 +69,90 @@ fn member_kind(model: &Model, e: &squid_n_core::model::ElementData) -> MemberKin
     MemberKind::RcSrc
 }
 
-pub fn auto_rigid_zones(
-    model: &squid_n_core::model::Model,
-    elem_id: squid_n_core::ids::ElemId,
-    rule: &RigidZoneRule,
-) -> RigidZone {
-    let elem = match model.elements.iter().find(|e| e.id == elem_id) {
-        Some(e) => e,
-        None => {
-            return RigidZone {
-                reduction: rule.reduction,
-                ..Default::default()
+/// 節点 → 接続 Beam 要素のマップ（直交せい探索の対象は柱・梁＝Beam 要素のみ。
+/// 耐震壁・シェル等が混入すると「耐震壁周辺の柱・梁の剛域は考慮しません」
+/// という方針に反し、壁の名目せい等が誤って直交材に紛れ込む）。
+fn beam_adjacency(model: &Model) -> std::collections::HashMap<usize, Vec<usize>> {
+    let mut node_to_elems: std::collections::HashMap<usize, Vec<usize>> =
+        std::collections::HashMap::new();
+    for (ei, e) in model.elements.iter().enumerate() {
+        if e.nodes.len() >= 2 && matches!(e.kind, squid_n_core::model::ElementKind::Beam) {
+            for n in &e.nodes {
+                node_to_elems.entry(n.index()).or_default().push(ei);
             }
         }
-    };
+    }
+    node_to_elems
+}
 
+fn elem_axis(model: &Model, e: &squid_n_core::model::ElementData) -> [f64; 3] {
+    if e.nodes.len() < 2 {
+        return [0.0, 0.0, 0.0];
+    }
+    let p0 = model.nodes[e.nodes[0].index()].coord;
+    let p1 = model.nodes[e.nodes[1].index()].coord;
+    let dx = p1[0] - p0[0];
+    let dy = p1[1] - p0[1];
+    let dz = p1[2] - p0[2];
+    let l = (dx * dx + dy * dy + dz * dz).sqrt();
+    if l < 1e-12 {
+        [0.0, 0.0, 0.0]
+    } else {
+        [dx / l, dy / l, dz / l]
+    }
+}
+
+/// `only_rc_src` を true にすると、RC/SRC 系の直交 Beam 要素だけを対象に最大せいを探す
+/// （剛域長 λ 用。仕口部に接続する柱(梁)がすべてＳの場合、剛域長さは0
+/// ＝ S 系直交材は無視することで自然に d_max=0 となる）。false なら種別を問わず全直交
+/// Beam 要素が対象（危険断面位置 face 用。§6.2.3 は幾何量であり種別を区別しない）。
+fn max_orth_depth(
+    model: &Model,
+    node_idx: usize,
+    target_axis: [f64; 3],
+    target_elem_idx: usize,
+    node_to_elems: &std::collections::HashMap<usize, Vec<usize>>,
+    only_rc_src: bool,
+) -> f64 {
+    let mut d_max = 0.0;
+    if let Some(elems) = node_to_elems.get(&node_idx) {
+        for &ei in elems {
+            if ei == target_elem_idx {
+                continue;
+            }
+            let e = &model.elements[ei];
+            if e.nodes.len() < 2 {
+                continue;
+            }
+            if only_rc_src && member_kind(model, e) != MemberKind::RcSrc {
+                continue;
+            }
+            let axis = elem_axis(model, e);
+            let dot =
+                (axis[0] * target_axis[0] + axis[1] * target_axis[1] + axis[2] * target_axis[2])
+                    .abs();
+            if dot < 0.707 {
+                // 概ね直交（45°以上）
+                if let Some(sec) = e.section.and_then(|sid| model.sections.get(sid.index())) {
+                    if sec.depth > d_max {
+                        d_max = sec.depth;
+                    }
+                }
+            }
+        }
+    }
+    d_max
+}
+
+/// 剛域算定の本体（隣接マップは呼び出し側が構築して共有する）。
+/// `target_elem_idx` は `model.elements` 内の対象要素の添字。
+fn rigid_zone_with_adjacency(
+    model: &Model,
+    target_elem_idx: usize,
+    node_to_elems: &std::collections::HashMap<usize, Vec<usize>>,
+    rule: &RigidZoneRule,
+) -> RigidZone {
+    let elem = &model.elements[target_elem_idx];
     let nodes = &elem.nodes;
     if nodes.len() < 2 {
         return RigidZone {
@@ -95,85 +164,7 @@ pub fn auto_rigid_zones(
     let self_sec = elem.section.and_then(|sid| model.sections.get(sid.index()));
     let d_self = self_sec.map(|s| s.depth).unwrap_or(0.0);
 
-    // 節点 → 接続要素のマップ（直交せい探索の対象は柱・梁＝Beam 要素のみ。
-    // 耐震壁・シェル等が混入すると「耐震壁周辺の柱・梁の剛域は考慮しません」
-    // という方針に反し、壁の名目せい等が誤って直交材に紛れ込む）。
-    let mut node_to_elems: std::collections::HashMap<usize, Vec<usize>> =
-        std::collections::HashMap::new();
-    for (ei, e) in model.elements.iter().enumerate() {
-        if e.nodes.len() >= 2 && matches!(e.kind, squid_n_core::model::ElementKind::Beam) {
-            for n in &e.nodes {
-                node_to_elems.entry(n.index()).or_default().push(ei);
-            }
-        }
-    }
-
-    fn elem_axis(model: &Model, e: &squid_n_core::model::ElementData) -> [f64; 3] {
-        if e.nodes.len() < 2 {
-            return [0.0, 0.0, 0.0];
-        }
-        let p0 = model.nodes[e.nodes[0].index()].coord;
-        let p1 = model.nodes[e.nodes[1].index()].coord;
-        let dx = p1[0] - p0[0];
-        let dy = p1[1] - p0[1];
-        let dz = p1[2] - p0[2];
-        let l = (dx * dx + dy * dy + dz * dz).sqrt();
-        if l < 1e-12 {
-            [0.0, 0.0, 0.0]
-        } else {
-            [dx / l, dy / l, dz / l]
-        }
-    }
-
-    // `only_rc_src` を true にすると、RC/SRC 系の直交 Beam 要素だけを対象に最大せいを探す
-    // （剛域長 λ 用。仕口部に接続する柱(梁)がすべてＳの場合、剛域長さは0
-    // ＝ S 系直交材は無視することで自然に d_max=0 となる）。false なら種別を問わず全直交
-    // Beam 要素が対象（危険断面位置 face 用。§6.2.3 は幾何量であり種別を区別しない）。
-    fn max_orth_depth(
-        model: &Model,
-        node_idx: usize,
-        target_axis: [f64; 3],
-        target_elem_idx: usize,
-        node_to_elems: &std::collections::HashMap<usize, Vec<usize>>,
-        only_rc_src: bool,
-    ) -> f64 {
-        let mut d_max = 0.0;
-        if let Some(elems) = node_to_elems.get(&node_idx) {
-            for &ei in elems {
-                if ei == target_elem_idx {
-                    continue;
-                }
-                let e = &model.elements[ei];
-                if e.nodes.len() < 2 {
-                    continue;
-                }
-                if only_rc_src && member_kind(model, e) != MemberKind::RcSrc {
-                    continue;
-                }
-                let axis = elem_axis(model, e);
-                let dot = (axis[0] * target_axis[0]
-                    + axis[1] * target_axis[1]
-                    + axis[2] * target_axis[2])
-                    .abs();
-                if dot < 0.707 {
-                    // 概ね直交（45°以上）
-                    if let Some(sec) = e.section.and_then(|sid| model.sections.get(sid.index())) {
-                        if sec.depth > d_max {
-                            d_max = sec.depth;
-                        }
-                    }
-                }
-            }
-        }
-        d_max
-    }
-
     let target_axis = elem_axis(model, elem);
-    let target_elem_idx = model
-        .elements
-        .iter()
-        .position(|e| e.id == elem_id)
-        .unwrap_or(0);
 
     // face 用: 種別を問わない直交 Beam 要素の最大せい（従来どおりの幾何量）。
     let d_orth_face_i = max_orth_depth(
@@ -181,7 +172,7 @@ pub fn auto_rigid_zones(
         nodes[0].index(),
         target_axis,
         target_elem_idx,
-        &node_to_elems,
+        node_to_elems,
         false,
     );
     let d_orth_face_j = max_orth_depth(
@@ -189,7 +180,7 @@ pub fn auto_rigid_zones(
         nodes[nodes.len() - 1].index(),
         target_axis,
         target_elem_idx,
-        &node_to_elems,
+        node_to_elems,
         false,
     );
     // λ 用: RC/SRC 系の直交 Beam 要素だけの最大せい。
@@ -198,7 +189,7 @@ pub fn auto_rigid_zones(
         nodes[0].index(),
         target_axis,
         target_elem_idx,
-        &node_to_elems,
+        node_to_elems,
         true,
     );
     let d_orth_rc_j = max_orth_depth(
@@ -206,7 +197,7 @@ pub fn auto_rigid_zones(
         nodes[nodes.len() - 1].index(),
         target_axis,
         target_elem_idx,
-        &node_to_elems,
+        node_to_elems,
         true,
     );
 
@@ -246,6 +237,24 @@ pub fn auto_rigid_zones(
     }
 }
 
+/// 単一要素の剛域を算定する（テスト・単発利用向け）。
+/// 内部で隣接マップを構築するため O(E)。全要素へ適用する場合は
+/// [`apply_auto_rigid_zones`]（隣接マップを 1 回だけ構築して共有）を使うこと。
+pub fn auto_rigid_zones(
+    model: &squid_n_core::model::Model,
+    elem_id: squid_n_core::ids::ElemId,
+    rule: &RigidZoneRule,
+) -> RigidZone {
+    let Some(target_elem_idx) = model.elements.iter().position(|e| e.id == elem_id) else {
+        return RigidZone {
+            reduction: rule.reduction,
+            ..Default::default()
+        };
+    };
+    let node_to_elems = beam_adjacency(model);
+    rigid_zone_with_adjacency(model, target_elem_idx, &node_to_elems, rule)
+}
+
 pub fn recompute_auto_zones(zone: &mut RigidZone, recomputed: &RigidZone) {
     if matches!(zone.source_i, ZoneSource::Auto) {
         zone.length_i = recomputed.length_i;
@@ -266,17 +275,16 @@ pub fn recompute_auto_zones(zone: &mut RigidZone, recomputed: &RigidZone) {
 /// 解析前に1回呼ぶことで剛域が組立に反映される（既定では剛域長 0 のまま
 /// ＝呼ばなければ従来挙動。明示的に有効化する設計）。
 ///
-/// `auto_rigid_zones` を要素ごとに呼ぶと隣接マップ構築が O(E²) になるため、
-/// ここでは梁要素の集合に対し各端の剛域を算定して一括反映する。
+/// 隣接マップ（節点 → 接続 Beam 要素）を 1 回だけ構築して全要素で共有するため
+/// O(E)（辺数比例）で完了する。
 pub fn apply_auto_rigid_zones(model: &mut Model, rule: &RigidZoneRule) {
-    // 要素 id ごとに算定（auto_rigid_zones は内部で隣接を構築するが、
-    // 呼び出しは「解析前1回」を想定。大規模最適化は将来）。
+    let node_to_elems = beam_adjacency(model);
     let recomputed: Vec<(usize, RigidZone)> = model
         .elements
         .iter()
         .enumerate()
         .filter(|(_, e)| matches!(e.kind, squid_n_core::model::ElementKind::Beam))
-        .map(|(i, e)| (i, auto_rigid_zones(model, e.id, rule)))
+        .map(|(i, _)| (i, rigid_zone_with_adjacency(model, i, &node_to_elems, rule)))
         .collect();
 
     for (i, rz) in recomputed {

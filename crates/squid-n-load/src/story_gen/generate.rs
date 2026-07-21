@@ -102,6 +102,13 @@ pub fn generate_stories_with_opts(
             .unwrap_or(0)
     };
 
+    // 各レベルの所属節点を 1 パスでグルーピングする（階ごとに全節点を
+    // 走査し直すと O(節点数×レベル数²) になるため）。
+    let mut nodes_by_level: Vec<Vec<NodeId>> = vec![Vec::new(); levels.len()];
+    for n in &struct_nodes {
+        nodes_by_level[level_of(n.coord[2])].push(n.id);
+    }
+
     // --- 2. 節点の重量配分 ---
     let mut node_weight = vec![0.0f64; model.nodes.len()];
     let load_cfg = model.load_cfg.clone().unwrap_or_default();
@@ -187,6 +194,14 @@ pub fn generate_stories_with_opts(
     // 指定荷重ケース（複数可）の鉛直下向き成分。
     // §1.4: 部材荷重は単純梁の静定反力（`static_reactions`）で両端に配分する
     // （令88条の実務的取扱い: 地震用節点重量 = 大梁の CMoQo 計算による梁せん断力 Q0）。
+    // 部材荷重 → 要素の解決は ID 添字マップで行う（荷重ごとの線形探索は
+    // O(部材荷重数×要素数) になり、DL 自動同期モデルでは要素数の 2 乗で悪化する）。
+    let elem_idx_by_id: std::collections::HashMap<squid_n_core::ids::ElemId, usize> = model
+        .elements
+        .iter()
+        .enumerate()
+        .map(|(i, e)| (e.id, i))
+        .collect();
     let mut seen_lcs: std::collections::HashSet<LoadCaseId> = std::collections::HashSet::new();
     for &lc_id in gravity_lcs {
         if !seen_lcs.insert(lc_id) {
@@ -201,10 +216,9 @@ pub fn generate_stories_with_opts(
             }
         }
         for ml in &lc.member {
-            let Some(elem) = model
-                .elements
-                .iter()
-                .find(|e| e.id == ml.elem)
+            let Some(elem) = elem_idx_by_id
+                .get(&ml.elem)
+                .map(|&i| &model.elements[i])
                 .filter(|e| e.nodes.len() >= 2)
             else {
                 continue;
@@ -254,11 +268,7 @@ pub fn generate_stories_with_opts(
 
     for (si, &elev) in levels.iter().enumerate().skip(1) {
         let story_id = StoryId((si - 1) as u32);
-        let node_ids: Vec<NodeId> = struct_nodes
-            .iter()
-            .filter(|n| level_of(n.coord[2]) == si)
-            .map(|n| n.id)
-            .collect();
+        let node_ids: Vec<NodeId> = std::mem::take(&mut nodes_by_level[si]);
         if node_ids.is_empty() {
             continue;
         }

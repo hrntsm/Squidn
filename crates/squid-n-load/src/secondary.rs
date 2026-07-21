@@ -9,24 +9,53 @@
 use squid_n_core::ids::ElemId;
 use squid_n_core::model::{ElementKind, MemberLoad, MemberLoadKind, Model, NodalLoad};
 
-/// 節点座標が梁要素のスパン上（端点を除く、距離 `tol` [mm] 以内）にあれば
-/// `(要素 ID, i 端からの距離 a)` を返す。複数の梁に載る場合は最も近いものを返す。
-pub fn beam_span_position(model: &Model, coord: [f64; 3], tol: f64) -> Option<(ElemId, f64)> {
-    let mut best: Option<(ElemId, f64, f64)> = None; // (elem, a, dist)
+/// `beam_span_position`/`resolve_nodal_to_primary` が候補とする 2 節点 `Beam` 要素
+/// （要素独立な幾何のみ。ダングリング参照は除外済み）。`resolve_nodal_to_primary` が
+/// 荷重ごとに `model.elements` を走査し直す（かつ節点座標を都度引き直す）のを避け、
+/// 呼び出し 1 回につき 1 度だけ構築して使い回すための中間表現。
+struct BeamSpanCandidate {
+    id: ElemId,
+    a: [f64; 3],
+    b: [f64; 3],
+}
+
+/// `model` から `beam_span_position` の対象となる 2 節点 `Beam` 要素の候補列
+/// （端点座標つき）を集める。ダングリング参照（未検証モデルで節点が見つからない
+/// 要素）はここで読み飛ばす（この要素だけを除外し、他要素の探索は継続する。
+/// 元の `beam_span_position` の「1 要素の不整合で全体を打ち切らない」挙動を保つ）。
+fn beam_span_candidates(model: &Model) -> Vec<BeamSpanCandidate> {
+    let mut out = Vec::new();
     for e in &model.elements {
         if e.kind != ElementKind::Beam || e.nodes.len() != 2 {
             continue;
         }
-        // ダングリング参照（未検証モデル）はこの要素だけ読み飛ばす。関数全体を
-        // 打ち切ると、後続要素で見つかるはずの正しいスパンを取りこぼす
-        // （既に見つけていた `best` も含めて）ため、`?` による早期 return は使わない。
         let (Some(node_a), Some(node_b)) = (
             model.nodes.get(e.nodes[0].index()),
             model.nodes.get(e.nodes[1].index()),
         ) else {
             continue;
         };
-        let (a, b) = (node_a.coord, node_b.coord);
+        out.push(BeamSpanCandidate {
+            id: e.id,
+            a: node_a.coord,
+            b: node_b.coord,
+        });
+    }
+    out
+}
+
+/// `beam_span_position` の本体。事前構築済みの候補列 `candidates` から、`coord` が
+/// スパン上（端点を除く、距離 `tol` [mm] 以内）にある最も近い梁を探す。
+/// 複数の梁に載る場合は最も近いものを返す（`d < bd` の狭義比較により、同着なら
+/// 候補列で先に見つかったものを保持する＝要素順の先勝ち）。
+fn best_span_position(
+    candidates: &[BeamSpanCandidate],
+    coord: [f64; 3],
+    tol: f64,
+) -> Option<(ElemId, f64)> {
+    let mut best: Option<(ElemId, f64, f64)> = None; // (elem, a, dist)
+    for c in candidates {
+        let (a, b) = (c.a, c.b);
         let ab = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
         let len2 = ab[0] * ab[0] + ab[1] * ab[1] + ab[2] * ab[2];
         if len2 < 1.0 {
@@ -47,10 +76,22 @@ pub fn beam_span_position(model: &Model, coord: [f64; 3], tol: f64) -> Option<(E
             + (coord[2] - proj[2]).powi(2))
         .sqrt();
         if d <= tol && best.map(|(_, _, bd)| d < bd).unwrap_or(true) {
-            best = Some((e.id, a_pos, d));
+            best = Some((c.id, a_pos, d));
         }
     }
     best.map(|(e, a, _)| (e, a))
+}
+
+/// 節点座標が梁要素のスパン上（端点を除く、距離 `tol` [mm] 以内）にあれば
+/// `(要素 ID, i 端からの距離 a)` を返す。複数の梁に載る場合は最も近いものを返す。
+///
+/// 単発呼び出し向けの簡便版（候補列をこの呼び出し内だけで構築する）。
+/// `resolve_nodal_to_primary` のように同一モデルに対して複数回（荷重ごとに）
+/// 呼ぶ場合は、`beam_span_candidates` で事前構築した候補列を `best_span_position`
+/// へ渡して使い回すこと（要素走査・節点座標引きの重複を避ける）。
+pub fn beam_span_position(model: &Model, coord: [f64; 3], tol: f64) -> Option<(ElemId, f64)> {
+    let candidates = beam_span_candidates(model);
+    best_span_position(&candidates, coord, tol)
 }
 
 /// 各節点に要素（解析部材）が接続しているかを返す。
@@ -83,6 +124,10 @@ pub fn resolve_nodal_to_primary(
     tol: f64,
 ) -> (Vec<NodalLoad>, Vec<MemberLoad>) {
     let connected = node_connected_flags(model);
+    // 要素独立な梁候補（節点対応付け前の端点座標）を 1 回だけ構築し、荷重ごとの
+    // `beam_span_position` 呼び出し（= 全要素走査＋座標引き直し）を避ける
+    // （性能。候補列・探索ロジックは `beam_span_position` と共通のため挙動は不変）。
+    let candidates = beam_span_candidates(model);
     let mut out_nodal = Vec::new();
     let mut out_member = Vec::new();
     for nl in nodal {
@@ -102,7 +147,7 @@ pub fn resolve_nodal_to_primary(
             out_nodal.push(nl);
             continue;
         };
-        match beam_span_position(model, node.coord, tol) {
+        match best_span_position(&candidates, node.coord, tol) {
             Some((elem, a)) => out_member.push(MemberLoad {
                 elem,
                 dir: [f[0] / p, f[1] / p, f[2] / p],
