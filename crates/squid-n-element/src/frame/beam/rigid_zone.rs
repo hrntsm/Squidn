@@ -128,10 +128,9 @@ fn max_orth_depth(
                 continue;
             }
             let axis = elem_axis(model, e);
-            let dot = (axis[0] * target_axis[0]
-                + axis[1] * target_axis[1]
-                + axis[2] * target_axis[2])
-                .abs();
+            let dot =
+                (axis[0] * target_axis[0] + axis[1] * target_axis[1] + axis[2] * target_axis[2])
+                    .abs();
             if dot < 0.707 {
                 // 概ね直交（45°以上）
                 if let Some(sec) = e.section.and_then(|sid| model.sections.get(sid.index())) {

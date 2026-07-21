@@ -96,6 +96,52 @@ impl<'m> Analysis<'m> {
         })
     }
 
+    /// 荷重ケース生成専用の軽量準備。モデル検証・DofMap・拘束縮約の構築までを
+    /// 行い、全体剛性 K の組立・分解を省く。
+    ///
+    /// [`Self::build_seismic_load_case`] は分解済み K を使わない（略算 T は
+    /// モデル形状のみ、固有値 T も内部の固有値解析が独自に K・M を組立・分解する）
+    /// ため、荷重同期だけが目的ならこちらを使うことで大規模モデルの組立・分解
+    /// コスト（`prepare` の支配的コスト）を丸ごと省ける。
+    ///
+    /// 返した `Analysis` で `linear_static` 等の求解系を呼んではならない
+    /// （ソルバが未分解のため求解時にエラーになる）。
+    pub fn prepare_load_case_gen(model: &'m Model) -> Result<Self, SolveError> {
+        squid_n_math::parallelism::apply_to_faer();
+        model
+            .validate()
+            .map_err(|e| SolveError::InvalidInput(format!("モデル検証エラー: {:?}", e)))?;
+        precheck::precheck_model(model)?;
+        let dofmap = DofMap::build(model);
+        let n_active = dofmap.n_active();
+
+        if n_active == 0 {
+            return Ok(Self {
+                model,
+                dofmap,
+                reducer: Reducer {
+                    t_rows: vec![],
+                    n_indep: 0,
+                    n_free: 0,
+                },
+                solver: make_solver(SolverBackend::Auto),
+                n_indep: 0,
+                semi_precise_t: std::sync::OnceLock::new(),
+            });
+        }
+
+        let reducer = Reducer::build(model, &dofmap);
+        let n_indep = reducer.n_indep;
+        Ok(Self {
+            model,
+            dofmap,
+            reducer,
+            solver: make_solver(SolverBackend::Auto),
+            n_indep,
+            semi_precise_t: std::sync::OnceLock::new(),
+        })
+    }
+
     /// 全自由度ゼロの結果（有効自由度なしのモデル用）。
     fn zero_result(&self) -> StaticOnce {
         StaticOnce {

@@ -17,10 +17,19 @@ fn nearest_node(model: &Model, pt: [f64; 3]) -> Option<NodeId> {
         .map(|n| n.id)
 }
 
-/// 「柱要素」（鉛直な `Beam` 要素）のうち、指定点に最も近い節点を持つ要素。
-/// §フレーム外雑壁の「柱」伝達タイプに用いる（最近接の柱節点→その柱要素の上下節点）。
-fn nearest_column_element(model: &Model, pt: [f64; 3]) -> Option<&ElementData> {
-    let mut best: Option<(&ElementData, f64)> = None;
+/// 「柱要素」候補（鉛直な `Beam` 要素、要素本体＋両端座標）。`misc_wall_weight_shares`
+/// が壁を 500mm ごとに区分し、区分ごとに最近接柱を探す際、種別・節点数判定と
+/// 鉛直判定・座標引きを毎回繰り返さないよう、壁ループの前に 1 回だけ構築して
+/// 使い回す（性能。走査順・最近接判定ロジックは変更しない）。
+struct ColumnCandidate<'a> {
+    elem: &'a ElementData,
+    a: [f64; 3],
+    b: [f64; 3],
+}
+
+/// `model` から「柱要素」（鉛直な `Beam` 要素）候補（両端座標つき）を集める。
+fn column_candidates(model: &Model) -> Vec<ColumnCandidate<'_>> {
+    let mut out = Vec::new();
     for e in &model.elements {
         if e.kind != ElementKind::Beam || e.nodes.len() < 2 {
             continue;
@@ -32,9 +41,22 @@ fn nearest_column_element(model: &Model, pt: [f64; 3]) -> Option<&ElementData> {
         if !is_vertical_pair(a, b) {
             continue;
         }
-        let d = dist3(a, pt).min(dist3(b, pt));
+        out.push(ColumnCandidate { elem: e, a, b });
+    }
+    out
+}
+
+/// 「柱要素」候補のうち、指定点に最も近い節点を持つ要素。
+/// §フレーム外雑壁の「柱」伝達タイプに用いる（最近接の柱節点→その柱要素の上下節点）。
+fn nearest_column_element<'a>(
+    candidates: &[ColumnCandidate<'a>],
+    pt: [f64; 3],
+) -> Option<&'a ElementData> {
+    let mut best: Option<(&ElementData, f64)> = None;
+    for c in candidates {
+        let d = dist3(c.a, pt).min(dist3(c.b, pt));
         if best.map(|(_, bd)| d < bd).unwrap_or(true) {
-            best = Some((e, d));
+            best = Some((c.elem, d));
         }
     }
     best.map(|(e, _)| e)
@@ -62,6 +84,10 @@ pub(super) fn accumulate_misc_wall_weight(model: &Model, node_weight: &mut [f64]
 pub(crate) fn misc_wall_weight_shares(model: &Model) -> Vec<(usize, f64)> {
     const SEGMENT_LEN: f64 = 500.0;
     let mut shares: Vec<(usize, f64)> = Vec::new();
+    // 「柱」伝達タイプの区分ごとの最近接探索が使う候補列を 1 回だけ構築する
+    // （性能。`nearest_node` は節点数分の走査のままとし、タイブレーク挙動を
+    // 変えるおそれのある空間索引は導入しない）。
+    let columns = column_candidates(model);
     for wall in &model.misc_walls {
         let (s, e) = (wall.start, wall.end);
         let (dx, dy, dz) = (e[0] - s[0], e[1] - s[1], e[2] - s[2]);
@@ -82,7 +108,7 @@ pub(crate) fn misc_wall_weight_shares(model: &Model) -> Vec<(usize, f64)> {
 
             match wall.transfer {
                 MiscWallTransfer::Column => {
-                    if let Some(col) = nearest_column_element(model, center) {
+                    if let Some(col) = nearest_column_element(&columns, center) {
                         let ni = col.nodes[0].index();
                         let nj = col.nodes[1].index();
                         shares.push((ni, seg_weight / 2.0));

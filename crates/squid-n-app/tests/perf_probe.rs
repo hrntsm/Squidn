@@ -216,7 +216,12 @@ fn timed_generate_stories(app: &mut App) -> [std::time::Duration; 5] {
             .iter()
             .any(|lc| lc.kind != LoadCaseKind::Other);
         if !any_kind_set {
-            app.model.load_cases.first().map(|c| c.id).into_iter().collect()
+            app.model
+                .load_cases
+                .first()
+                .map(|c| c.id)
+                .into_iter()
+                .collect()
         } else {
             let mut result: Vec<LoadCaseId> = app
                 .model
@@ -284,6 +289,43 @@ fn timed_generate_stories(app: &mut App) -> [std::time::Duration; 5] {
     apply_auto_rigid_zones(&mut app.model, &RigidZoneRule::default());
     let d4 = t0.elapsed();
 
+    // --- stage 5 sub-breakdown (diagnostic only, redundant w/ stage 5 itself):
+    // replicate what sync_seismic_load_cases_action does internally --
+    // Analysis::prepare once, then build_seismic_load_case for X and Y --
+    // to see which part of stage 5 dominates. Uses the same public API
+    // (`squid_n_solver::analysis::{Analysis, SeismicCfg}`) on the exact same
+    // model state (post rigid-zone application, pre EX/EY sync). ---
+    {
+        use squid_n_solver::analysis::{Analysis, SeismicCfg, SeismicDir};
+        let t0 = Instant::now();
+        if let Ok(analysis) = Analysis::prepare(&app.model) {
+            let d_prepare = t0.elapsed();
+            let cfg_x = SeismicCfg {
+                dir: SeismicDir::X,
+                mode: app.analysis_cfg.ai_mode,
+                z: app.analysis_cfg.z,
+                soil: app.analysis_cfg.soil,
+                c0: app.analysis_cfg.c0,
+            };
+            let t0 = Instant::now();
+            let _ = analysis.build_seismic_load_case(cfg_x);
+            let d_x = t0.elapsed();
+            let cfg_y = SeismicCfg {
+                dir: SeismicDir::Y,
+                ..cfg_x
+            };
+            let t0 = Instant::now();
+            let _ = analysis.build_seismic_load_case(cfg_y);
+            let d_y = t0.elapsed();
+            println!(
+                "      (stage5 breakdown: prepare={} build_X={} build_Y={})",
+                fmt_ms(d_prepare),
+                fmt_ms(d_x),
+                fmt_ms(d_y)
+            );
+        }
+    }
+
     // --- stage 5: sync_seismic_load_cases_action (pub) ---
     let t0 = Instant::now();
     app.sync_seismic_load_cases_action();
@@ -334,15 +376,39 @@ fn run_case(label: &str, nx: usize, ny: usize, n_stories: usize, with_slabs: boo
     println!(
         "\n=== {label}  grid {nx}x{ny} x {n_stories} stories  (nodes={n_nodes}, elems={n_elems}, slabs={n_slabs}) ==="
     );
-    println!("  load_model                              : {}", fmt_ms(t_load));
-    println!("  [1] sync_gravity_load_cases_action       : {}", fmt_ms(stages[0]));
-    println!("  [2] story_gen::generate_stories_with_opts: {}", fmt_ms(stages[1]));
-    println!("  [3] undo.run(ApplyStories)                : {}", fmt_ms(stages[2]));
-    println!("  [4] apply_rigid_zones_for_analysis        : {}", fmt_ms(stages[3]));
-    println!("  [5] sync_seismic_load_cases_action        : {}", fmt_ms(stages[4]));
+    println!(
+        "  load_model                              : {}",
+        fmt_ms(t_load)
+    );
+    println!(
+        "  [1] sync_gravity_load_cases_action       : {}",
+        fmt_ms(stages[0])
+    );
+    println!(
+        "  [2] story_gen::generate_stories_with_opts: {}",
+        fmt_ms(stages[1])
+    );
+    println!(
+        "  [3] undo.run(ApplyStories)                : {}",
+        fmt_ms(stages[2])
+    );
+    println!(
+        "  [4] apply_rigid_zones_for_analysis        : {}",
+        fmt_ms(stages[3])
+    );
+    println!(
+        "  [5] sync_seismic_load_cases_action        : {}",
+        fmt_ms(stages[4])
+    );
     println!("  ---------------------------------------------------------");
-    println!("  sum(1..5) manual replay                   : {}", fmt_ms(sum));
-    println!("  generate_stories_action (whole, fresh app): {}", fmt_ms(t_whole));
+    println!(
+        "  sum(1..5) manual replay                   : {}",
+        fmt_ms(sum)
+    );
+    println!(
+        "  generate_stories_action (whole, fresh app): {}",
+        fmt_ms(t_whole)
+    );
     use std::io::Write;
     std::io::stdout().flush().ok();
 }
@@ -371,4 +437,32 @@ fn perf_probe_generate_stories_action() {
 fn perf_probe_calibration_small() {
     run_case("A small     ", 5, 5, 5, true);
     run_case("B medium-w  ", 10, 10, 5, true);
+}
+
+// Individual per-case tests so each size can be run (and timed-out) in
+// isolation -- avoids one slow case starving the whole sweep of output.
+#[test]
+#[ignore = "perf probe, individual case"]
+fn perf_case_c_10x10x10() {
+    run_case("C medium-h  ", 10, 10, 10, true);
+}
+#[test]
+#[ignore = "perf probe, individual case"]
+fn perf_case_d_10x10x20() {
+    run_case("D large     ", 10, 10, 20, true);
+}
+#[test]
+#[ignore = "perf probe, individual case"]
+fn perf_case_e_15x15x10() {
+    run_case("E wide      ", 15, 15, 10, true);
+}
+#[test]
+#[ignore = "perf probe, individual case"]
+fn perf_case_f_15x15x20() {
+    run_case("F wide+tall ", 15, 15, 20, true);
+}
+#[test]
+#[ignore = "perf probe, individual case"]
+fn perf_case_g_10x10x20_noslab() {
+    run_case("G large,noSlab", 10, 10, 20, false);
 }

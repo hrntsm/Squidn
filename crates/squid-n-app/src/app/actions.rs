@@ -2,6 +2,17 @@
 
 use super::*;
 
+/// 節点対の順不同キー（`(min,max)`）。`beam_elem_map`（節点対→実 `Beam` 要素索引）と
+/// `slab_grillage_node_reactions`（実部材化判定）で、ノード順に依存しない同じキーを
+/// 使うための共通ヘルパー。
+fn beam_key(a: NodeId, b: NodeId) -> (NodeId, NodeId) {
+    if a.0 <= b.0 {
+        (a, b)
+    } else {
+        (b, a)
+    }
+}
+
 impl App {
     /// モデルを丸ごと差し替える（新規作成・サンプル読込・ファイル読込で共用）。
     /// undo 履歴・結果・選択・stale 状態をすべてリセットする。
@@ -1850,10 +1861,16 @@ impl App {
     /// 反力総和（`w·Σ spacing·L`）と厳密に一致する（総和保存）。相違は交点での荷重
     /// 分担の精度のみ。実部材化された小梁を含むスラブは、実 Beam が本体 FEM で荷重を
     /// 伝達し二重計上になるため対象外（`None`）とする。
+    ///
+    /// `beam_map` は節点対（`(min,max)` 順）→実 `Beam` 要素 `ElemId` の索引
+    /// （`beam_elem_map` で構築）。実部材化判定をスラブ全要素走査から `HashMap` 参照に
+    /// 落とし、呼び出し側（`slab_beam_loads`／`slab_grillage_unit_reactions`）で 1 回
+    /// 構築したものを使い回す（性能）。
     pub(crate) fn slab_grillage_node_reactions(
         &self,
         slab: &squid_n_core::model::Slab,
         w: f64,
+        beam_map: &std::collections::HashMap<(NodeId, NodeId), ElemId>,
     ) -> Option<Vec<(NodeId, f64)>> {
         // `distribute_slab_w` が小梁二段階伝達（点反力 Node＋境界 Edge）を採るスラブに
         // 限定する。隅・片持ち・辺支持・非矩形・分配法が三角/一方向以外のスラブは
@@ -1863,18 +1880,10 @@ impl App {
             return None;
         }
         // 実部材化された小梁を含む場合は対象外（本体 FEM と二重計上を避ける）。
-        let materialized = |a: NodeId, b: NodeId| -> bool {
-            self.model.elements.iter().any(|e| {
-                e.kind == squid_n_core::model::ElementKind::Beam
-                    && e.nodes.len() == 2
-                    && ((e.nodes[0] == a && e.nodes[1] == b)
-                        || (e.nodes[0] == b && e.nodes[1] == a))
-            })
-        };
         if slab
             .joists
             .iter()
-            .any(|j| materialized(j.support[0], j.support[1]))
+            .any(|j| beam_map.contains_key(&beam_key(j.support[0], j.support[1])))
         {
             return None;
         }
@@ -1889,6 +1898,43 @@ impl App {
         )
     }
 
+    /// 全スラブの床格子**単位**（`w=1.0`）支点反力を 1 回だけ解いて返す
+    /// （`SlabId` → 支点反力列）。反力は面荷重強度 `w` に線形（`build_slab_grillage`
+    /// の等分布荷重が `w·spacing` で唯一 `w` に依存し、以降の剛性解析は `w` に
+    /// 無関係）なため、各荷重ケースはこの単位反力を `w` 倍するだけでよく、
+    /// 交差小梁スラブ毎の格子 FEM 組立・求解を `sync_gravity_load_cases_action` の
+    /// DL/LL(架構用)/LL(地震用) 3 ケースで使い回せる（従来は 3 回solve_grillageを
+    /// 実行していた）。格子非対象（`None`）のスラブはキーが存在しない。
+    fn slab_grillage_unit_reactions(
+        &self,
+        beam_map: &std::collections::HashMap<(NodeId, NodeId), ElemId>,
+    ) -> std::collections::HashMap<squid_n_core::ids::SlabId, Vec<(NodeId, f64)>> {
+        let mut out = std::collections::HashMap::new();
+        for slab in &self.model.slabs {
+            if let Some(reactions) = self.slab_grillage_node_reactions(slab, 1.0, beam_map) {
+                out.insert(slab.id, reactions);
+            }
+        }
+        out
+    }
+
+    /// 節点対 (min,max) → 実 `Beam`（2 節点）要素の `ElemId` を引く索引を構築する
+    /// （`slab_beam_loads` の辺→部材対応付け・`slab_grillage_node_reactions` の
+    /// 実部材化判定で共有。従来は各スラブ・各辺・各交差小梁ごとに `elements.iter().find`
+    /// していたため O(スラブ数×辺数×要素数) だったのを、`sync_gravity_load_cases_action`
+    /// 1 回あたり O(要素数) の構築＋ O(1) 参照に削減する）。同一節点対に複数の実梁が
+    /// ある場合（通常は起きない）は要素順で最初に見つかったものを採用する
+    /// （`.find` の挙動を保つため `entry().or_insert` を使う）。
+    pub(crate) fn beam_elem_map(&self) -> std::collections::HashMap<(NodeId, NodeId), ElemId> {
+        let mut map = std::collections::HashMap::new();
+        for e in &self.model.elements {
+            if e.kind == squid_n_core::model::ElementKind::Beam && e.nodes.len() == 2 {
+                map.entry(beam_key(e.nodes[0], e.nodes[1])).or_insert(e.id);
+            }
+        }
+        map
+    }
+
     /// 各スラブについて面荷重強度 `w_of(slab)`（N/mm²）を境界へ分配し、
     /// `LoadTarget::Edge` を実 `ElemId` に対応付けた `BeamLoad` 列を返す。
     /// 対応する梁が無い辺の荷重は捨てる。`refresh_beam_loads`（DL）と
@@ -1898,9 +1944,30 @@ impl App {
     /// （`LoadTarget::Node`）を床格子サブモデルの支点反力で置換する（床 Phase F-3b。
     /// 総和は保存し、交点での荷重分担のみ高精度化）。境界大梁の残り負担
     /// （`LoadTarget::Edge`）や実部材化小梁（`LoadTarget::Span`）はそのまま。
+    ///
+    /// 単発呼び出し向けの簡便版。節点対索引・格子単位反力をこの呼び出し内だけで
+    /// 構築するため、`sync_gravity_load_cases_action` のように同一モデルに対して
+    /// 複数回（DL/LL(架構用)/LL(地震用)）呼ぶ場合は、事前に構築したものを
+    /// `slab_beam_loads_with` へ渡して使い回すこと（格子 FEM の重複組立・求解を防ぐ）。
     fn slab_beam_loads(
         &self,
         w_of: impl Fn(&squid_n_core::model::Slab) -> f64,
+    ) -> Vec<squid_n_load::floor::BeamLoad> {
+        let beam_map = self.beam_elem_map();
+        let unit_reactions = self.slab_grillage_unit_reactions(&beam_map);
+        self.slab_beam_loads_with(w_of, &unit_reactions, &beam_map)
+    }
+
+    /// `slab_beam_loads` の本体。`beam_map`（節点対→実 `ElemId` 索引）と
+    /// `unit_reactions`（`slab_grillage_unit_reactions` が返す `w=1` 支点反力。
+    /// 反力は `w` に線形なのでここで `w` 倍して使う）を呼び出し側から受け取ることで、
+    /// `sync_gravity_load_cases_action` の DL/LL(架構用)/LL(地震用) 3 ケースが
+    /// 実要素索引の構築・格子 FEM の組立/求解を 1 回だけ共有できる。
+    fn slab_beam_loads_with(
+        &self,
+        w_of: impl Fn(&squid_n_core::model::Slab) -> f64,
+        unit_reactions: &std::collections::HashMap<squid_n_core::ids::SlabId, Vec<(NodeId, f64)>>,
+        beam_map: &std::collections::HashMap<(NodeId, NodeId), ElemId>,
     ) -> Vec<squid_n_load::floor::BeamLoad> {
         let mut beam_loads = Vec::new();
         for slab in &self.model.slabs {
@@ -1910,20 +1977,15 @@ impl App {
             }
             // 節点対 (n0,n1) を両端に持つ実 Beam 要素の ElemId を引く（ノード順不問）。
             let find_beam = |n0: NodeId, n1: NodeId| -> Option<ElemId> {
-                self.model
-                    .elements
-                    .iter()
-                    .find(|e| {
-                        e.kind == squid_n_core::model::ElementKind::Beam
-                            && e.nodes.len() == 2
-                            && ((e.nodes[0] == n0 && e.nodes[1] == n1)
-                                || (e.nodes[0] == n1 && e.nodes[1] == n0))
-                    })
-                    .map(|e| e.id)
+                beam_map.get(&beam_key(n0, n1)).copied()
             };
             let w = w_of(slab);
-            // 交差小梁スラブは格子サブモデルの支点反力で小梁点反力を置換する（F-3b）。
-            let grillage_reactions = self.slab_grillage_node_reactions(slab, w);
+            // 交差小梁スラブは格子サブモデルの支点反力（単位反力を w 倍）で
+            // 小梁点反力を置換する（F-3b）。反力は w に線形（build_slab_grillage の
+            // コメント参照）なので、格子 FEM を w ごとに解き直す必要はない。
+            let grillage_reactions: Option<Vec<(NodeId, f64)>> = unit_reactions
+                .get(&slab.id)
+                .map(|rs| rs.iter().map(|(node, r)| (*node, r * w)).collect());
             for mut bl in squid_n_load::floor::distribute_slab_w(&self.model, slab, w) {
                 match bl.target {
                     squid_n_load::floor::LoadTarget::Node(_) => {
@@ -2215,12 +2277,23 @@ impl App {
     /// の入口で毎回呼ぶことを想定した冪等な同期アクション。
     pub fn sync_gravity_load_cases_action(&mut self) {
         use squid_n_core::model::{LoadCaseKind, LoadPurpose};
-        self.refresh_beam_loads();
 
-        // DL（固定荷重）: スラブ分配（`self.beam_loads` は refresh_beam_loads で
-        // dead_intensity 分配済み）＋躯体自重。自重には二次部材（小梁・間柱）の
-        // 分（支持点への節点荷重）が含まれるため、要素が接続しない節点への荷重を
-        // 大梁の中間集中荷重（CMQ）へ変換してから同期する。
+        // 節点対→実 Beam 索引・床格子の単位（w=1）支点反力を 1 回だけ構築し、
+        // DL/LL(架構用)/LL(地震用) の 3 ケースで使い回す（性能。反力は面荷重強度
+        // `w` に線形なので格子 FEM を w ごとに解き直す必要はない）。
+        let beam_map = self.beam_elem_map();
+        let unit_reactions = self.slab_grillage_unit_reactions(&beam_map);
+
+        // CMQ 図表示・従来互換のため `self.beam_loads` には固定荷重（DL）分配を
+        // 格納する（`refresh_beam_loads` と同じ結果。ここでは共有済みの
+        // `beam_map`/`unit_reactions` を使い回すため直接 `slab_beam_loads_with` を呼ぶ）。
+        self.beam_loads =
+            self.slab_beam_loads_with(|slab| slab.dead_intensity(), &unit_reactions, &beam_map);
+
+        // DL（固定荷重）: スラブ分配（`self.beam_loads` は上で dead_intensity 分配済み）
+        // ＋躯体自重。自重には二次部材（小梁・間柱）の分（支持点への節点荷重）が
+        // 含まれるため、要素が接続しない節点への荷重を大梁の中間集中荷重（CMQ）へ
+        // 変換してから同期する。
         let dl_beam_loads = self.beam_loads.clone();
         let (mut dl_nodal, mut dl_member) = self.slab_load_case_content(&dl_beam_loads);
         let load_cfg = self.model.load_cfg.clone().unwrap_or_default();
@@ -2237,12 +2310,20 @@ impl App {
         self.sync_one_auto_case(DL_CASE_NAME, LoadCaseKind::Dead, dl_nodal, dl_member);
 
         // LL（積載荷重・骨組用）: スラブ用途から令別表第1 の骨組用積載を分配。
-        let ll_beam_loads = self.slab_beam_loads(|slab| slab.live_intensity(LoadPurpose::Frame));
+        let ll_beam_loads = self.slab_beam_loads_with(
+            |slab| slab.live_intensity(LoadPurpose::Frame),
+            &unit_reactions,
+            &beam_map,
+        );
         let (ll_nodal, ll_member) = self.slab_load_case_content(&ll_beam_loads);
         self.sync_one_auto_case(LL_FRAME_CASE_NAME, LoadCaseKind::Live, ll_nodal, ll_member);
 
         // LL（積載荷重・地震用）: スラブ用途から令別表第1 の地震用積載を分配。
-        let ls_beam_loads = self.slab_beam_loads(|slab| slab.live_intensity(LoadPurpose::Seismic));
+        let ls_beam_loads = self.slab_beam_loads_with(
+            |slab| slab.live_intensity(LoadPurpose::Seismic),
+            &unit_reactions,
+            &beam_map,
+        );
         let (ls_nodal, ls_member) = self.slab_load_case_content(&ls_beam_loads);
         self.sync_one_auto_case(
             LL_SEISMIC_CASE_NAME,
@@ -2269,7 +2350,10 @@ impl App {
             return;
         }
         let built: Vec<(&'static str, squid_n_core::model::LoadCase)> = {
-            let Ok(analysis) = Analysis::prepare(&self.model) else {
+            // 荷重ケースの構築だけが目的なので、K の組立・分解を省いた軽量準備を
+            // 使う（`build_seismic_load_case` は分解済み K を使わない。実測で
+            // 本アクションの支配的コストは prepare の組立・分解だった）。
+            let Ok(analysis) = Analysis::prepare_load_case_gen(&self.model) else {
                 return;
             };
             [(SeismicDir::X, EX_CASE_NAME), (SeismicDir::Y, EY_CASE_NAME)]
