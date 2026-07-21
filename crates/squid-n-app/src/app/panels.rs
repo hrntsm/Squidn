@@ -1714,6 +1714,21 @@ impl App {
                     )
                     .on_hover_text(err);
                 }
+                // last_error（赤・処理を止める）とは別枠の注意事項（例: 精算周期
+                // (SemiPrecise)選択時に固有値解析が未実行で EX/EY が未更新である旨）。
+                // 情報色（BEST_YELLOW）で表示し、解析自体は継続してよいことを示す。
+                if let Some(notice) = &self.last_notice {
+                    ui.separator();
+                    let one_line = notice.replace('\n', " ");
+                    ui.add(
+                        egui::Label::new(
+                            egui::RichText::new(format!("ℹ {}", one_line))
+                                .color(crate::theme::BEST_YELLOW),
+                        )
+                        .truncate(),
+                    )
+                    .on_hover_text(notice);
+                }
             });
         });
 

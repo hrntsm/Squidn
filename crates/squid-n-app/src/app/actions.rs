@@ -16,6 +16,8 @@ impl App {
         self.nav = Navigator::default();
         self.last_static = None;
         self.last_error = None;
+        self.last_notice = None;
+        self.auto_load_sync_hash = None;
         self.staleness = Staleness::default();
         self.sync_node_edit();
         self.refresh_beam_loads();
@@ -145,16 +147,14 @@ impl App {
     ///
     /// 解析準備前にスラブ荷重・躯体自重を「DL」等の標準ケースへ（レビュー §1.1・
     /// 照合レビュー：③梁自重・②壁荷重の CMoQ 経路を長期応力解析へ接続）、
-    /// 階が定義済みなら地震荷重を「EX」「EY」ケースへ同期する。
+    /// 階が定義済みなら地震荷重を「EX」「EY」ケースへ同期する
+    /// （`sync_auto_load_cases_action`。モデル・関連設定が前回同期時から
+    /// 変わっていなければ丸ごとスキップする）。
     pub fn run_linear_static(&mut self, lc: LoadCaseId) {
         self.apply_parallelism_setting();
         self.last_error = None;
-        self.sync_gravity_load_cases_action();
-        // 剛域の反映は地震荷重の同期より先に行う（SemiPrecise の固有周期算定が
-        // 剛域込みの剛性を用いるようにするため。`sync_seismic_load_cases_action`
-        // は内部で別途 `Analysis::prepare` する）。
-        self.apply_rigid_zones_for_analysis();
-        self.sync_seismic_load_cases_action();
+        self.last_notice = None;
+        self.sync_auto_load_cases_action();
         match Analysis::prepare(&self.model) {
             Ok(analysis) => match analysis.linear_static(lc) {
                 Ok(res) => {
@@ -179,17 +179,16 @@ impl App {
     /// 指定インデックスの荷重組合せが存在しない場合はエラーメッセージをセット。
     ///
     /// 解析準備前にスラブ荷重・躯体自重を「DL」等の標準ケースへ、階が定義済み
-    /// なら地震荷重を「EX」「EY」ケースへ同期する（レビュー §1.1・照合レビュー）。
+    /// なら地震荷重を「EX」「EY」ケースへ同期する（レビュー §1.1・照合レビュー、
+    /// `sync_auto_load_cases_action`。モデル・関連設定が前回同期時から変わって
+    /// いなければ丸ごとスキップする）。
     /// 組合せが空の地震荷重ケースを参照している場合は解かずにエラーで案内する
     /// （地震項が黙って 0 になるのを防ぐ）。
     pub fn run_combination(&mut self, index: usize) {
         self.apply_parallelism_setting();
         self.last_error = None;
-        self.sync_gravity_load_cases_action();
-        // 剛域の反映は地震荷重の同期より先に行う（SemiPrecise の固有周期算定が
-        // 剛域込みの剛性を用いるようにするため）。
-        self.apply_rigid_zones_for_analysis();
-        self.sync_seismic_load_cases_action();
+        self.last_notice = None;
+        self.sync_auto_load_cases_action();
         let Some(combo) = self.model.combinations.get(index).cloned() else {
             self.last_error = Some(format!("荷重組合せ #{} が存在しません", index));
             return;
@@ -254,16 +253,16 @@ impl App {
     pub fn run_all_combinations(&mut self) {
         self.apply_parallelism_setting();
         self.last_error = None;
-        self.sync_gravity_load_cases_action();
+        self.last_notice = None;
         if self.model.combinations.is_empty() {
             self.last_error =
                 Some("荷重組合せがありません。荷重タブで作成してください。".to_string());
             return;
         }
-        // 剛域の反映は地震荷重の同期より先に行う（SemiPrecise の固有周期算定が
-        // 剛域込みの剛性を用いるようにするため）。
-        self.apply_rigid_zones_for_analysis();
-        self.sync_seismic_load_cases_action();
+        // 解析準備前にスラブ荷重・躯体自重を「DL」等の標準ケースへ、階が定義済み
+        // なら地震荷重を「EX」「EY」ケースへ同期する（`sync_auto_load_cases_action`。
+        // モデル・関連設定が前回同期時から変わっていなければ丸ごとスキップする）。
+        self.sync_auto_load_cases_action();
         let analysis = match Analysis::prepare(&self.model) {
             Ok(a) => a,
             Err(e) => {
@@ -816,6 +815,7 @@ impl App {
     pub fn run_eigen(&mut self, n_modes: usize) {
         self.apply_parallelism_setting();
         self.last_error = None;
+        self.last_notice = None;
         self.apply_rigid_zones_for_analysis();
         match Analysis::prepare(&self.model) {
             Ok(analysis) => match analysis.eigen(n_modes) {
@@ -844,6 +844,7 @@ impl App {
     /// これで荷重組合せ G+P±K が実行可能になる）。
     pub fn generate_stories_action(&mut self) {
         self.last_error = None;
+        self.last_notice = None;
         self.sync_gravity_load_cases_action();
         let gravity_lcs = gravity_cases_for_seismic_weight(&self.model);
         let include_density = density_self_weight_for_stories(&self.model);
@@ -868,6 +869,10 @@ impl App {
                 // 剛域込みの剛性を用いるようにするため）。
                 self.apply_rigid_zones_for_analysis();
                 self.sync_seismic_load_cases_action();
+                // 直後に run_linear_static 等（`sync_auto_load_cases_action`）が
+                // 呼ばれても、いま行った DL/LL/EX/EY の同期を無駄に繰り返さない
+                // よう、同期後の状態のハッシュを記録しておく。
+                self.auto_load_sync_hash = Some(self.compute_auto_load_sync_hash());
             }
             Err(e) => self.last_error = Some(format!("階の自動生成エラー: {}", e)),
         }
@@ -877,14 +882,26 @@ impl App {
     /// 方向・Ai算定法・Z・地盤種別・C0 は `analysis_cfg` を用いる。
     /// 結果は `StaticCaseKey::Seismic(dir)` に格納するため、X/Y 双方の地震静的結果
     /// および任意のユーザー荷重ケースの結果と衝突せず共存できる。
-    /// あわせて同じ水平力を「EX」「EY」ケースへ同期する（荷重組合せ用）。
+    /// あわせて同じ水平力を「EX」「EY」ケースへ同期する（荷重組合せ用、
+    /// `sync_auto_load_cases_action`。モデル・関連設定が前回同期時から変わって
+    /// いなければ丸ごとスキップする）。
+    ///
+    /// 設計用固有周期 T は `design_seismic_period` で暗黙の解析なしに決定する
+    /// （内部で固有値解析を実行しない `Analysis::seismic_static_with_period` を
+    /// 使う）。SemiPrecise で固有値解析が未実行の場合は解析せず、実行を促す
+    /// メッセージを `last_error` に設定して return する。
     pub fn run_seismic(&mut self, dir: SeismicDir) {
         self.apply_parallelism_setting();
         self.last_error = None;
-        // 剛域の反映は地震荷重の同期より先に行う（SemiPrecise の固有周期算定が
-        // 剛域込みの剛性を用いるようにするため）。
-        self.apply_rigid_zones_for_analysis();
-        self.sync_seismic_load_cases_action();
+        self.last_notice = None;
+        self.sync_auto_load_cases_action();
+        let t = match self.design_seismic_period() {
+            Ok(t) => t,
+            Err(msg) => {
+                self.last_error = Some(msg);
+                return;
+            }
+        };
         let cfg = squid_n_solver::analysis::SeismicCfg {
             dir,
             mode: self.analysis_cfg.ai_mode,
@@ -893,7 +910,7 @@ impl App {
             c0: self.analysis_cfg.c0,
         };
         match Analysis::prepare(&self.model) {
-            Ok(analysis) => match analysis.seismic_static_with(cfg) {
+            Ok(analysis) => match analysis.seismic_static_with_period(cfg, t) {
                 Ok(res) => {
                     let member_forces = res.member_forces.clone();
                     let mut bundle = self.results.take().unwrap_or_default();
@@ -918,6 +935,7 @@ impl App {
     pub fn run_wind(&mut self, dir: SeismicDir) {
         self.apply_parallelism_setting();
         self.last_error = None;
+        self.last_notice = None;
         let cfg = squid_n_solver::analysis::WindStaticCfg {
             dir,
             v0: self.analysis_cfg.v0,
@@ -2240,7 +2258,7 @@ impl App {
     /// DL に自重を含めるため、階の自動生成（地震用重量）では密度からの自重直接
     /// 算入を無効にして二重計上を防ぐ（`density_self_weight_for_stories`）。
     ///
-    /// 解析実行系（`run_linear_static`/`run_combination`）・`generate_stories_action`
+    /// 解析実行系（`sync_auto_load_cases_action` 経由）・`generate_stories_action`
     /// の入口で毎回呼ぶことを想定した冪等な同期アクション。
     pub fn sync_gravity_load_cases_action(&mut self) {
         use squid_n_core::model::{LoadCaseKind, LoadPurpose};
@@ -2281,26 +2299,69 @@ impl App {
         );
     }
 
+    /// 地震荷重(Ai分布)の設計用固有周期 T[s] を、暗黙の解析なしで決定する。
+    ///
+    /// - `AiMode::Approx`: 略算式 T = h(0.02+0.01α)（令88条・昭和55年建設省
+    ///   告示第1793号）。即時計算で解析は不要。
+    /// - `AiMode::SemiPrecise`: 明示実行済みの固有値解析結果
+    ///   （`self.results` の `modal`）の1次周期（`ModalResult::period[0]`）を
+    ///   再利用する。固有値解析が未実行（`results` が無い・`modal` が無い・
+    ///   `period` が空のいずれか）の場合は `Err`（実行を促す日本語メッセージ）。
+    ///
+    /// `Analysis::prepare`（剛性行列組立+Cholesky分解）や固有値解析を新たに
+    /// 実行することはない（暗黙の重い解析を避けるための入口）。
+    fn design_seismic_period(&self) -> Result<f64, String> {
+        match self.analysis_cfg.ai_mode {
+            AiMode::Approx => {
+                let height_m = squid_n_solver::analysis::building_height_mm(&self.model) / 1000.0;
+                let steel_ratio = squid_n_solver::analysis::steel_height_ratio(&self.model);
+                Ok(squid_n_load::ai::approx_t(height_m, steel_ratio))
+            }
+            AiMode::SemiPrecise => self
+                .results
+                .as_ref()
+                .and_then(|r| r.modal.as_ref())
+                .and_then(|m| m.period.first().copied())
+                .ok_or_else(|| {
+                    "精算周期(固有値解析)が選択されていますが固有値解析が未実行です。\
+                     解析タブの固有値解析を先に実行してください\
+                     (EX/EY の地震荷重は更新されません)。"
+                        .to_string()
+                }),
+        }
+    }
+
     /// 地震荷重の標準ケース（EX・EY、kind=Seismic）へ Ai 分布の水平力を同期する。
     ///
     /// 階（`model.stories`）が定義されている場合に、地震静的解析と同じ載荷
-    /// （`Analysis::build_seismic_load_case`。方向・Ai算定法・Z・地盤種別・C0 は
+    /// （`build_seismic_load_case_from_model`。方向・Ai算定法・Z・地盤種別・C0 は
     /// `analysis_cfg`）を EX/EY ケースへ書き込む。これにより荷重組合せ
     /// （G+P±K など）が EX/EY を参照して解析できる。
     ///
-    /// 階が未定義・解析準備に失敗・地震荷重が構築できない場合は何もしない
-    /// （既存の EX/EY ケースは変更しない。組合せ実行時に空の地震ケースを
-    /// 参照していればエラーで案内する）。冪等な同期アクション
-    /// （`sync_gravity_load_cases_action` と同じ規約）。
+    /// 設計用固有周期 T は `design_seismic_period` で決定する（`Analysis::prepare`
+    /// を要しないモデル単独版 `build_seismic_load_case_from_model` を使うため、
+    /// 本関数自体は剛性行列組立や固有値解析を一切行わない）。X・Y 双方向で T を
+    /// 共有するため `design_seismic_period` の呼び出しは 1 回のみ。
+    ///
+    /// 階が未定義・地震荷重が構築できない場合は何もしない（既存の EX/EY
+    /// ケースは変更しない。組合せ実行時に空の地震ケースを参照していれば
+    /// エラーで案内する）。SemiPrecise で固有値解析が未実行の場合も同様に
+    /// 何もせず、代わりに `last_notice` へ実行を促すメッセージを設定する
+    /// （`last_error` とは別枠。解析自体は継続してよい注意事項のため）。
+    /// 冪等な同期アクション（`sync_gravity_load_cases_action` と同じ規約）。
     pub fn sync_seismic_load_cases_action(&mut self) {
         use squid_n_core::model::LoadCaseKind;
         if self.model.stories.is_empty() {
             return;
         }
-        let built: Vec<(&'static str, squid_n_core::model::LoadCase)> = {
-            let Ok(analysis) = Analysis::prepare(&self.model) else {
+        let t = match self.design_seismic_period() {
+            Ok(t) => t,
+            Err(msg) => {
+                self.last_notice = Some(msg);
                 return;
-            };
+            }
+        };
+        let built: Vec<(&'static str, squid_n_core::model::LoadCase)> =
             [(SeismicDir::X, EX_CASE_NAME), (SeismicDir::Y, EY_CASE_NAME)]
                 .into_iter()
                 .filter_map(|(dir, name)| {
@@ -2311,16 +2372,75 @@ impl App {
                         soil: self.analysis_cfg.soil,
                         c0: self.analysis_cfg.c0,
                     };
-                    analysis
-                        .build_seismic_load_case(cfg)
-                        .ok()
-                        .map(|lc| (name, lc))
+                    squid_n_solver::analysis::build_seismic_load_case_from_model(
+                        &self.model,
+                        cfg,
+                        t,
+                    )
+                    .ok()
+                    .map(|lc| (name, lc))
                 })
-                .collect()
-        };
+                .collect();
         for (name, lc) in built {
             self.sync_one_auto_case(name, LoadCaseKind::Seismic, lc.nodal, lc.member);
         }
+    }
+
+    /// `sync_auto_load_cases_action` が同期の要否判定に使うハッシュを計算する。
+    ///
+    /// 荷重同期（DL/LL/EX/EY）の結果に影響し得る入力をすべて含める:
+    /// モデル本体（`bincode` でシリアライズしてハッシュ）、地震荷重の
+    /// Ai算定法（`ai_mode`）・地域係数 Z・地盤種別・標準せん断力係数 C0、
+    /// および SemiPrecise 時は `design_seismic_period` の値（算定できた場合のみ。
+    /// `to_bits()` でビット列化してハッシュ。固有値解析が未実行で `Err` の場合は
+    /// 含めない＝モデル・設定が同じなら「未実行」状態も同一ハッシュに畳み込む）。
+    fn compute_auto_load_sync_hash(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        if let Ok(bytes) = bincode::serialize(&self.model) {
+            bytes.hash(&mut hasher);
+        }
+        std::mem::discriminant(&self.analysis_cfg.ai_mode).hash(&mut hasher);
+        self.analysis_cfg.z.to_bits().hash(&mut hasher);
+        (self.analysis_cfg.soil as u8).hash(&mut hasher);
+        self.analysis_cfg.c0.to_bits().hash(&mut hasher);
+        if matches!(self.analysis_cfg.ai_mode, AiMode::SemiPrecise) {
+            if let Ok(t) = self.design_seismic_period() {
+                t.to_bits().hash(&mut hasher);
+            }
+        }
+        hasher.finish()
+    }
+
+    /// 自重・積載・地震荷重の自動同期（`sync_gravity_load_cases_action` ・
+    /// `sync_seismic_load_cases_action`）をまとめて行う、解析実行系
+    /// （`run_linear_static`/`run_combination`/`run_all_combinations`/
+    /// `run_seismic`）共通の入口。
+    ///
+    /// モデルが交差小梁スラブを含む場合、床荷重分配（DL・LL(架構用)・
+    /// LL(地震用)の3系統×床格子サブFEM解析）は重い処理になり得るため、
+    /// 前回の同期時からモデル・関連設定（`compute_auto_load_sync_hash`）が
+    /// 一切変わっていなければ丸ごとスキップする。
+    ///
+    /// 手順:
+    /// 1. `apply_rigid_zones_for_analysis`（冪等・軽量なので常に実行。
+    ///    剛域の反映は地震荷重の同期より先に行う。SemiPrecise の固有周期算定が
+    ///    剛域込みの剛性を用いるようにするため）。
+    /// 2. 現在のハッシュを計算し、前回保存したハッシュと一致すればスキップ。
+    /// 3. 不一致なら `sync_gravity_load_cases_action` → `sync_seismic_load_cases_action`
+    ///    の順で実行する。
+    /// 4. 同期後（荷重ケースの内容が書き換わった後）のモデルで再度ハッシュを
+    ///    計算して保存する（同期前のハッシュを保存すると、次回呼び出しで
+    ///    「同期していないのに一致」と誤判定するため、必ず同期後の状態で保存する）。
+    pub fn sync_auto_load_cases_action(&mut self) {
+        self.apply_rigid_zones_for_analysis();
+        let current = self.compute_auto_load_sync_hash();
+        if self.auto_load_sync_hash == Some(current) {
+            return;
+        }
+        self.sync_gravity_load_cases_action();
+        self.sync_seismic_load_cases_action();
+        self.auto_load_sync_hash = Some(self.compute_auto_load_sync_hash());
     }
 
     /// 名前付き荷重ケースを指定の `kind`・内容へ冪等に同期する

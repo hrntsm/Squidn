@@ -345,6 +345,10 @@ pub struct App {
     pub last_static: Option<StaticKey>,
     /// 解析実行中のエラーメッセージ
     pub last_error: Option<String>,
+    /// 解析実行中の注意メッセージ（エラーではないが利用者に知らせたい事項。
+    /// 例: 精算周期(SemiPrecise)選択時に固有値解析が未実行で EX/EY の地震荷重が
+    /// 更新されなかった旨）。`last_error`（赤）とは別枠で情報色表示する。
+    pub last_notice: Option<String>,
     /// 実行中のバックグラウンド解析ジョブ（プッシュオーバー・時刻歴、P8 §5）。
     /// 完了は `poll_job` で検知して結果を適用する。
     pub job: Option<AnalysisJob>,
@@ -462,6 +466,11 @@ pub struct App {
     pub project_path: Option<std::path::PathBuf>,
     /// 解析タブの設定値
     pub analysis_cfg: AnalysisSettings,
+    /// 自動荷重同期（`sync_auto_load_cases_action`）が最後に行われた時点の
+    /// モデル＋関連設定のハッシュ。次回呼び出し時に現在のハッシュと一致すれば
+    /// DL/LL/EX/EY の再計算（床格子サブFEM解析等）を丸ごとスキップする。
+    /// モデルの新規作成・読込では `None` にリセットする（永続化しない）。
+    pub auto_load_sync_hash: Option<u64>,
     /// 解析タブ「荷重組合せ」で選択中の組合せインデックス（model.combinations）
     #[cfg(feature = "gui")]
     pub analysis_combo_idx: usize,
@@ -524,6 +533,7 @@ impl Default for App {
             design_term: LoadTerm::Long,
             last_static: None,
             last_error: None,
+            last_notice: None,
             job: None,
             node_edit: Vec::new(),
             node_draft: ["0".to_string(), "0".to_string(), "0".to_string()],
@@ -588,6 +598,7 @@ impl Default for App {
             wall_draw_nodes: Vec::new(),
             project_path: None,
             analysis_cfg: AnalysisSettings::default(),
+            auto_load_sync_hash: None,
             #[cfg(feature = "gui")]
             analysis_combo_idx: 0,
             #[cfg(feature = "gui")]

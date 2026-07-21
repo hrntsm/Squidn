@@ -492,6 +492,139 @@ fn test_seismic_flow_requires_then_uses_stories() {
         .all(|lc| lc.name != DL_CASE_NAME));
 }
 
+/// 性能修正: Ai算定法が既定の略算（`AiMode::Approx`）の場合、固有値解析を
+/// 一切実行せずに `sync_seismic_load_cases_action` が EX/EY を同期できる
+/// （暗黙の固有値解析・暗黙の `Analysis::prepare` の廃止）。
+#[test]
+fn test_sync_seismic_approx_mode_syncs_ex_ey_without_eigen() {
+    let mut app = App::default();
+    app.load_model(crate::sample::portal_frame());
+    assert_eq!(app.analysis_cfg.ai_mode, AiMode::Approx, "既定は略算のはず");
+    app.generate_stories_action();
+    assert!(app.last_error.is_none(), "{:?}", app.last_error);
+    assert!(
+        app.last_notice.is_none(),
+        "略算モードでは注意メッセージは出ないはず: {:?}",
+        app.last_notice
+    );
+    assert!(app.results.is_none(), "固有値解析は実行されていないはず");
+
+    let ex = app
+        .model
+        .load_cases
+        .iter()
+        .find(|lc| lc.name == EX_CASE_NAME)
+        .expect("EXケースが同期されるはず");
+    assert!(!ex.nodal.is_empty(), "EXには水平力が入っているはず");
+    let ey = app
+        .model
+        .load_cases
+        .iter()
+        .find(|lc| lc.name == EY_CASE_NAME)
+        .expect("EYケースが同期されるはず");
+    assert!(!ey.nodal.is_empty(), "EYには水平力が入っているはず");
+}
+
+/// 性能修正: 精算周期（`AiMode::SemiPrecise`）を選択したが固有値解析が
+/// 未実行の場合、`sync_seismic_load_cases_action` は EX/EY を更新せず、
+/// `last_notice` に実行を促すメッセージを設定する（`last_error` は使わない。
+/// 解析自体は継続してよいため）。
+#[test]
+fn test_sync_seismic_semiprecise_without_eigen_sets_notice_and_skips() {
+    let mut app = App::default();
+    app.load_model(crate::sample::portal_frame());
+    // まず既定(略算)で EX/EY を生成しておく。
+    app.generate_stories_action();
+    assert!(app.last_error.is_none(), "{:?}", app.last_error);
+    let ex_before = app
+        .model
+        .load_cases
+        .iter()
+        .find(|lc| lc.name == EX_CASE_NAME)
+        .cloned()
+        .expect("EXケースが同期されているはず");
+
+    // 精算周期へ切り替え、固有値解析は実行しない。
+    app.analysis_cfg.ai_mode = AiMode::SemiPrecise;
+    app.last_notice = None;
+    app.sync_seismic_load_cases_action();
+
+    assert!(
+        app.last_notice.is_some(),
+        "固有値解析未実行時は注意メッセージが設定されるはず"
+    );
+    let ex_after = app
+        .model
+        .load_cases
+        .iter()
+        .find(|lc| lc.name == EX_CASE_NAME)
+        .cloned()
+        .expect("EXケースは残っているはず（削除されない）");
+    assert_eq!(
+        ex_before, ex_after,
+        "固有値解析未実行時はEXケースが更新されないはず"
+    );
+
+    // run_seismic も同様に、解析を行わず last_error で案内する。
+    app.last_error = None;
+    app.run_seismic(SeismicDir::X);
+    assert!(
+        app.last_error.is_some(),
+        "SemiPreciseで固有値解析未実行ならrun_seismicはエラーを返すはず"
+    );
+}
+
+/// 性能修正: `sync_auto_load_cases_action` は前回同期時からモデル・関連設定
+/// （`analysis_cfg` の一部）が変わっていなければ DL/LL/EX/EY の再計算を
+/// 丸ごとスキップする。ハッシュが一致する状態を人為的に作り、既存の
+/// （手で壊した）荷重ケース内容が上書きされない＝スキップされたことを確認する。
+#[test]
+fn test_sync_auto_load_cases_action_skips_when_hash_unchanged() {
+    let mut app = App::default();
+    app.load_model(crate::sample::portal_frame());
+    app.generate_stories_action();
+    assert!(app.last_error.is_none(), "{:?}", app.last_error);
+
+    let ex_idx = app
+        .model
+        .load_cases
+        .iter()
+        .position(|lc| lc.name == EX_CASE_NAME)
+        .expect("EXケースが生成されているはず");
+    assert!(
+        !app.model.load_cases[ex_idx].nodal.is_empty(),
+        "前提: EXには水平力が入っているはず"
+    );
+    // EX ケースの内容を手で壊す。
+    app.model.load_cases[ex_idx].nodal.clear();
+    app.model.load_cases[ex_idx].member.clear();
+
+    // 「この(壊れた)モデル状態で同期済み」であるとキャッシュへ偽装する
+    // （`compute_auto_load_sync_hash` と同じロジック。Approx モードなので
+    // 固有周期 T のハッシュ組み込みは対象外）。
+    fn fake_hash(app: &App) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        if let Ok(bytes) = bincode::serialize(&app.model) {
+            bytes.hash(&mut hasher);
+        }
+        std::mem::discriminant(&app.analysis_cfg.ai_mode).hash(&mut hasher);
+        app.analysis_cfg.z.to_bits().hash(&mut hasher);
+        (app.analysis_cfg.soil as u8).hash(&mut hasher);
+        app.analysis_cfg.c0.to_bits().hash(&mut hasher);
+        hasher.finish()
+    }
+    app.auto_load_sync_hash = Some(fake_hash(&app));
+
+    app.sync_auto_load_cases_action();
+
+    let ex_after = &app.model.load_cases[ex_idx];
+    assert!(
+        ex_after.nodal.is_empty() && ex_after.member.is_empty(),
+        "ハッシュ一致時は同期がスキップされ、壊した内容がそのまま残るはず"
+    );
+}
+
 /// 剛床代表節点は慣性力重心に自動生成される。再度自動生成しても
 /// 既存の代表節点を再利用するため節点数が増えないことを確認する
 /// （story_gen + edit の統合: `generate_stories` → `ApplyStories` の往復）。
