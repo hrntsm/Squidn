@@ -54,7 +54,7 @@ mod section;
 // 鉄骨の断面検定における断面性能（fb・断面二次半径・断面欠損・横座屈長さ）は
 // `section` サブモジュールへ集約したうえで、従来のパス（`crate::steel::X`）を
 // 維持するために再エクスポートする。
-pub use section::{resolve_lb, steel_fb_h, steel_h_z_with_loss, steel_i_t};
+pub use section::{resolve_lb, steel_fb_h, steel_fb_h_new, steel_h_z_with_loss, steel_i_t};
 
 // ---------------------------------------------------------------------
 // 断面形状カテゴリ（`Section.shape` 優先、無ければ `Section.name` から推定。

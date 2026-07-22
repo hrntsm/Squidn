@@ -1,22 +1,38 @@
 //! 鉄骨造梁の断面検定（鋼構造設計規準の
 //! 鉄骨造梁の許容応力度検定）。
 //!
+//! 軸力（引張/圧縮）+ 二軸曲げ + せん断 + von Mises 型合成応力度の各検定比の
+//! 最大値を検定比とする（柱と同様の複合検定。梁は弱軸曲げ Qz・My も
+//! 検定する点が柱と異なる）。
+//!
 //! 検定比には含まれない参考情報として、大梁の必要横補剛数とたわみ
 //! （長期のみ）も併せて算定する。
 
-use crate::material_strength::{steel_fs, steel_ft};
-use crate::{CheckResult, DesignCtx, LoadTerm, MemberForcesAt};
+use crate::material_strength::{steel_fc, steel_fs, steel_ft};
+use crate::{effective_slenderness, CheckResult, DesignCtx, LoadTerm, MemberForcesAt, SteelFbRule};
 use squid_n_core::model::{Material, Section};
+use squid_n_core::section_shape::SectionShape;
 
 use super::section::{
-    resolve_lb, steel_fb_h, steel_h_z_with_loss, steel_i_t, steel_lateral_buckling_c,
+    resolve_lb, steel_fb_h, steel_fb_h_new, steel_h_z_with_loss, steel_lateral_buckling_c,
+    steel_lateral_buckling_i_af, steel_p_lambda_b,
 };
-use super::{nonzero, safe_denom, section_modulus, shape_of, shear_area, ShapeCategory};
+use super::{nonzero, safe_denom, section_modulus, shape_of, ShapeCategory};
 
 /// 鉄骨造梁の断面検定（鋼構造設計規準）。
 ///
-/// σb = |mz|/Z強軸 を fb（H形強軸は横座屈考慮、他は ft）で検定する。
-/// せん断は H形のみ von Mises 型（σb′, τ の合成）、他は単純 τ/fs。
+/// - 応力度: `σax=|N|/A`、`σby=|Mz|/Z強軸`（既存の断面欠損 Z' 処理は維持）、
+///   `σbz=|My|/Z弱軸`。円形鋼管は二軸曲げを合成した `σb=√(Mz²+My²)/Z強軸`
+///   を併せて用いる。
+/// - 組合せ検定: 圧縮時 `σc/fc+ΣσB/fb`、引張時 `(σt+ΣσB)/ft`（fc は座屈考慮、
+///   fb は H形強軸のみ横座屈考慮）。
+/// - 単独曲げ検定: `σby/fb_strong`・`σbz/fb_weak` を組合せ式とは別に検定比の
+///   `max` へ含める（軸力 N=0 の純曲げでも横座屈による fb の低減が効くように
+///   するため）。
+/// - せん断検定: 強軸/弱軸それぞれのせん断有効断面積 Ay/Az による `τ/fs`。
+/// - von Mises 検定: 形状ごとの合成応力度（H形はウェブ端の曲げ応力度 σb′
+///   を用いた 2 方向せん断それぞれの式の大きい方）を ft で検定する。
+///
 /// 検定比には含まれない参考情報として、detail 末尾に大梁の必要横補剛数
 /// （[`steel_required_lateral_bracing_count`]）とたわみ
 /// （[`steel_beam_deflection`]、長期のみ）を付記する。
@@ -30,6 +46,7 @@ pub(crate) fn check_beam(
 ) -> CheckResult {
     let h = sec.depth;
     let b = sec.width;
+    let area = nonzero(sec.area);
     let (shape, tf, tw) = shape_of(sec);
 
     // 断面欠損（継手部の欠損率 βf/βw・端部スカラップ αw）を考慮した断面係数。
@@ -56,21 +73,28 @@ pub(crate) fn check_beam(
         }
         _ => nonzero(section_modulus(sec.iy, h / 2.0)),
     };
-    // 曲げ応力度 σb = |Mz| / Z強軸（強軸まわり断面係数）。
-    let sigma_b = forces.mz.abs() / z_strong;
+    let z_weak = nonzero(section_modulus(sec.iz, b / 2.0));
+
+    // 応力度: σax=|N|/A（引張/圧縮共通）、σby=|Mz|/Z強軸、σbz=|My|/Z弱軸。
+    let sigma_ax = forces.n.abs() / area;
+    let sigma_by = forces.mz.abs() / z_strong;
+    let sigma_bz = forces.my.abs() / z_weak;
+    // 円形鋼管の合成曲げ応力度 σb=√(Mz²+My²)/Z強軸（強軸/弱軸を区別しない）。
+    let sigma_b_pipe = (forces.mz.powi(2) + forces.my.powi(2)).sqrt() / z_strong;
 
     let ft_val = steel_ft(f, term);
     let fs_val = steel_fs(f, term);
 
-    let as_shear = shear_area(shape, sec, tw);
-    // せん断応力度 τ = Qy / As（せん断有効断面積）。
-    let tau = forces.qy.abs() / safe_denom(as_shear);
+    // 座屈を考慮した許容圧縮応力度 fc（column.rs と同じ流儀）。
+    // λ = max(lk_y/i_y, lk_z/i_z)（強軸・弱軸を個別の座屈長さで評価）。
+    let lambda = effective_slenderness(sec.iy, sec.iz, area, ctx.length, ctx.lk_y, ctx.lk_z);
+    let fc_val = steel_fc(f, lambda, term);
 
-    let (fb, ratio_shear, shear_basis);
-    match shape {
+    // 許容曲げ応力度 fb: H形強軸のみ横座屈考慮（旧基準/新基準の切替）、他は ft。
+    // 弱軸は横座屈を考慮しないため常に ft。
+    let fb_weak = ft_val;
+    let fb_strong = match shape {
         ShapeCategory::H => {
-            let af = b * tf;
-            let i_t = steel_i_t(b, tf, h, tw);
             // 横座屈長さ lb の優先順位: ctx.lb 直接指定 > SteelDesignAttr
             // （直接入力 (始端,中央,終端)／等間隔補剛 L/(n+1)）> 部材長。
             let lb = ctx.lb.unwrap_or_else(|| {
@@ -87,40 +111,120 @@ pub(crate) fn check_beam(
             } else {
                 steel_lateral_buckling_c(ctx)
             };
-            fb = steel_fb_h(f, term, lb, i_t, h, af, c);
-            // H形ウェブの von Mises 型合成検定（鋼構造設計規準）:
-            // σb′ = σb・(H−2tf)/H（ウェブ負担分に換算した曲げ応力度）、
-            // √(σb′² + 3τ²)/ft と τ/fs の大きい方を検定比とする。
-            let sigma_b_prime = sigma_b * (h - 2.0 * tf).max(0.0) / safe_denom(h);
-            let von_mises = (sigma_b_prime.powi(2) + 3.0 * tau.powi(2)).sqrt() / safe_denom(ft_val);
-            ratio_shear = von_mises.max(tau / safe_denom(fs_val));
-            shear_basis = "H形ウェブ von Mises 照査 (鋼構造設計規準)";
+            match ctx.steel_fb_rule {
+                SteelFbRule::Old => {
+                    let (i_t, af) = steel_lateral_buckling_i_af(sec, tf, tw);
+                    steel_fb_h(f, term, lb, i_t, h, af, c)
+                }
+                SteelFbRule::New => {
+                    let iz = sec.iz;
+                    let iw = steel_warping_constant(sec, tf);
+                    let j = sec.j;
+                    let e = mat.young;
+                    let g = mat.shear.unwrap_or(e / (2.0 * (1.0 + mat.poisson)));
+                    let p_lambda_b = steel_p_lambda_b(ctx);
+                    steel_fb_h_new(f, term, lb, iz, iw, j, e, g, z_strong, c, p_lambda_b)
+                }
+            }
         }
-        _ => {
-            fb = ft_val;
-            // H形以外は単純せん断検定 τ/fs。
-            ratio_shear = tau / safe_denom(fs_val);
-            shear_basis = "H形以外 τ/fs (鋼構造設計規準)";
-        }
-    }
+        _ => ft_val,
+    };
 
-    // 曲げ検定比 σb/fb。
-    let ratio_bend = sigma_b / safe_denom(fb);
-    let ratio = ratio_bend.max(ratio_shear);
+    // 組合せ検定（軸力+二軸曲げ）。
+    let (ratio_comb, axial_basis) = if forces.n < 0.0 {
+        let ratio = match shape {
+            ShapeCategory::Pipe => {
+                sigma_ax / safe_denom(fc_val) + sigma_b_pipe / safe_denom(fb_strong)
+            }
+            _ => {
+                sigma_ax / safe_denom(fc_val)
+                    + sigma_by / safe_denom(fb_strong)
+                    + sigma_bz / safe_denom(fb_weak)
+            }
+        };
+        (ratio, "圧縮+曲げ: σc/fc(座屈考慮)+ΣσB/fb")
+    } else {
+        let ratio = match shape {
+            ShapeCategory::Pipe => (sigma_ax + sigma_b_pipe) / safe_denom(ft_val),
+            _ => (sigma_ax + sigma_by + sigma_bz) / safe_denom(ft_val),
+        };
+        (ratio, "引張+曲げ: (σt+ΣσB)/ft")
+    };
+
+    // 単独曲げ検定（Util-My/Util-Mz）。N=0 の純曲げでも横座屈による fb の
+    // 低減が効くよう、組合せ式とは別に検定比の max へ加える。
+    let (ratio_my, ratio_mz) = match shape {
+        ShapeCategory::Pipe => (sigma_b_pipe / safe_denom(fb_strong), 0.0),
+        _ => (
+            sigma_by / safe_denom(fb_strong),
+            sigma_bz / safe_denom(fb_weak),
+        ),
+    };
+
+    // せん断検定（強軸 Qy・弱軸 Qz それぞれのせん断有効断面積による τ/fs）。
+    let (ay, az) = beam_shear_area(shape, sec, tf, tw);
+    let tau_y = forces.qy.abs() / safe_denom(ay);
+    let tau_z = forces.qz.abs() / safe_denom(az);
+    let ratio_vy = tau_y / safe_denom(fs_val);
+    let ratio_vz = tau_z / safe_denom(fs_val);
+
+    // von Mises 型合成検定（すべて分母 ft）。
+    let mises_ratio = match shape {
+        ShapeCategory::H => {
+            // σb′ = σby・(H−2tf)/H（ウェブ端の曲げ応力度に換算）。
+            let sigma_b_prime = sigma_by * (h - 2.0 * tf).max(0.0) / safe_denom(h);
+            let case_y = ((sigma_ax + sigma_b_prime).powi(2) + 3.0 * tau_y.powi(2)).sqrt();
+            let case_z = ((sigma_ax + sigma_by + sigma_bz).powi(2) + 3.0 * tau_z.powi(2)).sqrt();
+            case_y.max(case_z) / safe_denom(ft_val)
+        }
+        ShapeCategory::Pipe => {
+            // 円形鋼管は中立軸検定（曲げ項なし）。
+            (sigma_ax.powi(2) + 3.0 * (tau_y.powi(2) + tau_z.powi(2))).sqrt() / safe_denom(ft_val)
+        }
+        // 角形鋼管・その他: 安全側の一般化として角形と同式を用いる。
+        _ => {
+            let tau_max = tau_y.max(tau_z);
+            ((sigma_ax + sigma_by + sigma_bz).powi(2) + 3.0 * tau_max.powi(2)).sqrt()
+                / safe_denom(ft_val)
+        }
+    };
+
+    let ratio = ratio_comb
+        .max(ratio_my)
+        .max(ratio_mz)
+        .max(ratio_vy)
+        .max(ratio_vz)
+        .max(mises_ratio);
 
     let term_label = match term {
         LoadTerm::Long => "長期",
         LoadTerm::Short => "短期",
     };
+    let fb_rule_label = match ctx.steel_fb_rule {
+        SteelFbRule::Old => "旧基準",
+        SteelFbRule::New => "新基準",
+    };
     let basis = format!(
-        "鋼構造設計規準 {} 梁: 曲げ σ/fb (横座屈考慮={}) と せん断 {}",
-        term_label,
-        matches!(shape, ShapeCategory::H),
-        shear_basis
+        "鋼構造設計規準 {} 梁: 軸力+二軸曲げ・せん断・von Mises ({}, fb={})",
+        term_label, axial_basis, fb_rule_label
     );
     let mut detail = format!(
-        "σ={:.4} N/mm², fb={:.4} N/mm², τ={:.4} N/mm², fs={:.4} N/mm², 曲げ比={:.4}, せん断比={:.4}",
-        sigma_b, fb, tau, fs_val, ratio_bend, ratio_shear
+        "σax={:.4} N/mm², σby={:.4} N/mm², σbz={:.4} N/mm², fc={:.4} N/mm², fb={:.4} N/mm², \
+τy={:.4} N/mm², τz={:.4} N/mm², 組合せ比={:.4}, My比={:.4}, Mz比={:.4}, Vy比={:.4}, Vz比={:.4}, \
+Mises比={:.4}",
+        sigma_ax,
+        sigma_by,
+        sigma_bz,
+        fc_val,
+        fb_strong,
+        tau_y,
+        tau_z,
+        ratio_comb,
+        ratio_my,
+        ratio_mz,
+        ratio_vy,
+        ratio_vz,
+        mises_ratio
     );
 
     if let Some((n, lambda_y)) = steel_required_lateral_bracing_count(f, ctx.length, sec) {
@@ -140,6 +244,110 @@ pub(crate) fn check_beam(
         ok: ratio <= 1.0,
         basis,
         detail,
+    }
+}
+
+// ---------------------------------------------------------------------
+// 新基準 fb 用の曲げねじり定数 Iw
+// ---------------------------------------------------------------------
+
+/// 曲げねじり定数 Iw [mm⁶]（新基準 fb 用）。
+///
+/// - `SteelBuiltH`（非対称組立 H）: 上下フランジの寸法から個別に
+///   `I_u=t_u・b_u³/12`、`I_l=t_l・b_l³/12` を求め、`hf=H−(t_u+t_l)/2`
+///   （上下フランジ図心間距離）として `Iw=hf²・I_u・I_l/(I_u+I_l)`
+///   （上下フランジの曲げ剛性比に応じてねじり中心が偏心する非対称 H 用の式）。
+/// - それ以外（`SteelH` および shape 無しのフォールバック）: `Iz・(H−tf)²/4`
+///   （上下フランジ対称、`Iz` はフランジ図心間の距離の半分だけ離れた 2 枚の
+///   フランジが負担するとみなす近似式）。
+fn steel_warping_constant(sec: &Section, tf: f64) -> f64 {
+    match &sec.shape {
+        Some(SectionShape::SteelBuiltH {
+            height,
+            upper_width,
+            upper_thick,
+            lower_width,
+            lower_thick,
+            ..
+        }) => {
+            let hf = height - (upper_thick + lower_thick) / 2.0;
+            let i_u = upper_thick * upper_width.powi(3) / 12.0;
+            let i_l = lower_thick * lower_width.powi(3) / 12.0;
+            let denom = i_u + i_l;
+            if denom > 1e-12 {
+                hf * hf * i_u * i_l / denom
+            } else {
+                0.0
+            }
+        }
+        _ => {
+            let h = sec.depth;
+            sec.iz * (h - tf).powi(2) / 4.0
+        }
+    }
+}
+
+// ---------------------------------------------------------------------
+// 梁のせん断有効断面積（強軸 Ay・弱軸 Az）
+// ---------------------------------------------------------------------
+
+/// 梁のせん断有効断面積 `(Ay, Az)` [mm²]。柱の検定で共有する
+/// [`super::shear_area`]（強軸のみ）とは別に、梁は弱軸せん断 Qz も検定する
+/// ため両方向を求める。
+///
+/// - H形: `Ay=tw・(H−2tf)`（ウェブ有効せい×ウェブ厚）、
+///   `Az=2・B・tf/1.5`（上下フランジ断面積を応力分布係数 1.5 で低減）。
+/// - 角形鋼管: 角部外半径 r は断面定義時の入力値（`SteelBox.corner_r`）を
+///   用いる。`r>0` は角部を 1/4 円弧とみなし直線部＋角部円弧の断面積を
+///   合算する: `Ay=2{t・max(H−2r,0)+π・t・(2r−t)/4}`（`Az` は `H` を `B` に
+///   置き換えた同式）。`r=0`（未入力・名前推定フォールバック・角部半径を
+///   持たない CftBox）は角部を直角とみなし `Ay=2t・max(H−2t,0)`（`Az` は
+///   同様に `B`）。
+/// - 円形鋼管: `Ay=Az=π・t・(D−t)/2`（薄肉円管のせん断有効断面積。
+///   `D=sec.depth` は外径）。
+/// - その他: `Ay=as_y>0 ? as_y : area`、`Az=as_z>0 ? as_z : area`。
+fn beam_shear_area(shape: ShapeCategory, sec: &Section, tf: f64, tw: f64) -> (f64, f64) {
+    let h = sec.depth;
+    let b = sec.width;
+    match shape {
+        ShapeCategory::H => {
+            let ay = (tw * (h - 2.0 * tf).max(0.0)).max(0.0);
+            let az = (2.0 * b * tf / 1.5).max(0.0);
+            (ay, az)
+        }
+        ShapeCategory::Box => {
+            // 角形鋼管は tf=tw=t（shape_of 参照）。角部外半径 r は断面入力値。
+            let t = tw;
+            let r = match &sec.shape {
+                Some(SectionShape::SteelBox { corner_r, .. }) => corner_r.max(0.0),
+                _ => 0.0,
+            };
+            let (ay, az) = if r > 1e-9 {
+                let corner = (std::f64::consts::PI * t * (2.0 * r - t) / 4.0).max(0.0);
+                (
+                    2.0 * (t * (h - 2.0 * r).max(0.0) + corner),
+                    2.0 * (t * (b - 2.0 * r).max(0.0) + corner),
+                )
+            } else {
+                // 角部直角（未入力・CftBox・名前推定フォールバック）。
+                (
+                    2.0 * t * (h - 2.0 * t).max(0.0),
+                    2.0 * t * (b - 2.0 * t).max(0.0),
+                )
+            };
+            (ay.max(0.0), az.max(0.0))
+        }
+        ShapeCategory::Pipe => {
+            let t = tw;
+            let d = sec.depth;
+            let a = (std::f64::consts::PI * t * (d - t) / 2.0).max(0.0);
+            (a, a)
+        }
+        ShapeCategory::Other => {
+            let ay = if sec.as_y > 0.0 { sec.as_y } else { sec.area };
+            let az = if sec.as_z > 0.0 { sec.as_z } else { sec.area };
+            (ay, az)
+        }
     }
 }
 
@@ -392,10 +600,12 @@ mod tests {
             ..Default::default()
         };
         let result = SteelDesign.check(&forces, &sec, &mat_v, &ctx);
-        // τ = Q/(t·H) = 200000/(15*300) = 44.444..., fs = 235/(1.5√3)=90.44
-        let tau = 200_000.0 / (15.0 * 300.0);
+        // 名前推定フォールバックは tf=tw=15 の単一板厚近似のため
+        // Ay=tw・(H−2tf)=15・(300−30)=4050（新式・H形）。
+        let ay = 15.0 * (300.0 - 2.0 * 15.0);
+        let tau = 200_000.0 / ay;
         let fs = 235.0 / (1.5 * 3.0_f64.sqrt());
-        let expected_ratio_shear = tau / fs; // σb=0 なので von Mises 側は τ/fs と一致するはず
+        let expected_ratio_shear = tau / fs; // σ=0 なので von Mises 側は τ/fs と一致するはず
         assert!(
             (result.ratio - expected_ratio_shear).abs() < 1e-6,
             "ratio={} expected={}",
@@ -429,8 +639,9 @@ mod tests {
             ..Default::default()
         };
         let result = SteelDesign.check(&forces, &sec, &mat_v, &ctx);
-        // τ = Q/(tw·H) = 100000/(10·400) = 25.0
-        let tau = 100_000.0 / (10.0 * 400.0);
+        // Ay=tw・(H−2tf)=10・(400−30)=3700。
+        let ay = 10.0 * (400.0 - 2.0 * 15.0);
+        let tau = 100_000.0 / ay;
         let fs = 235.0 / (1.5 * 3.0_f64.sqrt());
         let expected = ((3.0_f64.sqrt() * tau) / (235.0 / 1.5)).max(tau / fs);
         assert!(
@@ -467,6 +678,491 @@ mod tests {
             "detail should show fb from F=215: {}",
             result.detail
         );
+    }
+
+    // -------------------------------------------------------------
+    // 組合せ検定（軸力+二軸曲げ）
+    // -------------------------------------------------------------
+
+    /// 圧縮軸力+二軸曲げ（H形）: σc/fc+σby/fb+σbz/ft を手計算照合する。
+    #[test]
+    fn test_beam_check_compression_biaxial_bending_hand_calc() {
+        let sec = h_section(400.0, 200.0, 8.0, 13.0);
+        let mat_v = mat("SN400B");
+        let forces = MemberForcesAt {
+            pos: 0.5,
+            n: -200_000.0,
+            qy: 0.0,
+            qz: 0.0,
+            my: 5e6,
+            mz: 8e7,
+        };
+        let ctx = DesignCtx {
+            term: LoadTerm::Long,
+            kind: MemberKind::Beam,
+            length: 4000.0,
+            ..Default::default()
+        };
+        let result = SteelDesign.check(&forces, &sec, &mat_v, &ctx);
+
+        let f = 235.0;
+        let area = sec.area;
+        let z_strong = sec.iy / (sec.depth / 2.0);
+        let z_weak = sec.iz / (sec.width / 2.0);
+        let sigma_c = 200_000.0 / area;
+        let sigma_by = 8e7_f64 / z_strong;
+        let sigma_bz = 5e6_f64 / z_weak;
+
+        let i_min = (sec.iy.min(sec.iz) / area).sqrt();
+        let lambda = 4000.0 / i_min;
+        let fc = steel_fc(f, lambda, LoadTerm::Long);
+        let ft = steel_ft(f, LoadTerm::Long);
+        // fb_strong は横座屈考慮（既存ロジック、H形は steel_lateral_buckling_i_af
+        // で (i,af) を解決する）。この内力配分では組合せ式が支配的となる
+        // （σax が大きく、mises 式の σax+σby′ 項に対し fc・fb の分母が効くため）。
+        let (i_t, af) = steel_lateral_buckling_i_af(&sec, 13.0, 8.0);
+        let fb_strong = steel_fb_h(f, LoadTerm::Long, 4000.0, i_t, 400.0, af, 1.0);
+        let expected_comb = sigma_c / fc + sigma_by / fb_strong + sigma_bz / ft;
+        assert!(
+            (result.ratio - expected_comb).abs() < 1e-9,
+            "ratio={} expected_comb={}",
+            result.ratio,
+            expected_comb
+        );
+    }
+
+    /// 引張軸力+二軸曲げ: (σt+σby+σbz)/ft を手計算照合する。
+    #[test]
+    fn test_beam_check_tension_biaxial_bending_hand_calc() {
+        let sec = h_section(400.0, 200.0, 8.0, 13.0);
+        let mat_v = mat("SN400B");
+        let forces = MemberForcesAt {
+            pos: 0.5,
+            n: 200_000.0,
+            qy: 0.0,
+            qz: 0.0,
+            my: 5e6,
+            mz: 8e7,
+        };
+        let ctx = DesignCtx {
+            term: LoadTerm::Long,
+            kind: MemberKind::Beam,
+            length: 4000.0,
+            ..Default::default()
+        };
+        let result = SteelDesign.check(&forces, &sec, &mat_v, &ctx);
+
+        let f = 235.0;
+        let area = sec.area;
+        let z_strong = sec.iy / (sec.depth / 2.0);
+        let z_weak = sec.iz / (sec.width / 2.0);
+        let sigma_t = 200_000.0 / area;
+        let sigma_by = 8e7_f64 / z_strong;
+        let sigma_bz = 5e6_f64 / z_weak;
+        let ft = steel_ft(f, LoadTerm::Long);
+        let expected_comb = (sigma_t + sigma_by + sigma_bz) / ft;
+        // 引張側は von Mises 式（Qz=0）の case_z 項と同値になり、必ず検定比の
+        // max に一致する（(σt+σby+σbz)/ft = √((σt+σby+σbz)²+3・0²)/ft）。
+        assert!(
+            (result.ratio - expected_comb).abs() < 1e-9,
+            "ratio={} expected_comb={}",
+            result.ratio,
+            expected_comb
+        );
+    }
+
+    /// 円形鋼管の合成曲げ: mz 単独と mz/my 分配で検定比がほぼ一致する
+    /// （σb=√(mz²+my²)/Z強軸に一本化されるため、合成モーメントの大きさが
+    /// 同じであれば分配方法によらず一致するはず）。
+    #[test]
+    fn test_beam_check_pipe_combines_biaxial_bending() {
+        let mut sec = rect_section(300.0, 300.0, "PIPE-300x12");
+        sec.iz = sec.iy; // 円形は iy=iz
+        sec.thickness = Some(12.0);
+        let mat_v = mat("SN400");
+        let forces_mz_only = MemberForcesAt {
+            pos: 0.5,
+            n: -50_000.0,
+            qy: 0.0,
+            qz: 0.0,
+            my: 0.0,
+            mz: 30e6,
+        };
+        let forces_split = MemberForcesAt {
+            pos: 0.5,
+            n: -50_000.0,
+            qy: 0.0,
+            qz: 0.0,
+            my: 30e6 / std::f64::consts::SQRT_2,
+            mz: 30e6 / std::f64::consts::SQRT_2,
+        };
+        let ctx = DesignCtx {
+            term: LoadTerm::Long,
+            kind: MemberKind::Beam,
+            length: 3000.0,
+            ..Default::default()
+        };
+        let r1 = SteelDesign.check(&forces_mz_only, &sec, &mat_v, &ctx);
+        let r2 = SteelDesign.check(&forces_split, &sec, &mat_v, &ctx);
+        assert!(
+            (r1.ratio - r2.ratio).abs() < 1e-6,
+            "pipe combined bending mismatch: {} vs {}",
+            r1.ratio,
+            r2.ratio
+        );
+    }
+
+    // -------------------------------------------------------------
+    // せん断検定（弱軸 Qz・角形鋼管）
+    // -------------------------------------------------------------
+
+    /// H形の弱軸せん断 Qz: Az=2・B・tf/1.5 の手計算照合。
+    #[test]
+    fn test_beam_check_shear_qz_h_shape_hand_calc() {
+        let sec = h_section(400.0, 200.0, 10.0, 15.0);
+        let mat_v = mat("SN400");
+        let forces = MemberForcesAt {
+            pos: 0.5,
+            n: 0.0,
+            qy: 0.0,
+            qz: 60_000.0,
+            my: 0.0,
+            mz: 0.0,
+        };
+        let ctx = DesignCtx {
+            term: LoadTerm::Long,
+            kind: MemberKind::Beam,
+            length: 0.0,
+            ..Default::default()
+        };
+        let result = SteelDesign.check(&forces, &sec, &mat_v, &ctx);
+
+        let az = 2.0 * 200.0 * 15.0 / 1.5;
+        let tau_z = 60_000.0_f64 / az;
+        let fs = steel_fs(235.0, LoadTerm::Long);
+        let expected = tau_z / fs;
+        assert!(
+            (result.ratio - expected).abs() < 1e-9,
+            "ratio={} expected={}",
+            result.ratio,
+            expected
+        );
+    }
+
+    /// 角形鋼管のせん断有効断面積: 断面入力の角部外半径 corner_r を用いた
+    /// 式の手計算照合（r=30mm を明示入力）。
+    #[test]
+    fn test_beam_check_shear_box_corner_radius_hand_calc() {
+        use squid_n_core::ids::SectionId;
+        use squid_n_core::section_shape::SectionShape;
+        let shape = SectionShape::SteelBox {
+            height: 300.0,
+            width: 300.0,
+            thick: 12.0,
+            corner_r: 30.0,
+        };
+        let sec = shape.to_section(SectionId(0), "BOX-300x300x12".to_string());
+        let mat_v = mat("SN400");
+        let forces = MemberForcesAt {
+            pos: 0.5,
+            n: 0.0,
+            qy: 150_000.0,
+            qz: 0.0,
+            my: 0.0,
+            mz: 0.0,
+        };
+        let ctx = DesignCtx {
+            term: LoadTerm::Long,
+            kind: MemberKind::Beam,
+            length: 0.0,
+            ..Default::default()
+        };
+        let result = SteelDesign.check(&forces, &sec, &mat_v, &ctx);
+
+        let t = 12.0_f64;
+        let h = 300.0_f64;
+        let r = 30.0_f64;
+        let corner = std::f64::consts::PI * t * (2.0 * r - t) / 4.0;
+        let ay = 2.0 * (t * (h - 2.0 * r).max(0.0) + corner);
+        let tau_y = 150_000.0_f64 / ay;
+        let fs = steel_fs(235.0, LoadTerm::Long);
+        let expected = tau_y / fs;
+        assert!(
+            (result.ratio - expected).abs() < 1e-9,
+            "ratio={} expected={}",
+            result.ratio,
+            expected
+        );
+    }
+
+    /// 角形鋼管の角部外半径が未入力（r=0。名前推定フォールバック含む）の場合は
+    /// 角部を直角とみなし Ay=2t(H−2t) となる。
+    #[test]
+    fn test_beam_check_shear_box_r_zero_falls_back_to_sharp_corner() {
+        let mut sec = rect_section(300.0, 300.0, "BOX-300x300x12");
+        sec.thickness = Some(12.0);
+        let mat_v = mat("SN400");
+        let forces = MemberForcesAt {
+            pos: 0.5,
+            n: 0.0,
+            qy: 150_000.0,
+            qz: 0.0,
+            my: 0.0,
+            mz: 0.0,
+        };
+        let ctx = DesignCtx {
+            term: LoadTerm::Long,
+            kind: MemberKind::Beam,
+            length: 0.0,
+            ..Default::default()
+        };
+        let result = SteelDesign.check(&forces, &sec, &mat_v, &ctx);
+
+        let t = 12.0_f64;
+        let h = 300.0_f64;
+        let ay = 2.0 * t * (h - 2.0 * t);
+        let tau_y = 150_000.0_f64 / ay;
+        let fs = steel_fs(235.0, LoadTerm::Long);
+        let expected = tau_y / fs;
+        assert!(
+            (result.ratio - expected).abs() < 1e-9,
+            "ratio={} expected={}",
+            result.ratio,
+            expected
+        );
+    }
+
+    // -------------------------------------------------------------
+    // 新基準 fb（AIJ-ASD19）
+    // -------------------------------------------------------------
+
+    /// steel_fb_rule 未指定（既定 Old）では従来値（steel_fb_h）と一致する。
+    #[test]
+    fn test_beam_check_fb_rule_default_matches_old() {
+        let sec = h_section(400.0, 200.0, 8.0, 13.0);
+        let mat_v = mat("SN400B");
+        let forces = MemberForcesAt {
+            pos: 0.5,
+            n: 0.0,
+            qy: 0.0,
+            qz: 0.0,
+            my: 0.0,
+            mz: 5e7,
+        };
+        let ctx = DesignCtx {
+            term: LoadTerm::Long,
+            kind: MemberKind::Beam,
+            length: 6000.0,
+            ..Default::default()
+        };
+        assert_eq!(ctx.steel_fb_rule, SteelFbRule::Old);
+        let result = SteelDesign.check(&forces, &sec, &mat_v, &ctx);
+
+        let f = 235.0;
+        let (i_t, af) = steel_lateral_buckling_i_af(&sec, 13.0, 8.0);
+        let fb_expected = steel_fb_h(f, LoadTerm::Long, 6000.0, i_t, 400.0, af, 1.0);
+        assert!(
+            result.detail.contains(&format!("fb={:.4}", fb_expected)),
+            "detail={}",
+            result.detail
+        );
+    }
+
+    /// 新基準 fb: λb ≤ pλb（横座屈長さが短い）では fb=F/ν（全塑性域）。
+    #[test]
+    fn test_beam_check_fb_rule_new_plastic_region() {
+        let sec = h_section(400.0, 200.0, 8.0, 13.0);
+        let mat_v = mat("SN400B");
+        let forces = MemberForcesAt {
+            pos: 0.5,
+            n: 0.0,
+            qy: 0.0,
+            qz: 0.0,
+            my: 0.0,
+            mz: 5e7,
+        };
+        let ctx = DesignCtx {
+            term: LoadTerm::Long,
+            kind: MemberKind::Beam,
+            length: 300.0, // 十分短い横座屈長さ→全塑性域
+            steel_fb_rule: SteelFbRule::New,
+            ..Default::default()
+        };
+        let result = SteelDesign.check(&forces, &sec, &mat_v, &ctx);
+
+        let f = 235.0;
+        let z_strong = sec.iy / (sec.depth / 2.0);
+        let iw = steel_warping_constant(&sec, 13.0);
+        let e = mat_v.young;
+        let g = e / (2.0 * (1.0 + mat_v.poisson));
+        let p_lambda_b = steel_p_lambda_b(&ctx);
+        let lb = 300.0_f64;
+
+        // My, Me, λb を独立に計算し、λb ≤ pλb（全塑性域）であることを確認したうえで
+        // fb=F/ν と一致することを検算する。
+        let my = f * z_strong;
+        let pi2 = std::f64::consts::PI.powi(2);
+        let pi4 = std::f64::consts::PI.powi(4);
+        let me = (pi4 * e * sec.iz * e * iw / lb.powi(4)
+            + pi2 * e * sec.iz * g * sec.j / lb.powi(2))
+        .sqrt();
+        let lambda_b = (my / me).sqrt();
+        assert!(
+            lambda_b <= p_lambda_b,
+            "lambda_b={} p_lambda_b={} 全塑性域前提",
+            lambda_b,
+            p_lambda_b
+        );
+        let e_lambda_b = 1.0 / 0.6_f64.sqrt();
+        let nu = 1.5 + (2.0 / 3.0) * (lambda_b / e_lambda_b).powi(2);
+        let expected = f / nu;
+
+        let fb_expected = steel_fb_h_new(
+            f,
+            LoadTerm::Long,
+            lb,
+            sec.iz,
+            iw,
+            sec.j,
+            e,
+            g,
+            z_strong,
+            1.0,
+            p_lambda_b,
+        );
+        assert!(
+            (fb_expected - expected).abs() < 1e-6,
+            "fb_expected={} expected={}",
+            fb_expected,
+            expected
+        );
+        assert!(
+            result.detail.contains(&format!("fb={:.4}", fb_expected)),
+            "detail={}",
+            result.detail
+        );
+    }
+
+    /// 新基準 fb: eλb < λb（横座屈長さが長い）では弾性域式 fb=F/(2.17λb²)。
+    #[test]
+    fn test_beam_check_fb_rule_new_elastic_region() {
+        let f = 235.0;
+        let sec = h_section(400.0, 200.0, 8.0, 13.0);
+        let mat_v = mat("SN400B");
+        let z_strong = sec.iy / (sec.depth / 2.0);
+        let iw = steel_warping_constant(&sec, 13.0);
+        let g = mat_v.young / (2.0 * (1.0 + mat_v.poisson));
+        let ctx = DesignCtx {
+            term: LoadTerm::Long,
+            kind: MemberKind::Beam,
+            length: 20_000.0, // 十分長い横座屈長さ→弾性域
+            steel_fb_rule: SteelFbRule::New,
+            ..Default::default()
+        };
+        let p_lambda_b = steel_p_lambda_b(&ctx);
+        let lb = 20_000.0;
+        let fb = steel_fb_h_new(
+            f,
+            LoadTerm::Long,
+            lb,
+            sec.iz,
+            iw,
+            sec.j,
+            mat_v.young,
+            g,
+            z_strong,
+            1.0,
+            p_lambda_b,
+        );
+
+        let my = f * z_strong;
+        let e = mat_v.young;
+        let pi2 = std::f64::consts::PI.powi(2);
+        let pi4 = std::f64::consts::PI.powi(4);
+        let me = (pi4 * e * sec.iz * e * iw / lb.powi(4)
+            + pi2 * e * sec.iz * g * sec.j / lb.powi(2))
+        .sqrt();
+        let lambda_b = (my / me).sqrt();
+        let e_lambda_b = 1.0 / 0.6_f64.sqrt();
+        assert!(lambda_b > e_lambda_b, "lambda_b={} 弾性域前提", lambda_b);
+        let expected = f / (2.17 * lambda_b * lambda_b);
+        assert!(
+            (fb - expected).abs() < 1e-6,
+            "fb={} expected={}",
+            fb,
+            expected
+        );
+    }
+
+    /// 新基準 fb: lb=0 では横座屈を考慮しない fb=ft。
+    #[test]
+    fn test_beam_check_fb_rule_new_lb_zero_equals_ft() {
+        let f = 235.0;
+        let z_strong = 1.0e6;
+        let fb = steel_fb_h_new(
+            f,
+            LoadTerm::Long,
+            0.0,
+            1.0e7,
+            1.0e12,
+            1.0e5,
+            205_000.0,
+            79_000.0,
+            z_strong,
+            1.0,
+            0.3,
+        );
+        let ft = steel_ft(f, LoadTerm::Long);
+        assert!((fb - ft).abs() < 1e-9, "fb={} ft={}", fb, ft);
+    }
+
+    // -------------------------------------------------------------
+    // steel_p_lambda_b（塑性限界細長比 pλb）
+    // -------------------------------------------------------------
+
+    /// 座屈区間中央の曲げが両端部より大きい場合は安全側 pλb=0.3。
+    #[test]
+    fn test_p_lambda_b_mid_moment_dominant_is_0_3() {
+        let ctx = DesignCtx {
+            end_moments_z: Some((50.0, 50.0)),
+            mid_moment_z: Some(200.0),
+            ..Default::default()
+        };
+        let p = steel_p_lambda_b(&ctx);
+        assert!((p - 0.3).abs() < 1e-9, "p={}", p);
+    }
+
+    /// 単曲率・等曲げ（M2/M1=−1）→ pλb=0.6−0.3=0.3。
+    #[test]
+    fn test_p_lambda_b_single_curvature_uniform_is_0_3() {
+        let ctx = DesignCtx {
+            end_moments_z: Some((100.0, 100.0)),
+            ..Default::default()
+        };
+        let p = steel_p_lambda_b(&ctx);
+        assert!((p - 0.3).abs() < 1e-9, "p={}", p);
+    }
+
+    /// 複曲率・等曲げ（M2/M1=+1）→ pλb=0.6+0.3=0.9。
+    #[test]
+    fn test_p_lambda_b_double_curvature_uniform_is_0_9() {
+        let ctx = DesignCtx {
+            end_moments_z: Some((100.0, -100.0)),
+            ..Default::default()
+        };
+        let p = steel_p_lambda_b(&ctx);
+        assert!((p - 0.9).abs() < 1e-9, "p={}", p);
+    }
+
+    /// end_moments_z が None の場合は安全側 pλb=0.3。
+    #[test]
+    fn test_p_lambda_b_none_end_moments_is_0_3() {
+        let ctx = DesignCtx {
+            end_moments_z: None,
+            ..Default::default()
+        };
+        let p = steel_p_lambda_b(&ctx);
+        assert!((p - 0.3).abs() < 1e-9, "p={}", p);
     }
 
     // -------------------------------------------------------------
