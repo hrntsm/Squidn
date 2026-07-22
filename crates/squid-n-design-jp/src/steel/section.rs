@@ -5,8 +5,10 @@
 //! 断面欠損（継手部・スカラップ）を考慮した断面係数 Z'・横座屈長さ lb の
 //! 解決を扱う。
 
-use crate::material_strength::big_lambda;
+use crate::material_strength::{big_lambda, steel_ft};
 use crate::{DesignCtx, LoadTerm};
+use squid_n_core::model::Section;
+use squid_n_core::section_shape::SectionShape;
 
 use super::section_modulus;
 
@@ -17,14 +19,64 @@ use super::section_modulus;
 /// 「圧縮フランジ＋せいの 1/6 のウェブ」からなる T 形断面の、ウェブ軸まわり
 /// 断面二次半径 `i = √(I_T/A_T)`（鋼構造設計規準 1973、横座屈許容曲げ fb1 用）。
 ///
-/// `I_T = tf·B³/12 + (h/6)·tw³/12`、`A_T = B·tf + (h/6)·tw`。
+/// `I_T = tf·B³/12 + max(h/6−tf, 0)·tw³/12`、
+/// `A_T = B·tf + max(h/6−tf, 0)·tw`。
+///
+/// ウェブ側の負担高さは「せいの 1/6」からフランジ厚 `tf` を差し引いた
+/// ウェブ純高さ相当（フランジに食い込む分を除く）とし、`h/6 ≤ tf` となる
+/// 薄せい・厚フランジの断面ではウェブ寄与分を 0 にガードする。
 pub fn steel_i_t(b: f64, tf: f64, h: f64, tw: f64) -> f64 {
-    let i_t = tf * b.powi(3) / 12.0 + (h / 6.0) * tw.powi(3) / 12.0;
-    let a_t = b * tf + (h / 6.0) * tw;
+    let hw = (h / 6.0 - tf).max(0.0);
+    let i_t = tf * b.powi(3) / 12.0 + hw * tw.powi(3) / 12.0;
+    let a_t = b * tf + hw * tw;
     if a_t > 1e-12 {
         (i_t / a_t).sqrt()
     } else {
         0.0
+    }
+}
+
+/// 横座屈用の断面二次半径・圧縮フランジ断面積 `(i, af)` を解決する。
+///
+/// - `Section.shape` が `SteelH` の場合: `(steel_i_t(B, tf, H, tw), B·tf)`。
+/// - `SteelBuiltH`（非対称組立 H）の場合: 上下どちらのフランジが圧縮側か
+///   （荷重の向き）によらないよう、上下フランジそれぞれについて
+///   [`steel_i_t`] を計算し、断面二次半径 `i` が小さい側（横座屈に対して
+///   不利な側）の `(i, af=B·tf)` を採用する。
+/// - 上記以外（`shape` 無し等）は従来通り `sec.width` を B、呼び出し側が
+///   渡す `tf`/`tw` をそのまま用いた `(steel_i_t(B, tf, H, tw), B·tf)`。
+pub(crate) fn steel_lateral_buckling_i_af(sec: &Section, tf: f64, tw: f64) -> (f64, f64) {
+    match &sec.shape {
+        Some(SectionShape::SteelH {
+            height,
+            width,
+            web_thick,
+            flange_thick,
+        }) => {
+            let i = steel_i_t(*width, *flange_thick, *height, *web_thick);
+            (i, width * flange_thick)
+        }
+        Some(SectionShape::SteelBuiltH {
+            height,
+            upper_width,
+            upper_thick,
+            lower_width,
+            lower_thick,
+            web_thick,
+        }) => {
+            let i_upper = steel_i_t(*upper_width, *upper_thick, *height, *web_thick);
+            let i_lower = steel_i_t(*lower_width, *lower_thick, *height, *web_thick);
+            if i_upper <= i_lower {
+                (i_upper, upper_width * upper_thick)
+            } else {
+                (i_lower, lower_width * lower_thick)
+            }
+        }
+        _ => {
+            let b = sec.width;
+            let h = sec.depth;
+            (steel_i_t(b, tf, h, tw), b * tf)
+        }
     }
 }
 
@@ -115,6 +167,116 @@ pub(crate) fn steel_lateral_buckling_c(ctx: &DesignCtx) -> f64 {
 
     let c = 1.75 + 1.05 * m2_over_m1 + 0.3 * m2_over_m1 * m2_over_m1;
     c.min(2.3)
+}
+
+// ---------------------------------------------------------------------
+// 許容曲げ応力度 fb（新基準・AIJ 鋼構造許容応力度設計規準 2019）
+// ---------------------------------------------------------------------
+
+/// H 形鋼強軸の許容曲げ応力度 fb [N/mm²]（新基準・AIJ 鋼構造許容応力度設計規準
+/// 2019）。降伏モーメント My と弾性横座屈モーメント Me から求めた限界細長比
+/// λb により、全塑性域・非弾性域（直線補間）・弾性域の 3 領域で式を切り替える。
+///
+/// - `My = F·Z強軸`（降伏モーメント。`z_strong` は強軸断面係数）
+/// - `Me = C・√(π⁴・E・Iz・E・Iw/lb⁴ + π²・E・Iz・G・J/lb²)`（弾性横座屈モーメント。
+///   `iz`: 弱軸断面二次モーメント、`iw`: 曲げねじり定数、`j`: サンブナンねじり
+///   定数、`e`,`g`: ヤング係数・せん断弾性係数、`c`: 修正係数。[`steel_fb_h`]
+///   と同じ [`steel_lateral_buckling_c`] を用いてよい）
+/// - `λb = √(My/Me)`（横座屈限界細長比）
+/// - `eλb = 1/√0.6`（弾性限界細長比）
+/// - `ν = 3/2 + (2/3)・(λb/eλb)²`（安全率）
+/// - `λb ≤ pλb`（塑性限界細長比。[`steel_p_lambda_b`]）→ `fb = F/ν`
+/// - `pλb < λb ≤ eλb` → `fb = (1 − 0.4・(λb−pλb)/(eλb−pλb))・F/ν`
+/// - `eλb < λb` → `fb = F/(2.17・λb²)`（弾性座屈域）
+///
+/// 上限は長期許容引張 `F/1.5`。短期は長期の 1.5 倍（上限 F）。`lb ≤ 0`
+/// （横座屈長さ無し）の場合は横座屈を考慮しない `fb = ft` を返す。
+#[allow(clippy::too_many_arguments)]
+pub fn steel_fb_h_new(
+    f: f64,
+    term: LoadTerm,
+    lb: f64,
+    iz: f64,
+    iw: f64,
+    j: f64,
+    e: f64,
+    g: f64,
+    z_strong: f64,
+    c: f64,
+    p_lambda_b: f64,
+) -> f64 {
+    if lb <= 1e-9 {
+        return steel_ft(f, term);
+    }
+    let c = if c > 1e-9 { c } else { 1.0 };
+
+    let my = f * z_strong;
+    let pi2 = std::f64::consts::PI.powi(2);
+    let pi4 = std::f64::consts::PI.powi(4);
+    let me_sq = pi4 * e * iz * e * iw / lb.powi(4) + pi2 * e * iz * g * j / lb.powi(2);
+    let me = (c * me_sq.max(0.0).sqrt()).max(1e-9);
+
+    let lambda_b = (my / me).max(0.0).sqrt();
+    let e_lambda_b = 1.0 / 0.6_f64.sqrt();
+    let nu = 1.5 + (2.0 / 3.0) * (lambda_b / e_lambda_b).powi(2);
+
+    let fb_long = if lambda_b <= p_lambda_b {
+        f / nu
+    } else if lambda_b <= e_lambda_b {
+        let gap = (e_lambda_b - p_lambda_b).max(1e-9);
+        (1.0 - 0.4 * (lambda_b - p_lambda_b) / gap) * f / nu
+    } else {
+        f / (2.17 * lambda_b.powi(2))
+    };
+    let cap_long = f / 1.5;
+    let fb_long = fb_long.min(cap_long).max(0.0);
+
+    match term {
+        LoadTerm::Long => fb_long,
+        LoadTerm::Short => (fb_long * 1.5).min(f),
+    }
+}
+
+/// 塑性限界細長比 pλb（新基準・AIJ 鋼構造許容応力度設計規準 2019）。
+///
+/// `pλb = 0.6 + 0.3・(M2/M1)`。`M2/M1` の符号規約は [`steel_lateral_buckling_c`]
+/// と同じ（`M1`: 座屈区間端部モーメントの絶対値が大きい方、`M2`: 小さい方。
+/// 複曲率＝両端モーメント異符号で正、単曲率＝同符号で負）。
+///
+/// - 座屈区間中央部（[`DesignCtx::mid_moment_z`]）の絶対値が両端部より
+///   大きい場合は、区間内の最大曲げが端部に無いため安全側の `pλb=0.3` とする。
+/// - [`DesignCtx::end_moments_z`] が `None` の場合も同様に安全側の `pλb=0.3`。
+/// - `M1≈0`（両端とも曲げがほぼ無い）のときは `M2/M1=0` 扱いで `pλb=0.6`。
+pub(crate) fn steel_p_lambda_b(ctx: &DesignCtx) -> f64 {
+    let Some((m_i, m_j)) = ctx.end_moments_z else {
+        return 0.3;
+    };
+    let abs_i = m_i.abs();
+    let abs_j = m_j.abs();
+    let m1 = abs_i.max(abs_j);
+    let m2 = abs_i.min(abs_j);
+
+    // 区間中央の曲げが端部より大きければ、区間内最大曲げが端部に無いため 0.3。
+    if let Some(mid) = ctx.mid_moment_z {
+        if mid.abs() > m1 + 1e-9 {
+            return 0.3;
+        }
+    }
+
+    if m1 <= 1e-9 {
+        // 両端とも曲げがほぼ無い（M2/M1=0 相当）→ 0.6。
+        return 0.6;
+    }
+
+    let ratio_abs = m2 / m1;
+    let double_curvature = m_i * m_j < 0.0;
+    let m2_over_m1 = if double_curvature {
+        ratio_abs
+    } else {
+        -ratio_abs
+    };
+
+    0.6 + 0.3 * m2_over_m1
 }
 
 // ---------------------------------------------------------------------
@@ -236,10 +398,23 @@ mod tests {
     #[test]
     fn test_i_t_helper() {
         let i = steel_i_t(200.0, 15.0, 400.0, 10.0);
-        let expected_it = 15.0 * 200.0_f64.powi(3) / 12.0 + (400.0 / 6.0) * 10.0_f64.powi(3) / 12.0;
-        let expected_at = 200.0 * 15.0 + (400.0 / 6.0) * 10.0;
+        // hw = max(h/6 - tf, 0) = max(400/6 - 15, 0) = 51.6666...
+        let hw: f64 = (400.0 / 6.0 - 15.0_f64).max(0.0);
+        let expected_it = 15.0 * 200.0_f64.powi(3) / 12.0 + hw * 10.0_f64.powi(3) / 12.0;
+        let expected_at = 200.0 * 15.0 + hw * 10.0;
         let expected = (expected_it / expected_at).sqrt();
         assert!((i - expected).abs() < 1e-9);
+    }
+
+    /// h/6 ≤ tf（薄せい・厚フランジ）の場合はウェブ寄与分が 0 にガードされ、
+    /// T 形はフランジ矩形単独の断面二次半径 `i = √((tf·b³/12)/(b·tf)) = b/√12`
+    /// に一致する。
+    #[test]
+    fn test_i_t_helper_hw_clamped_to_zero() {
+        // h/6 = 100/6 = 16.67 < tf=20 → hw=0。
+        let i = steel_i_t(200.0, 20.0, 100.0, 10.0);
+        let expected = 200.0 / 12.0_f64.sqrt();
+        assert!((i - expected).abs() < 1e-9, "i={} expected={}", i, expected);
     }
 
     // -------------------------------------------------------------

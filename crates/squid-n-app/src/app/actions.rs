@@ -1984,6 +1984,7 @@ impl App {
                 mid_moment_z,
                 seismic_qd,
                 steel_attr,
+                steel_fb_rule: Default::default(),
             };
 
             // 検定器の選択: 複合断面（SRC/CFT）は形状優先、それ以外は材料名で鋼/RC。

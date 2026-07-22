@@ -223,6 +223,7 @@ pub(crate) fn compute_design_check_job(
             mid_moment_z: m_at(0.5),
             seismic_qd: None,
             steel_attr,
+            steel_fb_rule: Default::default(),
         };
 
         // 検定器の選択: 複合断面（SRC/CFT）は形状優先、それ以外は材料名で鋼/RC
