@@ -229,21 +229,20 @@ impl ElementBehavior for NodalSpringElement {
             }
             *fi = s;
         }
-        // 両端 2 評価点の [N, Qy, Qz, Mx, My, Mz]（バネ力。beam.rs/truss.rs と同じ
-        // 局所軸・符号の約束: i 端 = f_local[0..6]、j 端は反力として符号反転）。
-        let i_end = [
-            f_local[0], f_local[1], f_local[2], f_local[3], f_local[4], f_local[5],
-        ];
-        let j_end = [
-            -f_local[6],
-            -f_local[7],
-            -f_local[8],
-            -f_local[9],
-            -f_local[10],
-            -f_local[11],
+        // 両端 2 評価点の [N, Qy, Qz, Mx, My, Mz]（バネ力。beam.rs と同じ断面力の
+        // 符号規約: N は引張正・モーメントは i 端節点モーメントの符号反転、
+        // せん断は i 端節点力そのまま）。バネの剛性形（f_local[d+6] = −f_local[d]）
+        // から、断面力は両評価点で同一値（一定）になる。
+        let v = [
+            -f_local[0],
+            f_local[1],
+            f_local[2],
+            -f_local[3],
+            -f_local[4],
+            -f_local[5],
         ];
         Some(crate::beam::MemberForces {
-            at: vec![(0.0, i_end), (1.0, j_end)],
+            at: vec![(0.0, v), (1.0, v)],
         })
     }
 }
@@ -424,6 +423,51 @@ mod tests {
             assert_eq!(f.data[i], 0.0);
         }
         assert!(spring.recover_forces(&[0.0; 12]).is_some());
+    }
+
+    /// recover_forces の断面力規約が beam.rs と一致すること。
+    /// 軸方向の伸び（j 端を +x へ引く）で N = +kx·δ（引張正）、
+    /// 相対回転 rz で Mz = +krz·φ（beam の i 端規約 mz=−f5 と同値）。
+    /// バネは内部に外力を持たないため、両評価点（ξ=0/1）で全成分が同一になる。
+    /// 零長バネ（局所＝全体座標）で全体系の変位が局所自由度へ直接写るようにする。
+    #[test]
+    fn test_recover_forces_tension_positive_and_constant() {
+        let (model, data) = make_model_with_k(
+            [0.0, 0.0, 0.0],
+            [0.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0],
+            [1000.0, 2000.0, 3000.0, 4.0e6, 5.0e6, 6.0e6],
+        );
+        let spring = NodalSpringElement::new(&data, &model);
+        let delta = 0.5; // j 端 +x（軸）伸び
+        let phi = 1.0e-3; // j 端 +rz 相対回転
+        let mut u = [0.0; 12];
+        u[6] = delta;
+        u[11] = phi;
+        let mf = spring.recover_forces(&u).unwrap();
+        assert_eq!(mf.at.len(), 2);
+        let f0 = mf.at[0].1;
+        let f1 = mf.at[1].1;
+        for k in 0..6 {
+            assert!(
+                (f0[k] - f1[k]).abs() < 1e-9,
+                "成分 {k} が両端で不一致: {} vs {}",
+                f0[k],
+                f1[k]
+            );
+        }
+        let n_expected = 1000.0 * delta;
+        assert!(
+            (f0[0] - n_expected).abs() < 1e-9,
+            "N={} expected={n_expected}（引張正）",
+            f0[0]
+        );
+        let mz_expected = 6.0e6 * phi;
+        assert!(
+            (f0[5] - mz_expected).abs() < 1e-9,
+            "Mz={} expected={mz_expected}",
+            f0[5]
+        );
     }
 
     /// 剛性行列は対称であること（軸・せん断・回転すべての成分が独立対角なので当然だが、
