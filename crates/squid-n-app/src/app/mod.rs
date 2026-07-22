@@ -565,7 +565,8 @@ pub struct App {
     /// 右ドックの表示パネル（インスペクタ／解析設定）
     #[cfg(feature = "gui")]
     pub right_panel: RightPanel,
-    /// 下ドック（ログ／編集テーブル）の表示状態
+    /// 下ドック（ログ／編集テーブル）の表示状態。既定で開き、イベントログを
+    /// 起動直後から見えるようにする（処理の経過が常時追える Zed のターミナル相当）。
     #[cfg(feature = "gui")]
     pub bottom_dock_open: bool,
     /// 下ドックの表示タブ（ログ／モデル編集／荷重編集）
@@ -736,7 +737,7 @@ impl Default for App {
             #[cfg(feature = "gui")]
             right_panel: RightPanel::default(),
             #[cfg(feature = "gui")]
-            bottom_dock_open: false,
+            bottom_dock_open: true,
             #[cfg(feature = "gui")]
             bottom_tab: BottomTab::default(),
             #[cfg(feature = "gui")]
