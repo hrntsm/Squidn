@@ -477,6 +477,16 @@ pub fn viewer_panel(ui: &mut egui::Ui, app: &mut App) {
         // 床（スラブ・小梁）・二次部材の表示切替（全モードと併用可。
         // CMQ 図は主架構の図のため設定によらず常に非表示）
         ui.toggle_value(&mut app.show_floor_secondary, "床・二次部材");
+        // 剛床代表点（重心マスター）の表示切替。剛床がある場合のみ選択肢を出す。
+        // ON にすると代表点マーカー・面内拘束マーク・スレーブへの点線を描く。
+        let has_diaphragm_constraint = app
+            .model
+            .constraints
+            .iter()
+            .any(|c| matches!(c, squid_n_core::model::Constraint::RigidDiaphragm { .. }));
+        if has_diaphragm_constraint {
+            ui.toggle_value(&mut app.show_diaphragm_master, "剛床代表点");
+        }
         ui.separator();
         // §3-2 の操作規約をヒント表示（左ドラッグ=回転／スクロール=ズーム）
         ui.add_enabled(
@@ -587,6 +597,24 @@ pub fn viewer_panel(ui: &mut egui::Ui, app: &mut App) {
                 }
             });
         }
+    }
+    // 変形倍率スライダー: 変形を表示するモード（変形・モード・応力図の変形重ね）で
+    // 表示する。自動算定倍率への手動係数を対数スライダーで調整し、「リセット」で
+    // 1.0 に戻す。
+    let show_scale_slider = matches!(mode, ViewMode::Deformed | ViewMode::Mode)
+        || (matches!(mode, ViewMode::N | ViewMode::Q | ViewMode::M) && app.overlay_deform);
+    if show_scale_slider {
+        ui.horizontal(|ui| {
+            ui.label("変形倍率:");
+            ui.add(
+                egui::Slider::new(&mut app.deform_scale_factor, 0.1..=10.0)
+                    .logarithmic(true)
+                    .text("×（自動比）"),
+            );
+            if ui.button("リセット").clicked() {
+                app.deform_scale_factor = 1.0;
+            }
+        });
     }
 
     app.view_mode = mode;
@@ -701,12 +729,18 @@ pub fn viewer_panel(ui: &mut egui::Ui, app: &mut App) {
 
     // 主架構要素に接続しない節点（スラブ境界・小梁支持点・二次部材の節点）は
     // 解析自由度が割り当てられず変位が常にゼロのため（`DofMap` 参照）、最寄りの
-    // 主架構部材の変位から補間し、床・二次部材を変形へ追従させる。
-    let disp = disp.map(|d| interpolate_unreferenced_disp(&app.model, d));
+    // 主架構部材の変位から補間し、床・二次部材を変形へ追従させる。梁に載る節点は
+    // 梁の Hermite 変形曲線上へ載る（`interpolate_unreferenced_disp`）。続けて剛床
+    // 代表節点の鉛直変位をスレーブ平均で補い、代表点も床の変形へ追従させる。
+    let disp = disp
+        .map(|d| interpolate_unreferenced_disp(&app.model, d))
+        .map(|d| fill_diaphragm_master_disp_for_display(&app.model, d));
 
-    // 変形スケール: モデルのバウンディングボックスから自動計算
-    // （最大変位がバウンディングボックス対角長の 10% で表示される倍率）。
-    let deform_scale_actual = {
+    // 変形スケール（自動）: バウンディングボックス基準（最大並進変位が対角長の
+    // 10%）と梁スパン基準（梁の内部たわみがスパンの一定割合以内。梁は Hermite 曲線
+    // で描くため端部回転が大きいと中央が過大にふくらむのを抑える）の小さい方を採る。
+    // 手動係数（スライダー `deform_scale_factor`）を掛けた値を実効倍率とする。
+    let auto_scale = {
         let max_disp = disp
             .as_ref()
             .map(|d| {
@@ -715,12 +749,24 @@ pub fn viewer_panel(ui: &mut egui::Ui, app: &mut App) {
                     .fold(0.0_f64, f64::max)
             })
             .unwrap_or(0.0);
-        if max_disp > 1e-12 {
+        let bbox_scale = if max_disp > 1e-12 {
             model_size * 0.1 / max_disp
+        } else {
+            0.0
+        };
+        if bbox_scale > 0.0 {
+            match disp
+                .as_ref()
+                .and_then(|d| beam_deflection_scale_limit(&app.model, d))
+            {
+                Some(beam_limit) => bbox_scale.min(beam_limit),
+                None => bbox_scale,
+            }
         } else {
             0.0
         }
     };
+    let deform_scale_actual = auto_scale * app.deform_scale_factor as f64;
 
     // 表示用の節点 3D 座標（変形図・モード形では変位を加味）。
     // 断面ソリッド描画でも 3D 座標が要るため、投影前の座標を保持する。
@@ -1100,7 +1146,7 @@ pub fn viewer_panel(ui: &mut egui::Ui, app: &mut App) {
         }
     }
 
-    // 変形の実効倍率（バウンディングボックスから自動計算）の注記。
+    // 変形の実効倍率（自動倍率 × 手動係数）の注記。
     // 実変位を表示している時のみ描く（モード形は固有ベクトルの規模が任意のため
     // 倍率に物理的な意味がなく、表示しない）。
     if deform_scale_actual > 0.0 && mode != ViewMode::Mode {
@@ -1111,13 +1157,22 @@ pub fn viewer_panel(ui: &mut egui::Ui, app: &mut App) {
             ViewMode::N | ViewMode::Q | ViewMode::M => 30.0,
             _ => 10.0,
         };
+        // 手動係数が 1.0 のときは「自動」、それ以外は「自動×係数」を併記する。
+        let note = if (app.deform_scale_factor - 1.0).abs() < 1e-3 {
+            format!("変形倍率 ×{:.0}（自動）", deform_scale_actual)
+        } else {
+            format!(
+                "変形倍率 ×{:.0}（自動×{:.2}）",
+                deform_scale_actual, app.deform_scale_factor
+            )
+        };
         painter.text(
             egui::pos2(
                 painter.clip_rect().min.x + 10.0,
                 painter.clip_rect().min.y + y,
             ),
             egui::Align2::LEFT_TOP,
-            format!("変形倍率 ×{:.0}（自動）", deform_scale_actual),
+            note,
             egui::FontId::proportional(12.0),
             theme::GRAY_600,
         );
@@ -1139,6 +1194,40 @@ pub fn viewer_panel(ui: &mut egui::Ui, app: &mut App) {
                     );
                 }
             }
+        }
+    }
+
+    // --- 剛床代表点（トグル ON 時）: 代表点マーカーと関連スレーブへの点線 ---
+    // 剛床代表節点（重心マスター）は面内挙動を担う仮想節点で実部材に接続しない。
+    // 関連付けられたスレーブ節点へ点線を引き、所属関係を可視化する。代表点・
+    // スレーブとも変形後座標（`coords3` 由来の `pts`）で描くため変形へ追従する。
+    // 点線は節点数が多いと他部材が見づらくなるため、トグルで表示を切り替える。
+    if app.show_diaphragm_master {
+        const DASH: f32 = 5.0;
+        const GAP: f32 = 4.0;
+        for c in &app.model.constraints {
+            let squid_n_core::model::Constraint::RigidDiaphragm { master, slaves, .. } = c else {
+                continue;
+            };
+            let mi = master.index();
+            if mi >= pts.len() {
+                continue;
+            }
+            let mp = egui::pos2(pts[mi][0], pts[mi][1]);
+            for sl in slaves {
+                let si = sl.index();
+                if si >= pts.len() {
+                    continue;
+                }
+                painter.extend(egui::Shape::dashed_line(
+                    &[mp, egui::pos2(pts[si][0], pts[si][1])],
+                    egui::Stroke::new(1.0_f32, theme::translucent(theme::HILITE_PURPLE, 140)),
+                    DASH,
+                    GAP,
+                ));
+            }
+            // 代表点マーカー（強調リング）。通常の青節点の上に紫リングを重ねる。
+            painter.circle_stroke(mp, 6.0, egui::Stroke::new(2.0_f32, theme::HILITE_PURPLE));
         }
     }
 
@@ -1177,6 +1266,11 @@ pub fn viewer_panel(ui: &mut egui::Ui, app: &mut App) {
     let mut has_diaphragm = false;
     for (i, node) in app.model.nodes.iter().enumerate() {
         let is_master = diaphragm_masters.contains(&i);
+        // 剛床マスターの面内拘束マークは代表点トグル ON 時のみ描く（既定は非表示に
+        // して他部材を見やすくする。点線・マーカーと表示を一致させる）。
+        if is_master && !app.show_diaphragm_master {
+            continue;
+        }
         // 表示する拘束: 剛床マスターは面内拘束（Ux/Uy/Rz）、それ以外は節点拘束。
         let restraint = if is_master {
             diaphragm_mask
@@ -1259,57 +1353,75 @@ fn beam_deformed_polyline(
     scale: f64,
     segments: usize,
 ) -> Vec<[f64; 3]> {
-    let l = member_len3(p_i, p_j);
     let seg = segments.max(1);
+    let mut pts = Vec::with_capacity(seg + 1);
+    for k in 0..=seg {
+        let xi = k as f64 / seg as f64;
+        // 未倍率の Hermite 変位（グローバル並進）を評価し、表示倍率を掛けて
+        // 未変形材軸上の点へ加える。
+        let dg = beam_hermite_disp_at(p_i, p_j, d_i, d_j, ref_vector, xi);
+        let base = [
+            p_i[0] + (p_j[0] - p_i[0]) * xi,
+            p_i[1] + (p_j[1] - p_i[1]) * xi,
+            p_i[2] + (p_j[2] - p_i[2]) * xi,
+        ];
+        pts.push([
+            base[0] + dg[0] * scale,
+            base[1] + dg[1] * scale,
+            base[2] + dg[2] * scale,
+        ]);
+    }
+    pts
+}
+
+/// 梁要素の Hermite 変位場を材軸パラメータ ξ∈[0,1] で評価し、未変形材軸上の点へ
+/// 加える「グローバル並進変位（無倍率）」を返す。
+///
+/// 端部変位 `d_i`, `d_j`（節点変位 6 成分、無倍率）から、要素ローカル系で
+/// - 軸方向 (x): 線形内挿（1−ξ, ξ）
+/// - 曲げ 2 面 (y, z): Hermite 3 次形状関数（等価節点力 [`squid_n_element::member_load`]
+///   と同一の形状関数・符号規約）
+///
+/// により変位場を評価し、グローバル系へ戻す。ξ=0,1 では回転項が消え、端点は
+/// 節点並進変位に厳密一致する。[`beam_deformed_polyline`]（曲線描画）と、床・
+/// 二次部材の節点を梁曲線へ載せる補間（[`interpolate_unreferenced_disp`]）とで
+/// この関数を共有し、床節点が梁の描画曲線から浮かないようにする。
+fn beam_hermite_disp_at(
+    p_i: [f64; 3],
+    p_j: [f64; 3],
+    d_i: [f64; 6],
+    d_j: [f64; 6],
+    ref_vector: [f64; 3],
+    xi: f64,
+) -> [f64; 3] {
+    let l = member_len3(p_i, p_j);
     let frame = squid_n_element::transform::LocalFrame::from_nodes(p_i, p_j, ref_vector);
 
-    // 端部変位（並進・回転）を表示スケール倍し、ローカル系へ回転する。
+    // 端部変位（並進・回転）をローカル系へ回転する。
     let g = [
-        d_i[0] * scale,
-        d_i[1] * scale,
-        d_i[2] * scale,
-        d_i[3] * scale,
-        d_i[4] * scale,
-        d_i[5] * scale,
-        d_j[0] * scale,
-        d_j[1] * scale,
-        d_j[2] * scale,
-        d_j[3] * scale,
-        d_j[4] * scale,
-        d_j[5] * scale,
+        d_i[0], d_i[1], d_i[2], d_i[3], d_i[4], d_i[5], d_j[0], d_j[1], d_j[2], d_j[3], d_j[4],
+        d_j[5],
     ];
     let u = frame.rotate_to_local(&g);
     // i 端: 並進(ux,uy,uz)=u[0..3]、回転(-, ry, rz)=u[3..6]
     let (uxi, uyi, uzi, ryi, rzi) = (u[0], u[1], u[2], u[4], u[5]);
     let (uxj, uyj, uzj, ryj, rzj) = (u[6], u[7], u[8], u[10], u[11]);
 
-    let mut pts = Vec::with_capacity(seg + 1);
-    for k in 0..=seg {
-        let xi = k as f64 / seg as f64;
-        // Hermite 3 次形状関数（N2,N4 は L 倍を含む回転項）
-        let n1 = 1.0 - 3.0 * xi * xi + 2.0 * xi * xi * xi;
-        let n2 = l * (xi - 2.0 * xi * xi + xi * xi * xi);
-        let n3 = 3.0 * xi * xi - 2.0 * xi * xi * xi;
-        let n4 = l * (-xi * xi + xi * xi * xi);
-        // ローカル変位場: y 面は θz、z 面は θy（符号反転、member_load の msign=-1 と一致）
-        let ux = (1.0 - xi) * uxi + xi * uxj;
-        let uy = n1 * uyi + n2 * rzi + n3 * uyj + n4 * rzj;
-        let uz = n1 * uzi - n2 * ryi + n3 * uzj - n4 * ryj;
-        // ローカル→グローバル（rot 行 = ex,ey,ez。global = ux·ex + uy·ey + uz·ez）
-        let dg = [
-            frame.rot[0][0] * ux + frame.rot[1][0] * uy + frame.rot[2][0] * uz,
-            frame.rot[0][1] * ux + frame.rot[1][1] * uy + frame.rot[2][1] * uz,
-            frame.rot[0][2] * ux + frame.rot[1][2] * uy + frame.rot[2][2] * uz,
-        ];
-        // 未変形材軸上の点 + 変位（変位は既にスケール済み）
-        let base = [
-            p_i[0] + (p_j[0] - p_i[0]) * xi,
-            p_i[1] + (p_j[1] - p_i[1]) * xi,
-            p_i[2] + (p_j[2] - p_i[2]) * xi,
-        ];
-        pts.push([base[0] + dg[0], base[1] + dg[1], base[2] + dg[2]]);
-    }
-    pts
+    // Hermite 3 次形状関数（N2,N4 は L 倍を含む回転項）
+    let n1 = 1.0 - 3.0 * xi * xi + 2.0 * xi * xi * xi;
+    let n2 = l * (xi - 2.0 * xi * xi + xi * xi * xi);
+    let n3 = 3.0 * xi * xi - 2.0 * xi * xi * xi;
+    let n4 = l * (-xi * xi + xi * xi * xi);
+    // ローカル変位場: y 面は θz、z 面は θy（符号反転、member_load の msign=-1 と一致）
+    let ux = (1.0 - xi) * uxi + xi * uxj;
+    let uy = n1 * uyi + n2 * rzi + n3 * uyj + n4 * rzj;
+    let uz = n1 * uzi - n2 * ryi + n3 * uzj - n4 * ryj;
+    // ローカル→グローバル（rot 行 = ex,ey,ez。global = ux·ex + uy·ey + uz·ez）
+    [
+        frame.rot[0][0] * ux + frame.rot[1][0] * uy + frame.rot[2][0] * uz,
+        frame.rot[0][1] * ux + frame.rot[1][1] * uy + frame.rot[2][1] * uz,
+        frame.rot[0][2] * ux + frame.rot[1][2] * uy + frame.rot[2][2] * uz,
+    ]
 }
 
 /// 3D 位置 `base3` から `dir3` 方向へ `off_world` だけ張り出した点を投影する。
@@ -1910,14 +2022,29 @@ fn interpolate_unreferenced_disp(
         return disp;
     }
 
-    // 補間ソースとなる主架構の線材（2 節点要素）の端点 index。端点は必ず参照済み
-    // （正しい解析変位を持つ）ため、射影補間は他の未参照節点に依存しない。
-    let segments: Vec<(usize, usize)> = model
+    // 補間ソースとなる主架構の線材（2 節点要素）。端点は必ず参照済み（正しい解析
+    // 変位を持つ）ため、射影補間は他の未参照節点に依存しない。梁（`Beam`）は
+    // 変形図で Hermite 3 次曲線として描画されるため、その線上に載る節点は端点変位
+    // の線形補間ではなく梁の Hermite 変位で追従させる（描画曲線から浮かないよう
+    // 端点回転を含めて評価する）。梁以外（ブレース等）は従来どおり線形補間とする
+    // ため、要素種別と局所座標参照ベクトルを保持する。
+    struct AnchorSeg {
+        a: usize,
+        b: usize,
+        beam: bool,
+        ref_vec: [f64; 3],
+    }
+    let segments: Vec<AnchorSeg> = model
         .elements
         .iter()
         .filter(|e| e.nodes.len() == 2)
-        .map(|e| (e.nodes[0].index(), e.nodes[1].index()))
-        .filter(|&(a, b)| a < n && b < n)
+        .map(|e| AnchorSeg {
+            a: e.nodes[0].index(),
+            b: e.nodes[1].index(),
+            beam: e.kind == squid_n_core::model::ElementKind::Beam,
+            ref_vec: e.local_axis.ref_vector,
+        })
+        .filter(|s| s.a < n && s.b < n)
         .collect();
 
     // 「大梁に直付き（線上に載る）」と判定する許容垂線距離。モデル寸法に対する
@@ -1938,10 +2065,10 @@ fn interpolate_unreferenced_disp(
         }
         let p = model.nodes[i].coord;
         // 射影点までの距離が最小の線分を探す（射影パラメータ t は [0,1] にクランプ）。
-        let mut best: Option<(f64, [f64; 6])> = None; // (垂線距離², 補間変位)
-        for &(a, b) in &segments {
-            let pa = model.nodes[a].coord;
-            let pb = model.nodes[b].coord;
+        let mut best: Option<(f64, usize, f64)> = None; // (垂線距離², 線分 index, 射影 t)
+        for (si, s) in segments.iter().enumerate() {
+            let pa = model.nodes[s.a].coord;
+            let pb = model.nodes[s.b].coord;
             let ab = [pb[0] - pa[0], pb[1] - pa[1], pb[2] - pa[2]];
             let len2 = ab[0] * ab[0] + ab[1] * ab[1] + ab[2] * ab[2];
             let t = if len2 < 1e-12 {
@@ -1952,13 +2079,31 @@ fn interpolate_unreferenced_disp(
             };
             let q = [pa[0] + ab[0] * t, pa[1] + ab[1] * t, pa[2] + ab[2] * t];
             let d2 = (p[0] - q[0]).powi(2) + (p[1] - q[1]).powi(2) + (p[2] - q[2]).powi(2);
-            if best.is_none_or(|(bd, _)| d2 < bd) {
-                let (da, db) = (disp[a], disp[b]);
-                let interp = std::array::from_fn(|k| da[k] * (1.0 - t) + db[k] * t);
-                best = Some((d2, interp));
+            if best.is_none_or(|(bd, _, _)| d2 < bd) {
+                best = Some((d2, si, t));
             }
         }
-        if let Some((d2, interp)) = best {
+        if let Some((d2, si, t)) = best {
+            let s = &segments[si];
+            let (da, db) = (disp[s.a], disp[s.b]);
+            // 梁は Hermite 変位で追従（並進 3 成分は描画曲線上へ載せ、回転は端点の
+            // 線形補間で補う）。梁以外は全 6 成分を線形補間する。
+            let interp: [f64; 6] = if s.beam {
+                let hermite = beam_hermite_disp_at(
+                    model.nodes[s.a].coord,
+                    model.nodes[s.b].coord,
+                    da,
+                    db,
+                    s.ref_vec,
+                    t,
+                );
+                std::array::from_fn(|k| match k {
+                    0..=2 => hermite[k],
+                    _ => da[k] * (1.0 - t) + db[k] * t,
+                })
+            } else {
+                std::array::from_fn(|k| da[k] * (1.0 - t) + db[k] * t)
+            };
             proj_disp[i] = interp;
             proj_ok[i] = true;
             if d2.sqrt() <= anchor_tol {
@@ -2043,6 +2188,100 @@ fn interpolate_unreferenced_disp(
         }
     }
     disp
+}
+
+/// 剛床代表節点（マスター）の鉛直変位（Uz）を、スレーブ節点の鉛直変位の平均で
+/// 表示用に補う。あくまで描画専用の近似で、解析結果（`StaticOnce::disp`）は変更
+/// しない。
+///
+/// マスターの面内自由度（Ux・Uy・Rz）は解析結果をそのまま使うため水平変形には
+/// 追従するが、面外自由度（Uz・Rx・Ry）は零剛性による特異行列を避けるための数値
+/// ダミー拘束で 0 に固定されている（`squid-n-load` の `story_gen`）。そのままだと
+/// 変形図で代表点だけが原標高に浮き、床の鉛直変形（重力たわみ・地震の転倒による
+/// 床の上下動）へ追従しない。スレーブ節点の Uz 平均を代表点の Uz とすることで、
+/// 代表点を変形後の床の平均標高へ載せる。
+fn fill_diaphragm_master_disp_for_display(
+    model: &squid_n_core::model::Model,
+    mut disp: Vec<[f64; 6]>,
+) -> Vec<[f64; 6]> {
+    let n = model.nodes.len().min(disp.len());
+    for c in &model.constraints {
+        let squid_n_core::model::Constraint::RigidDiaphragm { master, slaves, .. } = c else {
+            continue;
+        };
+        let mi = master.index();
+        if mi >= n {
+            continue;
+        }
+        let mut sum = 0.0_f64;
+        let mut cnt = 0.0_f64;
+        for sl in slaves {
+            let si = sl.index();
+            if si < n {
+                sum += disp[si][2];
+                cnt += 1.0;
+            }
+        }
+        if cnt >= 0.5 {
+            disp[mi][2] = sum / cnt;
+        }
+    }
+    disp
+}
+
+/// 梁のスパンに対する内部たわみが過大にならないよう、表示倍率の上限を算定する。
+/// 制約する梁が無ければ `None`。
+///
+/// 変形図の梁は端部 6 自由度からの Hermite 3 次曲線で描くため、端部回転が大きいと
+/// 中央のふくらみ（変形後両端を結ぶ弦からの逸脱）がスパンに対して過大になり得る。
+/// 各梁について無倍率のたわみ（弦からの最大逸脱）を評価し、
+/// `倍率 × たわみ ≤ FRAC × スパン` を満たす倍率上限 `FRAC × スパン / たわみ` の
+/// 最小値を返す。バウンディングボックス基準の倍率と併せて小さい方を採ることで、
+/// 全体変形も梁のふくらみも過大にならないスケールにする。
+fn beam_deflection_scale_limit(
+    model: &squid_n_core::model::Model,
+    disp: &[[f64; 6]],
+) -> Option<f64> {
+    /// 梁の内部たわみ（弦からの逸脱）が許容されるスパン比。
+    const BEAM_DEFLECTION_DISPLAY_FRAC: f64 = 0.1;
+    /// たわみ評価の内部サンプル点数（両端を除く分割）。
+    const SAMPLES: usize = 9;
+
+    let n = model.nodes.len().min(disp.len());
+    let mut limit: Option<f64> = None;
+    for elem in &model.elements {
+        if elem.kind != squid_n_core::model::ElementKind::Beam || elem.nodes.len() != 2 {
+            continue;
+        }
+        let a = elem.nodes[0].index();
+        let b = elem.nodes[1].index();
+        if a >= n || b >= n {
+            continue;
+        }
+        let p_i = model.nodes[a].coord;
+        let p_j = model.nodes[b].coord;
+        let l = member_len3(p_i, p_j);
+        if l < 1e-9 {
+            continue;
+        }
+        let (d_i, d_j) = (disp[a], disp[b]);
+        // 無倍率での弦からの最大逸脱（弦＝端部並進の線形補間、曲線＝Hermite 変位）。
+        let mut max_dev = 0.0_f64;
+        for k in 1..SAMPLES {
+            let xi = k as f64 / SAMPLES as f64;
+            let h = beam_hermite_disp_at(p_i, p_j, d_i, d_j, elem.local_axis.ref_vector, xi);
+            let dev = ((h[0] - (d_i[0] * (1.0 - xi) + d_j[0] * xi)).powi(2)
+                + (h[1] - (d_i[1] * (1.0 - xi) + d_j[1] * xi)).powi(2)
+                + (h[2] - (d_i[2] * (1.0 - xi) + d_j[2] * xi)).powi(2))
+            .sqrt();
+            max_dev = max_dev.max(dev);
+        }
+        if max_dev > 1e-12 {
+            let lim = BEAM_DEFLECTION_DISPLAY_FRAC * l / max_dev;
+            limit = Some(limit.map_or(lim, |cur: f64| cur.min(lim)));
+        }
+    }
+    limit
 }
 
 /// モデルのバウンディングボックス（min, max）。空なら原点を返す。
@@ -2341,9 +2580,10 @@ mod tests {
     }
 
     #[test]
-    fn 大梁スパン中間の未参照節点は両端変位の線形補間になる() {
+    fn 大梁スパン中間の未参照節点は梁のエルミート変位で追従する() {
         // 大梁 n0-n1 のスパン 1/4 点に、節点共有なしで載る小梁支持点 n2
-        // （ST-Bridge 取り込みモデルの典型）を置く。
+        // （ST-Bridge 取り込みモデルの典型）を置く。梁は変形図で Hermite 曲線として
+        // 描かれるため、直付き節点は端点の線形補間ではなく Hermite 変位で追従する。
         let mut model = Model::default();
         model.nodes.push(test_node(0, [0.0, 0.0, 0.0]));
         model.nodes.push(test_node(1, [8000.0, 0.0, 0.0]));
@@ -2356,10 +2596,60 @@ mod tests {
             [0.0; 6], // 未参照節点は解析結果ではゼロ
         ];
         let out = interpolate_unreferenced_disp(&model, disp);
-        // t = 2000/8000 = 0.25 の線形補間
-        assert!((out[2][0] - 1.0).abs() < 1e-12);
-        assert!((out[2][1] - 2.0).abs() < 1e-12);
-        assert!((out[2][2] + 3.0).abs() < 1e-12);
+        // t = 2000/8000 = 0.25。端部回転は 0 のため、軸方向（+X）は線形（0.25·4=1.0）、
+        // 材軸直交成分（Y,Z）は Hermite の N3(0.25)=0.15625 倍で追従する
+        // （線形補間の 0.25 倍より小さく、梁の描画曲線上に載る）。
+        assert!((out[2][0] - 1.0).abs() < 1e-12, "X={}", out[2][0]);
+        assert!((out[2][1] - 8.0 * 0.15625).abs() < 1e-12, "Y={}", out[2][1]);
+        assert!(
+            (out[2][2] + 12.0 * 0.15625).abs() < 1e-12,
+            "Z={}",
+            out[2][2]
+        );
+    }
+
+    #[test]
+    fn 梁上の未参照節点は梁の描画曲線に厳密一致する() {
+        // 端部に回転を与えた梁のスパン中央に未参照節点を置く。その補間変位が、同じ
+        // 端部変位で beam_deformed_polyline を描いた曲線の同一パラメータ位置の変位に
+        // 厳密一致すること（床・二次部材の節点が梁の描画たわみ曲線から浮かない）。
+        let mut model = Model::default();
+        model.nodes.push(test_node(0, [0.0, 0.0, 0.0]));
+        model.nodes.push(test_node(1, [6000.0, 0.0, 0.0]));
+        model.nodes.push(test_node(2, [3000.0, 0.0, 0.0])); // スパン中央（t=0.5）
+        model.elements.push(test_beam(0, 0, 1)); // ref_vector=[0,0,1]
+
+        let d_i = [0.0, 0.0, 0.0, 0.0, 0.0, 0.01];
+        let d_j = [0.0, 0.0, 0.0, 0.0, 0.0, -0.01];
+        let disp = vec![d_i, d_j, [0.0; 6]];
+        let out = interpolate_unreferenced_disp(&model, disp);
+
+        // 同じ端部変位で梁曲線を無倍率描画し、中央点（12 分割の index 6=ξ0.5）の
+        // 変位（曲線点 − 未変形材軸点）を取る。
+        let poly = beam_deformed_polyline(
+            [0.0, 0.0, 0.0],
+            [6000.0, 0.0, 0.0],
+            d_i,
+            d_j,
+            [0.0, 0.0, 1.0],
+            1.0,
+            12,
+        );
+        let curve_disp = [poly[6][0] - 3000.0, poly[6][1] - 0.0, poly[6][2] - 0.0];
+        for k in 0..3 {
+            assert!(
+                (out[2][k] - curve_disp[k]).abs() < 1e-9,
+                "軸 {k}: 補間 {} と曲線 {} が不一致",
+                out[2][k],
+                curve_disp[k]
+            );
+        }
+        // 端部回転で中央がたわむため、直線（線形補間＝0）とは異なる。
+        assert!(
+            out[2][1].abs() > 1.0,
+            "Hermite たわみが出ていない: {}",
+            out[2][1]
+        );
     }
 
     #[test]
@@ -2527,5 +2817,62 @@ mod tests {
         // node 2, 3 とも連鎖を辿って node 1 の変位 8.0 に追従する。
         assert!((out[2][0] - 8.0).abs() < 1e-9, "node2={:?}", out[2]);
         assert!((out[3][0] - 8.0).abs() < 1e-9, "node3={:?}", out[3]);
+    }
+
+    #[test]
+    fn 剛床マスターの鉛直変位はスレーブ平均で補完される() {
+        // マスター（重心）はダミー拘束で Uz=0。スレーブの Uz 平均で表示用に補完し、
+        // 面内（Ux/Uy/Rz）は解析結果のまま維持されることを確認する。
+        let mut model = Model::default();
+        model.nodes.push(test_node(0, [0.0, 0.0, 3000.0]));
+        model.nodes.push(test_node(1, [6000.0, 0.0, 3000.0]));
+        model.nodes.push(test_node(2, [3000.0, 0.0, 3000.0])); // マスター（重心）
+        model
+            .constraints
+            .push(squid_n_core::model::Constraint::RigidDiaphragm {
+                story: squid_n_core::ids::StoryId(0),
+                master: NodeId(2),
+                slaves: vec![NodeId(0), NodeId(1)],
+            });
+        let disp = vec![
+            [1.0, 0.0, -4.0, 0.0, 0.0, 0.0],
+            [1.0, 0.0, -6.0, 0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0, 0.0, 0.0, 0.02], // マスターの面内変位（Uz は 0）
+        ];
+        let out = fill_diaphragm_master_disp_for_display(&model, disp);
+        // Uz は (-4 + -6)/2 = -5 に補完される。
+        assert!((out[2][2] + 5.0).abs() < 1e-12, "Uz={}", out[2][2]);
+        // 面内（Ux, Rz）は変更されない。
+        assert!((out[2][0] - 1.0).abs() < 1e-12, "Ux={}", out[2][0]);
+        assert!((out[2][5] - 0.02).abs() < 1e-12, "Rz={}", out[2][5]);
+    }
+
+    #[test]
+    fn 梁の内部たわみで変形スケール上限が算定される() {
+        // 端部に等・逆回転（θz=±0.01）を与えた L=6000 の梁。両端並進 0 のため弦は
+        // 直線で、弦からの逸脱＝Hermite たわみ w(ξ)=0.01·L·ξ(1−ξ)。9 分割の内部
+        // サンプルでの最大は ξ=4/9,5/9 の 0.01·6000·(20/81)。
+        // 上限 = 0.1·L / w_max = 0.1·6000·81 / (0.01·6000·20) = 40.5。
+        let mut model = Model::default();
+        model.nodes.push(test_node(0, [0.0, 0.0, 0.0]));
+        model.nodes.push(test_node(1, [6000.0, 0.0, 0.0]));
+        model.elements.push(test_beam(0, 0, 1));
+        let disp = vec![
+            [0.0, 0.0, 0.0, 0.0, 0.0, 0.01],
+            [0.0, 0.0, 0.0, 0.0, 0.0, -0.01],
+        ];
+        let limit = beam_deflection_scale_limit(&model, &disp).expect("上限が算定される");
+        assert!((limit - 40.5).abs() < 1e-9, "limit={}", limit);
+    }
+
+    #[test]
+    fn 変位ゼロなら梁スケール上限は無し() {
+        // たわみが生じない（全変位ゼロ）と制約する梁が無く None を返す。
+        let mut model = Model::default();
+        model.nodes.push(test_node(0, [0.0, 0.0, 0.0]));
+        model.nodes.push(test_node(1, [6000.0, 0.0, 0.0]));
+        model.elements.push(test_beam(0, 0, 1));
+        let disp = vec![[0.0; 6], [0.0; 6]];
+        assert!(beam_deflection_scale_limit(&model, &disp).is_none());
     }
 }
