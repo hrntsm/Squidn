@@ -422,7 +422,6 @@ fn draw_support_legend(painter: &egui::Painter) {
 
 pub fn viewer_panel(ui: &mut egui::Ui, app: &mut App) {
     let mut mode = app.view_mode;
-    let mut deform_scale = app.deform_scale;
     let mut mode_idx = app.view_mode_idx;
     let mut cmq_component = app.cmq_component;
 
@@ -441,6 +440,9 @@ pub fn viewer_panel(ui: &mut egui::Ui, app: &mut App) {
         ui.separator();
         // 断面表示: 部材を断面形状の押し出しソリッドで立体表示（全モードと併用可）
         ui.toggle_value(&mut app.show_sections, "断面表示");
+        // 床（スラブ・小梁）・二次部材の表示切替（全モードと併用可。
+        // CMQ 図は主架構の図のため設定によらず常に非表示）
+        ui.toggle_value(&mut app.show_floor_secondary, "床・二次部材");
         ui.separator();
         // §3-2 の操作規約をヒント表示（左ドラッグ=回転／スクロール=ズーム）
         ui.add_enabled(
@@ -451,12 +453,6 @@ pub fn viewer_panel(ui: &mut egui::Ui, app: &mut App) {
             ),
         );
     });
-    if matches!(mode, ViewMode::Deformed | ViewMode::Mode) {
-        ui.horizontal(|ui| {
-            ui.label("倍率:");
-            ui.add(egui::Slider::new(&mut deform_scale, 1.0..=10000.0).logarithmic(true));
-        });
-    }
     if mode == ViewMode::Cmq {
         ui.horizontal(|ui| {
             ui.label("成分:");
@@ -469,6 +465,9 @@ pub fn viewer_panel(ui: &mut egui::Ui, app: &mut App) {
     // コンター ON 時のみカラーマップ選択（既定 Viridis。TONMANUAL §3）を表示する。
     if matches!(mode, ViewMode::N | ViewMode::Q | ViewMode::M) {
         ui.horizontal(|ui| {
+            // 応力図に変形図を重ねる（変位は自動倍率で節点座標に加味され、
+            // 図も変形後の材軸に沿って描かれる）
+            ui.toggle_value(&mut app.overlay_deform, "変形表示");
             ui.toggle_value(&mut app.diagram_contour, "コンター");
             if app.diagram_contour {
                 let mut colormap = app.contour_colormap;
@@ -515,7 +514,6 @@ pub fn viewer_panel(ui: &mut egui::Ui, app: &mut App) {
     }
 
     app.view_mode = mode;
-    app.deform_scale = deform_scale;
     app.view_mode_idx = mode_idx;
     app.cmq_component = cmq_component;
 
@@ -607,9 +605,12 @@ pub fn viewer_panel(ui: &mut egui::Ui, app: &mut App) {
     // グリッド・軸（§3-2: 赤=X / 緑=Y / 青=Z）。モデルの背後に先に描く。
     draw_grid_and_axes(&painter, rect, center3, &cam, scale, center);
 
-    // 節点座標（変形・モード時は変位を加味）
+    // 節点座標（変形・モード時と、N/Q/M 図の変形重ね表示時は変位を加味）
     let disp = match mode {
         ViewMode::Deformed => app.current_static().map(|s| s.disp.clone()),
+        ViewMode::N | ViewMode::Q | ViewMode::M if app.overlay_deform => {
+            app.current_static().map(|s| s.disp.clone())
+        }
         ViewMode::Mode => app
             .results
             .as_ref()
@@ -632,8 +633,14 @@ pub fn viewer_panel(ui: &mut egui::Ui, app: &mut App) {
         _ => None,
     };
 
-    // 変形スケール: 最大変位をモデルサイズの 10% に正規化
-    let deform_scale_actual = if disp.is_some() {
+    // 主架構要素に接続しない節点（スラブ境界・小梁支持点・二次部材の節点）は
+    // 解析自由度が割り当てられず変位が常にゼロのため（`DofMap` 参照）、最寄りの
+    // 主架構部材の変位から補間し、床・二次部材を変形へ追従させる。
+    let disp = disp.map(|d| interpolate_unreferenced_disp(&app.model, d));
+
+    // 変形スケール: モデルのバウンディングボックスから自動計算
+    // （最大変位がバウンディングボックス対角長の 10% で表示される倍率）。
+    let deform_scale_actual = {
         let max_disp = disp
             .as_ref()
             .map(|d| {
@@ -643,12 +650,10 @@ pub fn viewer_panel(ui: &mut egui::Ui, app: &mut App) {
             })
             .unwrap_or(0.0);
         if max_disp > 1e-12 {
-            (model_size * 0.1 / max_disp) * deform_scale as f64
+            model_size * 0.1 / max_disp
         } else {
             0.0
         }
-    } else {
-        0.0
     };
 
     // 表示用の節点 3D 座標（変形図・モード形では変位を加味）。
@@ -838,7 +843,8 @@ pub fn viewer_panel(ui: &mut egui::Ui, app: &mut App) {
     // 構造部材（実線・青/グレー系）と異なる暖色半透明フィル＋破線のフォーマットで描く。
     // 部材線・断面ソリッドより先に描き、架構が床の上に重なるようにする。
     // CMQ 図は全体解析（主架構）に関するものなので、小梁・スラブは表示しない。
-    if mode != ViewMode::Cmq {
+    // 「床・二次部材」トグル OFF 時も表示しない。
+    if mode != ViewMode::Cmq && app.show_floor_secondary {
         draw_slabs_and_joists(&painter, app, &pts);
     }
 
@@ -921,22 +927,24 @@ pub fn viewer_panel(ui: &mut egui::Ui, app: &mut App) {
     // （解析対象外を示す暖色アンバー。スラブの暖色と同族で、主架構の
     // 青/グレーと弁別。断面表示中はソリッドが上に描かれているため
     // 材軸線として薄く重ねる）。
-    let secondary_stroke = if app.show_sections {
-        egui::Stroke::new(1.0_f32, theme::translucent(theme::SECONDARY_AMBER, 110))
-    } else {
-        egui::Stroke::new(1.5_f32, theme::SECONDARY_AMBER)
-    };
-    for sm in &app.model.secondary_members {
-        let n0 = sm.nodes[0].index();
-        let n1 = sm.nodes[1].index();
-        if n0 < pts.len() && n1 < pts.len() {
-            painter.line_segment(
-                [
-                    egui::pos2(pts[n0][0], pts[n0][1]),
-                    egui::pos2(pts[n1][0], pts[n1][1]),
-                ],
-                secondary_stroke,
-            );
+    if app.show_floor_secondary {
+        let secondary_stroke = if app.show_sections {
+            egui::Stroke::new(1.0_f32, theme::translucent(theme::SECONDARY_AMBER, 110))
+        } else {
+            egui::Stroke::new(1.5_f32, theme::SECONDARY_AMBER)
+        };
+        for sm in &app.model.secondary_members {
+            let n0 = sm.nodes[0].index();
+            let n1 = sm.nodes[1].index();
+            if n0 < pts.len() && n1 < pts.len() {
+                painter.line_segment(
+                    [
+                        egui::pos2(pts[n0][0], pts[n0][1]),
+                        egui::pos2(pts[n1][0], pts[n1][1]),
+                    ],
+                    secondary_stroke,
+                );
+            }
         }
     }
 
@@ -960,6 +968,29 @@ pub fn viewer_panel(ui: &mut egui::Ui, app: &mut App) {
     }
     if mode == ViewMode::Cmq {
         draw_cmq_diagram(&painter, app, &coords3, center3, &cam, scale, center);
+    }
+
+    // 変形の実効倍率（バウンディングボックスから自動計算）の注記。
+    // 実変位を表示している時のみ描く（モード形は固有ベクトルの規模が任意のため
+    // 倍率に物理的な意味がなく、表示しない）。
+    if deform_scale_actual > 0.0 && mode != ViewMode::Mode {
+        // N/Q/M 図の凡例（min.y+10）・コンターバー＋ラベル（min.y+30〜56 程度）と
+        // 重ならない位置へ
+        let y = match mode {
+            ViewMode::N | ViewMode::Q | ViewMode::M if app.diagram_contour => 70.0,
+            ViewMode::N | ViewMode::Q | ViewMode::M => 30.0,
+            _ => 10.0,
+        };
+        painter.text(
+            egui::pos2(
+                painter.clip_rect().min.x + 10.0,
+                painter.clip_rect().min.y + y,
+            ),
+            egui::Align2::LEFT_TOP,
+            format!("変形倍率 ×{:.0}（自動）", deform_scale_actual),
+            egui::FontId::proportional(12.0),
+            theme::GRAY_600,
+        );
     }
 
     // 選択ハイライト
@@ -1570,6 +1601,100 @@ fn dist_point_to_segment(p: egui::Pos2, a: egui::Pos2, b: egui::Pos2) -> f32 {
     (p - proj).length()
 }
 
+/// 主架構要素（`model.elements`）に接続しない節点の変位を、最寄りの主架構
+/// 2 節点要素（線材）の線分上へ射影した位置における両端変位の線形補間で埋める。
+///
+/// スラブ境界・小梁支持点・二次部材の節点は解析自由度が割り当てられず
+/// （`DofMap` は主架構要素が接続しない節点の全自由度を不活性にする）、変位が
+/// 常にゼロのため、そのままでは変形図で床・二次部材だけが原位置に残る。
+/// ST-Bridge 取り込みモデルでは二次部材の支持点が大梁のスパン中間へ節点共有
+/// なしで載るのが典型（`squid-n-load` の secondary 変換と同じ前提）のため、
+/// 線分への射影補間で表示上の追従ができる。あくまで描画用の近似であり、
+/// 解析結果そのものは変更しない。
+fn interpolate_unreferenced_disp(
+    model: &squid_n_core::model::Model,
+    mut disp: Vec<[f64; 6]>,
+) -> Vec<[f64; 6]> {
+    let n = model.nodes.len().min(disp.len());
+
+    // 解析自由度を持ち変位が直接求まる節点（`DofMap::build` の structural 判定と
+    // 同じ規則）: 主架構要素が接続する節点、または拘束（剛床・剛リンク・MPC）の
+    // マスター節点。剛床代表節点（階自動生成が重心に置く仮想節点）は要素に
+    // 接続しないが正しい解析変位を持つため、補間で上書きしてはいけない。
+    let mut referenced = vec![false; n];
+    for elem in &model.elements {
+        for nd in &elem.nodes {
+            if let Some(r) = referenced.get_mut(nd.index()) {
+                *r = true;
+            }
+        }
+    }
+    for c in &model.constraints {
+        use squid_n_core::model::Constraint;
+        match c {
+            Constraint::RigidDiaphragm { master, .. } | Constraint::RigidLink { master, .. } => {
+                if let Some(r) = referenced.get_mut(master.index()) {
+                    *r = true;
+                }
+            }
+            // MPC は `master` フィールドがスレーブ節点、`terms` がマスター側。
+            Constraint::Mpc { terms, .. } => {
+                for (nd, _, _) in terms {
+                    if let Some(r) = referenced.get_mut(nd.index()) {
+                        *r = true;
+                    }
+                }
+            }
+        }
+    }
+    if referenced.iter().all(|&r| r) {
+        return disp;
+    }
+
+    // 補間ソースとなる主架構の線材（2 節点要素）の端点 index
+    let segments: Vec<(usize, usize)> = model
+        .elements
+        .iter()
+        .filter(|e| e.nodes.len() == 2)
+        .map(|e| (e.nodes[0].index(), e.nodes[1].index()))
+        .filter(|&(a, b)| a < n && b < n)
+        .collect();
+    if segments.is_empty() {
+        return disp;
+    }
+
+    for i in 0..n {
+        if referenced[i] {
+            continue;
+        }
+        let p = model.nodes[i].coord;
+        // 射影点までの距離が最小の線分を探す（射影パラメータ t は [0,1] にクランプ）
+        let mut best: Option<(f64, usize, usize, f64)> = None; // (dist², n0, n1, t)
+        for &(a, b) in &segments {
+            let pa = model.nodes[a].coord;
+            let pb = model.nodes[b].coord;
+            let ab = [pb[0] - pa[0], pb[1] - pa[1], pb[2] - pa[2]];
+            let len2 = ab[0] * ab[0] + ab[1] * ab[1] + ab[2] * ab[2];
+            let t = if len2 < 1e-12 {
+                0.0
+            } else {
+                (((p[0] - pa[0]) * ab[0] + (p[1] - pa[1]) * ab[1] + (p[2] - pa[2]) * ab[2]) / len2)
+                    .clamp(0.0, 1.0)
+            };
+            let q = [pa[0] + ab[0] * t, pa[1] + ab[1] * t, pa[2] + ab[2] * t];
+            let d2 = (p[0] - q[0]).powi(2) + (p[1] - q[1]).powi(2) + (p[2] - q[2]).powi(2);
+            if best.is_none_or(|(bd, ..)| d2 < bd) {
+                best = Some((d2, a, b, t));
+            }
+        }
+        if let Some((_, a, b, t)) = best {
+            let (da, db) = (disp[a], disp[b]);
+            disp[i] = std::array::from_fn(|k| da[k] * (1.0 - t) + db[k] * t);
+        }
+    }
+    disp
+}
+
 /// モデルのバウンディングボックス（min, max）。空なら原点を返す。
 fn model_bbox(model: &squid_n_core::model::Model) -> ([f64; 3], [f64; 3]) {
     if model.nodes.is_empty() {
@@ -1801,5 +1926,130 @@ mod tests {
         assert!((cam.pitch - 0.0).abs() < 1e-6);
         cam.turntable_drag(0.0, -1e6); // 大きく上ドラッグ → 真下で停止
         assert!((cam.pitch + std::f32::consts::PI).abs() < 1e-6);
+    }
+
+    use squid_n_core::ids::{ElemId, NodeId};
+    use squid_n_core::model::{
+        ElementData, ElementKind, EndCondition, ForceRegime, LocalAxis, Model, Node,
+    };
+
+    /// 補間テスト用の節点を作る（拘束なし・付加情報なし）。
+    fn test_node(id: u32, coord: [f64; 3]) -> Node {
+        Node {
+            id: NodeId(id),
+            coord,
+            restraint: Dof6Mask::FREE,
+            mass: None,
+            story: None,
+        }
+    }
+
+    /// 補間テスト用の 2 節点梁要素を作る。
+    fn test_beam(id: u32, i: u32, j: u32) -> ElementData {
+        ElementData {
+            id: ElemId(id),
+            kind: ElementKind::Beam,
+            nodes: [NodeId(i), NodeId(j)].into_iter().collect(),
+            section: None,
+            material: None,
+            local_axis: LocalAxis {
+                ref_vector: [0.0, 0.0, 1.0],
+            },
+            end_cond: [EndCondition::Fixed, EndCondition::Fixed],
+            force_regime: ForceRegime::Auto,
+            rigid_zone: Default::default(),
+            plastic_zone: None,
+            spring: None,
+        }
+    }
+
+    #[test]
+    fn 主架構に接続する節点の変位は補間で変更されない() {
+        let mut model = Model::default();
+        model.nodes.push(test_node(0, [0.0, 0.0, 0.0]));
+        model.nodes.push(test_node(1, [6000.0, 0.0, 0.0]));
+        model.elements.push(test_beam(0, 0, 1));
+
+        let disp = vec![
+            [1.0, 2.0, 3.0, 0.1, 0.2, 0.3],
+            [4.0, 5.0, 6.0, 0.4, 0.5, 0.6],
+        ];
+        let out = interpolate_unreferenced_disp(&model, disp.clone());
+        assert_eq!(out, disp);
+    }
+
+    #[test]
+    fn 大梁スパン中間の未参照節点は両端変位の線形補間になる() {
+        // 大梁 n0-n1 のスパン 1/4 点に、節点共有なしで載る小梁支持点 n2
+        // （ST-Bridge 取り込みモデルの典型）を置く。
+        let mut model = Model::default();
+        model.nodes.push(test_node(0, [0.0, 0.0, 0.0]));
+        model.nodes.push(test_node(1, [8000.0, 0.0, 0.0]));
+        model.nodes.push(test_node(2, [2000.0, 0.0, 0.0]));
+        model.elements.push(test_beam(0, 0, 1));
+
+        let disp = vec![
+            [0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            [4.0, 8.0, -12.0, 0.0, 0.0, 0.0],
+            [0.0; 6], // 未参照節点は解析結果ではゼロ
+        ];
+        let out = interpolate_unreferenced_disp(&model, disp);
+        // t = 2000/8000 = 0.25 の線形補間
+        assert!((out[2][0] - 1.0).abs() < 1e-12);
+        assert!((out[2][1] - 2.0).abs() < 1e-12);
+        assert!((out[2][2] + 3.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn 梁軸から外れた未参照節点も最寄り線分の射影位置で補間される() {
+        // 大梁からオフセットした位置の節点（床境界の幾何節点など）は、
+        // 最寄り線分への射影点（クランプ込み）の変位で追従する。
+        let mut model = Model::default();
+        model.nodes.push(test_node(0, [0.0, 0.0, 0.0]));
+        model.nodes.push(test_node(1, [4000.0, 0.0, 0.0]));
+        model.nodes.push(test_node(2, [2000.0, 500.0, 0.0]));
+        model.elements.push(test_beam(0, 0, 1));
+
+        let disp = vec![[0.0; 6], [10.0, 0.0, 0.0, 0.0, 0.0, 0.0], [0.0; 6]];
+        let out = interpolate_unreferenced_disp(&model, disp);
+        // 射影点は t=0.5 → 5.0
+        assert!((out[2][0] - 5.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn 主架構の線材が無ければ未参照節点の変位はゼロのまま() {
+        let mut model = Model::default();
+        model.nodes.push(test_node(0, [0.0, 0.0, 0.0]));
+        model.nodes.push(test_node(1, [1000.0, 0.0, 0.0]));
+        // 要素なし → 補間ソースがなく、変位はゼロのまま
+        let out = interpolate_unreferenced_disp(&model, vec![[0.0; 6]; 2]);
+        assert!(out.iter().all(|v| v.iter().all(|&x| x == 0.0)));
+    }
+
+    #[test]
+    fn 剛床マスター節点の変位は補間で上書きされない() {
+        // 剛床代表節点（階自動生成が重心に置く仮想節点）は要素に接続しないが、
+        // 拘束のマスターとして解析自由度を持ち正しい変位が求まる
+        // （`DofMap::build` の structural 判定と同じ規則）。補間対象にしてはいけない。
+        let mut model = Model::default();
+        model.nodes.push(test_node(0, [0.0, 0.0, 0.0]));
+        model.nodes.push(test_node(1, [8000.0, 0.0, 0.0]));
+        model.nodes.push(test_node(2, [4000.0, 0.0, 0.0])); // 剛床マスター
+        model.elements.push(test_beam(0, 0, 1));
+        model
+            .constraints
+            .push(squid_n_core::model::Constraint::RigidDiaphragm {
+                story: squid_n_core::ids::StoryId(0),
+                master: NodeId(2),
+                slaves: vec![NodeId(0), NodeId(1)],
+            });
+
+        let disp = vec![
+            [0.0; 6],
+            [10.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            [7.0, 0.0, 0.0, 0.0, 0.0, 0.0], // マスターの解析変位（補間値 5.0 とは異なる）
+        ];
+        let out = interpolate_unreferenced_disp(&model, disp.clone());
+        assert_eq!(out, disp);
     }
 }

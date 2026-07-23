@@ -7,6 +7,7 @@
 - [アーキテクチャ](./architecture.md)
 - [モデル入出力（ファイル形式）](./model_io.md)
 - [MCP サーバ](./mcp_server.md)
+- [結果の表示（3D ビューア）](./result_view.md)
 
 # 計算根拠（理論・出典）
 

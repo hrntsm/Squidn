@@ -595,9 +595,12 @@ pub struct App {
     /// コンター表示のカラーマップ（既定は TONMANUAL §3 準拠の Viridis）
     #[cfg(feature = "gui")]
     pub contour_colormap: crate::theme::ColorMap,
-    /// 変形図・モード形の倍率スライダー値
+    /// N/Q/M 図で変形図を重ねて表示するか（応力と変形を同時に確認する）
     #[cfg(feature = "gui")]
-    pub deform_scale: f32,
+    pub overlay_deform: bool,
+    /// 床（スラブ・小梁）と二次部材の表示（変形図で解析対象外の要素を隠せる）
+    #[cfg(feature = "gui")]
+    pub show_floor_secondary: bool,
     /// モード形の表示インデックス
     #[cfg(feature = "gui")]
     pub view_mode_idx: usize,
@@ -766,7 +769,9 @@ impl Default for App {
             #[cfg(feature = "gui")]
             contour_colormap: crate::theme::ColorMap::default(),
             #[cfg(feature = "gui")]
-            deform_scale: 100.0,
+            overlay_deform: false,
+            #[cfg(feature = "gui")]
+            show_floor_secondary: true,
             #[cfg(feature = "gui")]
             view_mode_idx: 0,
             #[cfg(feature = "gui")]
