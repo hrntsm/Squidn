@@ -1565,3 +1565,44 @@ fn test_track_shear_yield_axial_compression_raises_qy_end_to_end() {
         "without axial compression the same Vz demand should still trigger the event"
     );
 }
+
+/// 保有水平耐力計算の材料強度割増: 鋼材グレード名の材料のみ fy が
+/// 1.1 倍（590N 級=SA440/TMCP440 は 1.05 倍）され、鉄筋（SD）・
+/// コンクリート（Fc）・未知名称の材料は変更されないことを確認する。
+#[test]
+fn test_scale_steel_material_strength() {
+    let mk = |id: u32, name: &str, fy: Option<f64>| Material {
+        id: MaterialId(id),
+        name: name.to_string(),
+        young: 205000.0,
+        poisson: 0.3,
+        density: 7.85e-9,
+        shear: None,
+        fc: None,
+        fy,
+        concrete_class: Default::default(),
+    };
+    let model = Model {
+        materials: vec![
+            mk(0, "SS400", Some(235.0)),
+            mk(1, "SN490B", Some(325.0)),
+            mk(2, "SA440", Some(440.0)),
+            mk(3, "TMCP440", Some(440.0)),
+            mk(4, "SD345", Some(345.0)),
+            mk(5, "カスタム鋼材", Some(300.0)),
+            mk(6, "Fc24", None),
+        ],
+        ..Default::default()
+    };
+    let scaled = super::driver::scale_steel_material_strength(&model);
+    let fy = |i: usize| scaled.materials[i].fy;
+    assert_eq!(fy(0), Some(235.0 * 1.1), "SS400 は 1.1 倍");
+    assert_eq!(fy(1), Some(325.0 * 1.1), "SN490B は 1.1 倍");
+    assert_eq!(fy(2), Some(440.0 * 1.05), "SA440 は 1.05 倍");
+    assert_eq!(fy(3), Some(440.0 * 1.05), "TMCP440 は 1.05 倍");
+    assert_eq!(fy(4), Some(345.0), "鉄筋 SD345 は割増しない");
+    assert_eq!(fy(5), Some(300.0), "未知名称の直接入力材料は割増しない");
+    assert_eq!(fy(6), None, "fy 未設定はそのまま");
+    // 元のモデルは変更されない。
+    assert_eq!(model.materials[0].fy, Some(235.0));
+}
