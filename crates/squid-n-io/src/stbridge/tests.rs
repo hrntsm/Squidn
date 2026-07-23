@@ -2170,6 +2170,69 @@ fn test_import_auto_fixes_base_level_supports() {
     assert!(report.is_clean(), "warnings: {:?}", report.warnings);
 }
 
+/// 支点の自動設定は、最下レベルで**柱脚が取り付く**節点だけをピン支点にする。
+/// 柱が取り付かず梁（地中梁）だけが取り付く最下レベル節点は支点にしない。
+#[test]
+fn test_import_auto_support_excludes_beam_only_base_nodes() {
+    // 最下レベル Z=0 に節点 0,1,4。柱 C1(0→2)・C2(1→4... ではなく 1→3)。
+    // 地中梁 G1(0→4)・G2(4→1) は水平材で節点 4 に柱は無い。
+    let xml = r#"<?xml version="1.0"?>
+<ST_BRIDGE version="2.0.0"><StbModel>
+  <StbNodes>
+    <StbNode id="0" X="0" Y="0" Z="0"/>
+    <StbNode id="1" X="6000" Y="0" Z="0"/>
+    <StbNode id="2" X="0" Y="0" Z="3000"/>
+    <StbNode id="3" X="6000" Y="0" Z="3000"/>
+    <StbNode id="4" X="3000" Y="0" Z="0"/>
+  </StbNodes>
+  <StbSections>
+    <StbSecColumn_S id="0" name="C">
+      <StbSecSteelFigureColumn_S><StbSecSteelColumn_S_Same shape="H1"/></StbSecSteelFigureColumn_S>
+    </StbSecColumn_S>
+    <StbSecBeam_S id="1" name="G">
+      <StbSecSteelFigureBeam_S><StbSecSteelBeam_S_Straight shape="H1"/></StbSecSteelFigureBeam_S>
+    </StbSecBeam_S>
+    <StbSecSteel>
+      <StbSecRoll-H name="H1" A="300" B="150" t1="6.5" t2="9"/>
+    </StbSecSteel>
+  </StbSections>
+  <StbMembers>
+    <StbColumns>
+      <StbColumn id="0" name="C1" id_node_bottom="0" id_node_top="2" id_section="0" kind_structure="S"/>
+      <StbColumn id="1" name="C2" id_node_bottom="1" id_node_top="3" id_section="0" kind_structure="S"/>
+    </StbColumns>
+    <StbGirders>
+      <StbGirder id="2" name="G1" id_node_start="0" id_node_end="4" id_section="1" kind_structure="S"/>
+      <StbGirder id="3" name="G2" id_node_start="4" id_node_end="1" id_section="1" kind_structure="S"/>
+    </StbGirders>
+  </StbMembers>
+</StbModel></ST_BRIDGE>"#;
+    let (m, report) = import_stbridge_with_report(xml).expect("import");
+
+    use squid_n_core::dof::Dof6Mask;
+    // 柱脚が取り付く 0,1 はピン支点。梁だけの最下レベル節点 4 は自由のまま。
+    assert_eq!(m.nodes[0].restraint, Dof6Mask::PINNED, "柱脚 0 はピン");
+    assert_eq!(m.nodes[1].restraint, Dof6Mask::PINNED, "柱脚 1 はピン");
+    assert_eq!(
+        m.nodes[4].restraint,
+        Dof6Mask::FREE,
+        "梁だけが取り付く最下レベル節点 4 は支点にしない"
+    );
+    // 柱頭は自由のまま。
+    assert_eq!(m.nodes[2].restraint, Dof6Mask::FREE);
+    assert_eq!(m.nodes[3].restraint, Dof6Mask::FREE);
+    // notes は「柱が取り付く節点 2 箇所」を通知する。
+    assert!(
+        report
+            .notes
+            .iter()
+            .any(|n| n.contains("柱が取り付く節点") && n.contains("2 箇所")),
+        "notes: {:?}",
+        report.notes
+    );
+    assert!(report.is_clean(), "warnings: {:?}", report.warnings);
+}
+
 /// 小梁（StbBeam）は二次部材（解析対象外・CMQ 用）として取り込まれ、
 /// 大梁（StbGirder）は従来どおり解析要素になる。断面・材料（グレード伝播）も
 /// 二次部材へ解決される。

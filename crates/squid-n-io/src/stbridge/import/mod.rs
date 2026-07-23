@@ -1449,11 +1449,12 @@ pub fn import_stbridge_with_report(xml: &str) -> Result<(Model, ImportReport), S
     }
 
     // 支点の自動設定: ST-Bridge は境界条件（支点）を持たないため、支点が 1 つも
-    // 無いモデルは最下レベル（Z 最小、許容差 1mm）の節点をピン支点
+    // 無いモデルは最下レベル（Z 最小、許容差 1mm）で柱脚を持つ節点をピン支点
     // （並進固定・回転自由）に設定する（柱脚ピンの仮定＝基礎の回転拘束を
     // 期待しない安全側の既定。解析可能な出発点にする）。
-    // 仮定した内容は notes で通知する。拘束を 1 つでも持つモデル（将来の方言
-    // 拡張等で取り込んだ場合）はそのまま尊重して何もしない。
+    // 柱が取り付かず梁だけが取り付く最下レベル節点（地中梁の中間節点など）は
+    // 支点にしない。仮定した内容は notes で通知する。拘束を 1 つでも持つモデル
+    // （将来の方言拡張等で取り込んだ場合）はそのまま尊重して何もしない。
     let mut notes: Vec<String> = Vec::new();
     if n_joists + n_posts > 0 {
         notes.push(format!(
@@ -1469,6 +1470,7 @@ pub fn import_stbridge_with_report(xml: &str) -> Result<(Model, ImportReport), S
     }
     {
         use squid_n_core::dof::Dof6Mask;
+        use squid_n_core::model::ElementKind;
         if !model.nodes.is_empty() && model.nodes.iter().all(|n| n.restraint == Dof6Mask::FREE) {
             const BASE_LEVEL_TOL_MM: f64 = 1.0;
             let z_min = model
@@ -1476,16 +1478,60 @@ pub fn import_stbridge_with_report(xml: &str) -> Result<(Model, ImportReport), S
                 .iter()
                 .map(|n| n.coord[2])
                 .fold(f64::INFINITY, f64::min);
+
+            // 柱脚が取り付く節点の集合を求める。柱＝鉛直な 2 節点 Beam 要素
+            // （部材軸の鉛直成分 |ez| > 0.707。偏心率算定 column_stiffnesses と同じ
+            // 判定規則）。その下端節点（Z が小さい方）を柱脚候補とする。
+            const VERTICAL_COS_TOL: f64 = 0.707;
+            let mut column_base: std::collections::HashSet<usize> =
+                std::collections::HashSet::new();
+            for elem in &model.elements {
+                if elem.kind != ElementKind::Beam || elem.nodes.len() != 2 {
+                    continue;
+                }
+                let (a, b) = (elem.nodes[0].index(), elem.nodes[1].index());
+                if a >= model.nodes.len() || b >= model.nodes.len() {
+                    continue;
+                }
+                let (pa, pb) = (model.nodes[a].coord, model.nodes[b].coord);
+                let d = [pb[0] - pa[0], pb[1] - pa[1], pb[2] - pa[2]];
+                let l = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
+                if l < 1e-9 || (d[2] / l).abs() <= VERTICAL_COS_TOL {
+                    continue; // 長さ 0 または水平材（梁）は柱ではない
+                }
+                let bottom = if pa[2] <= pb[2] { a } else { b };
+                column_base.insert(bottom);
+            }
+
+            // 最下レベルかつ柱脚が取り付く節点だけをピン支点にする。
             let mut fixed = 0usize;
-            for n in &mut model.nodes {
-                if (n.coord[2] - z_min).abs() <= BASE_LEVEL_TOL_MM {
+            for (i, n) in model.nodes.iter_mut().enumerate() {
+                if (n.coord[2] - z_min).abs() <= BASE_LEVEL_TOL_MM && column_base.contains(&i) {
                     n.restraint = Dof6Mask::PINNED;
                     fixed += 1;
                 }
             }
-            notes.push(format!(
-                "支点情報が無いため、最下レベル（Z={z_min:.0} mm）の節点 {fixed} 箇所をピン支点に設定しました（モデルタブ→境界条件で変更できます）"
-            ));
+
+            if fixed > 0 {
+                notes.push(format!(
+                    "支点情報が無いため、最下レベル（Z={z_min:.0} mm）で柱が取り付く節点 {fixed} 箇所をピン支点に設定しました（モデルタブ→境界条件で変更できます）"
+                ));
+            } else {
+                // 最下レベルに柱脚が 1 つも無い（柱が全く無い／柱脚が最下レベルに
+                // 達しない）場合は、解析可能性を優先して従来どおり最下レベルの全節点を
+                // ピン支点にフォールバックする。
+                for n in &mut model.nodes {
+                    if (n.coord[2] - z_min).abs() <= BASE_LEVEL_TOL_MM {
+                        n.restraint = Dof6Mask::PINNED;
+                        fixed += 1;
+                    }
+                }
+                if fixed > 0 {
+                    notes.push(format!(
+                        "支点情報が無いため、最下レベル（Z={z_min:.0} mm）の節点 {fixed} 箇所をピン支点に設定しました（柱脚が特定できなかったため全節点。モデルタブ→境界条件で変更できます）"
+                    ));
+                }
+            }
         }
     }
 

@@ -394,10 +394,24 @@ fn draw_support_symbol(
 }
 
 /// 支持条件シンボルの凡例をビュー左下に描く。
-fn draw_support_legend(painter: &egui::Painter) {
+/// `has_diaphragm` が真のとき、剛床マーク（面内拘束）の説明行を追加する。
+fn draw_support_legend(painter: &egui::Painter, has_diaphragm: bool) {
     let rect = painter.clip_rect();
     let x0 = rect.min.x + 10.0;
-    let y0 = rect.max.y - 10.0;
+    let mut y0 = rect.max.y - 10.0;
+
+    // 剛床マークの説明（面内拘束 Ux/Uy/Rz）を最下段へ追加する。
+    if has_diaphragm {
+        painter.text(
+            egui::pos2(x0, y0),
+            egui::Align2::LEFT_BOTTOM,
+            "剛床マーク: 面内拘束 (Ux/Uy/Rz)",
+            egui::FontId::proportional(11.0),
+            theme::GRAY_600,
+        );
+        // 以降の支持条件凡例を 1 行分上へずらす。
+        y0 -= 16.0;
+    }
 
     // タイトル
     painter.text(
@@ -1132,29 +1146,68 @@ pub fn viewer_panel(ui: &mut egui::Ui, app: &mut App) {
     // 固定方向へ軸色の矢印、回転軸まわりに円弧を描く。
     // 部材・応力図の上に重ねて描き、支持方向を一目で判別できるようにする。
     // スクリーン上で矢印 18px・円弧半径 12px になるようワールド長を逆算する。
+    //
+    // 剛床（RigidDiaphragm）マスター節点は特別扱いする。マスターに設定される
+    // 拘束（Uz/Rx/Ry）は零剛性自由度による特異行列を避けるための数値上の
+    // ダミー拘束であり、剛床が物理的に拘束するのは面内自由度（Ux/Uy/Rz）。
+    // そのため剛床マークはダミー拘束ではなく面内拘束（Ux/Uy/Rz）を表示する
+    // （支点拘束との整合。従来はダミー拘束をそのまま描き、剛床が拘束しない
+    // 自由度を表示していた）。
     const SUPPORT_ARROW_PX: f32 = 18.0;
     const SUPPORT_ARC_PX: f32 = 12.0;
+    // 剛床マスター節点の index 集合。
+    let diaphragm_masters: std::collections::HashSet<usize> = app
+        .model
+        .constraints
+        .iter()
+        .filter_map(|c| match c {
+            squid_n_core::model::Constraint::RigidDiaphragm { master, .. } => Some(master.index()),
+            _ => None,
+        })
+        .collect();
+    // 剛床の面内拘束マスク（Ux, Uy, Rz）。
+    let diaphragm_mask = {
+        let mut m = Dof6Mask::FREE;
+        m.set_fixed(Dof::Ux);
+        m.set_fixed(Dof::Uy);
+        m.set_fixed(Dof::Rz);
+        m
+    };
     let mut has_support = false;
-    for node in &app.model.nodes {
-        let kind = support_kind(node.restraint);
-        if kind == SupportKind::Free {
+    let mut has_diaphragm = false;
+    for (i, node) in app.model.nodes.iter().enumerate() {
+        let is_master = diaphragm_masters.contains(&i);
+        // 表示する拘束: 剛床マスターは面内拘束（Ux/Uy/Rz）、それ以外は節点拘束。
+        let restraint = if is_master {
+            diaphragm_mask
+        } else {
+            node.restraint
+        };
+        if support_kind(restraint) == SupportKind::Free {
             continue;
         }
-        has_support = true;
+        // 支点シンボルは変形後座標に描く。実支点は変位ゼロで原位置に留まり、
+        // 剛床マスターは床の面内変形に追従する（剛床の重心マークが変形へ移動する）。
+        let coord = coords3.get(i).copied().unwrap_or(node.coord);
+        if is_master {
+            has_diaphragm = true;
+        } else {
+            has_support = true;
+        }
         draw_support_symbol(
             &painter,
-            node.coord,
+            coord,
             center3,
             &cam,
             scale,
             center,
-            node.restraint,
+            restraint,
             SUPPORT_ARROW_PX,
             SUPPORT_ARC_PX,
         );
     }
-    if has_support {
-        draw_support_legend(&painter);
+    if has_support || has_diaphragm {
+        draw_support_legend(&painter, has_diaphragm);
     }
 
     // 右上に ViewCube、右下にカメラ追従の座標系アイコン（常に手前に表示。
@@ -1796,16 +1849,27 @@ fn dist_point_to_segment(p: egui::Pos2, a: egui::Pos2, b: egui::Pos2) -> f32 {
     (p - proj).length()
 }
 
-/// 主架構要素（`model.elements`）に接続しない節点の変位を、最寄りの主架構
-/// 2 節点要素（線材）の線分上へ射影した位置における両端変位の線形補間で埋める。
+/// 主架構要素（`model.elements`）に接続しない節点の変位を、主架構の変形へ
+/// 追従するよう補間で埋める。あくまで描画用の近似であり、解析結果そのものは
+/// 変更しない。
 ///
 /// スラブ境界・小梁支持点・二次部材の節点は解析自由度が割り当てられず
 /// （`DofMap` は主架構要素が接続しない節点の全自由度を不活性にする）、変位が
 /// 常にゼロのため、そのままでは変形図で床・二次部材だけが原位置に残る。
-/// ST-Bridge 取り込みモデルでは二次部材の支持点が大梁のスパン中間へ節点共有
-/// なしで載るのが典型（`squid-n-load` の secondary 変換と同じ前提）のため、
-/// 線分への射影補間で表示上の追従ができる。あくまで描画用の近似であり、
-/// 解析結果そのものは変更しない。
+/// 補間は 2 段階で行う:
+///
+/// 1. **大梁への直付き（線上に載る）節点**: 最寄りの主架構 2 節点要素（線材）へ
+///    射影し、垂線距離が許容値（モデル寸法の 0.1%）以内なら、その線分上の
+///    射影位置 t の両端変位の線形補間を採用する。ST-Bridge 取り込みモデルで
+///    二次部材の支持点が大梁のスパン中間へ節点共有なしで載る典型ケースを追従。
+/// 2. **大梁に直付きしない二次部材節点**: 二次部材（小梁・間柱）の接続グラフを
+///    辿り、最寄りの確定節点（1. のアンカー、または主架構節点）の変位へ剛体的に
+///    追従させる（辺長を距離とする Dijkstra 的伝播）。最寄り線分への単純射影では
+///    無関係な別の大梁へ張り付いて追従しない先端節点（片持ちの二次部材の先など）を
+///    正しく取り付き先へ追従させる。
+///
+/// どちらでも確定しない孤立節点（大梁にも直付きせず、二次部材でも確定節点に
+/// 到達しない床境界節点など）は、最寄り線分への射影変位でフォールバックする。
 fn interpolate_unreferenced_disp(
     model: &squid_n_core::model::Model,
     mut disp: Vec<[f64; 6]>,
@@ -1846,7 +1910,8 @@ fn interpolate_unreferenced_disp(
         return disp;
     }
 
-    // 補間ソースとなる主架構の線材（2 節点要素）の端点 index
+    // 補間ソースとなる主架構の線材（2 節点要素）の端点 index。端点は必ず参照済み
+    // （正しい解析変位を持つ）ため、射影補間は他の未参照節点に依存しない。
     let segments: Vec<(usize, usize)> = model
         .elements
         .iter()
@@ -1854,17 +1919,26 @@ fn interpolate_unreferenced_disp(
         .map(|e| (e.nodes[0].index(), e.nodes[1].index()))
         .filter(|&(a, b)| a < n && b < n)
         .collect();
-    if segments.is_empty() {
-        return disp;
-    }
 
+    // 「大梁に直付き（線上に載る）」と判定する許容垂線距離。モデル寸法に対する
+    // 相対値（バウンディングボックス対角長の 0.1%）。これより近い射影は主架構への
+    // 直付きアンカーとして主架構変位を直接採用し、遠い節点は二次部材の接続を
+    // 辿って追従させる。
+    let anchor_tol = (model_bbox_size(model) * 1e-3).max(1e-9);
+
+    // 段階 1: 各未参照節点を最寄り線分へ射影し、垂線距離が許容値以内なら主架構
+    // 直付きアンカーとして確定する。射影変位は、伝播が届かなかった場合の
+    // フォールバックとしても保持する。
+    let mut finalized = referenced.clone();
+    let mut proj_disp = vec![[0.0_f64; 6]; n];
+    let mut proj_ok = vec![false; n];
     for i in 0..n {
         if referenced[i] {
             continue;
         }
         let p = model.nodes[i].coord;
-        // 射影点までの距離が最小の線分を探す（射影パラメータ t は [0,1] にクランプ）
-        let mut best: Option<(f64, usize, usize, f64)> = None; // (dist², n0, n1, t)
+        // 射影点までの距離が最小の線分を探す（射影パラメータ t は [0,1] にクランプ）。
+        let mut best: Option<(f64, [f64; 6])> = None; // (垂線距離², 補間変位)
         for &(a, b) in &segments {
             let pa = model.nodes[a].coord;
             let pb = model.nodes[b].coord;
@@ -1878,13 +1952,94 @@ fn interpolate_unreferenced_disp(
             };
             let q = [pa[0] + ab[0] * t, pa[1] + ab[1] * t, pa[2] + ab[2] * t];
             let d2 = (p[0] - q[0]).powi(2) + (p[1] - q[1]).powi(2) + (p[2] - q[2]).powi(2);
-            if best.is_none_or(|(bd, ..)| d2 < bd) {
-                best = Some((d2, a, b, t));
+            if best.is_none_or(|(bd, _)| d2 < bd) {
+                let (da, db) = (disp[a], disp[b]);
+                let interp = std::array::from_fn(|k| da[k] * (1.0 - t) + db[k] * t);
+                best = Some((d2, interp));
             }
         }
-        if let Some((_, a, b, t)) = best {
-            let (da, db) = (disp[a], disp[b]);
-            disp[i] = std::array::from_fn(|k| da[k] * (1.0 - t) + db[k] * t);
+        if let Some((d2, interp)) = best {
+            proj_disp[i] = interp;
+            proj_ok[i] = true;
+            if d2.sqrt() <= anchor_tol {
+                disp[i] = interp;
+                finalized[i] = true;
+            }
+        }
+    }
+
+    // 段階 2: 二次部材（小梁・間柱）の接続グラフを辿り、大梁に直付きしない節点を
+    // 最寄りの確定節点の変位へ追従させる。
+    let mut sec_adj: Vec<Vec<usize>> = vec![Vec::new(); n];
+    for sm in &model.secondary_members {
+        let a = sm.nodes[0].index();
+        let b = sm.nodes[1].index();
+        if a < n && b < n {
+            sec_adj[a].push(b);
+            sec_adj[b].push(a);
+        }
+    }
+    let node_dist = |a: usize, b: usize| -> f64 {
+        let pa = model.nodes[a].coord;
+        let pb = model.nodes[b].coord;
+        ((pa[0] - pb[0]).powi(2) + (pa[1] - pb[1]).powi(2) + (pa[2] - pb[2]).powi(2)).sqrt()
+    };
+
+    // 追従元候補（確定節点から二次部材でつながる未確定節点への辺長と追従変位）。
+    let mut best_dist = vec![f64::INFINITY; n];
+    let mut src_disp = vec![[0.0_f64; 6]; n];
+    let mut has_source = vec![false; n];
+    // 確定節点（参照済み＋主架構直付きアンカー）から隣接未確定節点を緩和する。
+    for u in 0..n {
+        if !finalized[u] {
+            continue;
+        }
+        for &j in &sec_adj[u] {
+            if finalized[j] {
+                continue;
+            }
+            let d = node_dist(u, j);
+            if d < best_dist[j] {
+                best_dist[j] = d;
+                src_disp[j] = disp[u];
+                has_source[j] = true;
+            }
+        }
+    }
+    // 最寄りの確定節点から順に確定させる（辺長を距離とする Dijkstra 的貪欲法）。
+    // 二次部材の連鎖が長くても、主架構に最も近い側から変位が伝播する。
+    loop {
+        let mut pick: Option<(usize, f64)> = None;
+        for i in 0..n {
+            if finalized[i] || !has_source[i] {
+                continue;
+            }
+            if pick.is_none_or(|(_, bd)| best_dist[i] < bd) {
+                pick = Some((i, best_dist[i]));
+            }
+        }
+        let Some((u, _)) = pick else { break };
+        disp[u] = src_disp[u];
+        finalized[u] = true;
+        // u を追従元として、二次部材でつながる未確定の隣接節点を緩和する。
+        for &j in &sec_adj[u] {
+            if finalized[j] {
+                continue;
+            }
+            let d = node_dist(u, j);
+            if d < best_dist[j] {
+                best_dist[j] = d;
+                src_disp[j] = disp[u];
+                has_source[j] = true;
+            }
+        }
+    }
+
+    // フォールバック: まだ確定しない節点（大梁にも直付きせず、二次部材でも確定
+    // 節点に到達しない孤立した床境界節点など）は、最寄り線分への射影変位を採る。
+    for i in 0..n {
+        if !finalized[i] && proj_ok[i] {
+            disp[i] = proj_disp[i];
         }
     }
     disp
@@ -2126,6 +2281,7 @@ mod tests {
     use squid_n_core::ids::{ElemId, NodeId};
     use squid_n_core::model::{
         ElementData, ElementKind, EndCondition, ForceRegime, LocalAxis, Model, Node,
+        SecondaryMember, SecondaryMemberKind,
     };
 
     /// 補間テスト用の節点を作る（拘束なし・付加情報なし）。
@@ -2136,6 +2292,17 @@ mod tests {
             restraint: Dof6Mask::FREE,
             mass: None,
             story: None,
+        }
+    }
+
+    /// 補間テスト用の二次部材（小梁）を作る。
+    fn test_secondary(i: u32, j: u32) -> SecondaryMember {
+        SecondaryMember {
+            kind: SecondaryMemberKind::Joist,
+            nodes: [NodeId(i), NodeId(j)],
+            section: None,
+            material: None,
+            name: String::new(),
         }
     }
 
@@ -2295,5 +2462,70 @@ mod tests {
         );
         // 端部は原位置（並進 0・回転のみ）
         assert!(poly[0][1].abs() < 1e-9 && poly[12][1].abs() < 1e-9);
+    }
+
+    #[test]
+    fn 大梁に直付きしない二次部材の先端は接続先を辿って追従する() {
+        // 大梁 G1(0-1) は節点 1 に大きな水平変位を持つ。node 2 は G1 のスパン上
+        // （直付きアンカー）。node 3 は G1 から離れた先端で、二次部材 2-3 で node 2 に
+        // つながる。もう 1 本の大梁 G2(4-5)（変位ゼロ）を node 3 の近くに置き、
+        // 「最寄り線分へ射影」だけでは node 3 が G2 へ張り付いて追従しないところを、
+        // 二次部材経由の追従で取り付き先（node 2）へ揃うことを確認する。
+        let mut model = Model::default();
+        model.nodes.push(test_node(0, [0.0, 0.0, 0.0])); // G1 端
+        model.nodes.push(test_node(1, [8000.0, 0.0, 0.0])); // G1 端
+        model.nodes.push(test_node(2, [2000.0, 0.0, 0.0])); // G1 上（直付き）
+        model.nodes.push(test_node(3, [2000.0, 4000.0, 0.0])); // 先端（G1 から 4000, G2 から 1000）
+        model.nodes.push(test_node(4, [0.0, 5000.0, 0.0])); // G2 端
+        model.nodes.push(test_node(5, [8000.0, 5000.0, 0.0])); // G2 端
+        model.elements.push(test_beam(0, 0, 1)); // G1
+        model.elements.push(test_beam(1, 4, 5)); // G2
+        model.secondary_members.push(test_secondary(2, 3)); // 二次部材 2-3
+
+        // G1 は大きく水平移動、G2 は変位ゼロ。
+        let disp = vec![
+            [0.0; 6],                         // 0
+            [100.0, 0.0, 0.0, 0.0, 0.0, 0.0], // 1
+            [0.0; 6],                         // 2（未参照）
+            [0.0; 6],                         // 3（未参照）
+            [0.0; 6],                         // 4
+            [0.0; 6],                         // 5
+        ];
+        let out = interpolate_unreferenced_disp(&model, disp);
+        // node 2 は G1 上 t=0.25 → 25.0
+        assert!((out[2][0] - 25.0).abs() < 1e-9, "node2={:?}", out[2]);
+        // node 3 は最寄り大梁 G2（変位 0）ではなく、二次部材で node 2 に追従 → 25.0
+        assert!((out[3][0] - 25.0).abs() < 1e-9, "node3={:?}", out[3]);
+    }
+
+    #[test]
+    fn 二次部材の連鎖でも主架構に近い側から順に追従する() {
+        // node 1(大梁 G1 上, 直付き) → 二次部材 → node 2 → 二次部材 → node 3 の連鎖。
+        // node 3 は変位ゼロの別の大梁 G2 に近く、単純射影では G2 へ張り付くが、
+        // 連鎖を辿って node 1 の変位へ揃うことを確認する（伝播が無いと誤る配置）。
+        let mut model = Model::default();
+        model.nodes.push(test_node(0, [0.0, 0.0, 0.0])); // G1 端
+        model.nodes.push(test_node(1, [4000.0, 0.0, 0.0])); // G1 端（直付きアンカー元）
+        model.nodes.push(test_node(2, [4000.0, 2000.0, 0.0])); // 連鎖 1 段目
+        model.nodes.push(test_node(3, [4000.0, 4000.0, 0.0])); // 連鎖 2 段目（G2 から 1000）
+        model.nodes.push(test_node(4, [0.0, 5000.0, 0.0])); // G2 端
+        model.nodes.push(test_node(5, [8000.0, 5000.0, 0.0])); // G2 端
+        model.elements.push(test_beam(0, 0, 1)); // G1
+        model.elements.push(test_beam(1, 4, 5)); // G2（変位ゼロ）
+        model.secondary_members.push(test_secondary(1, 2));
+        model.secondary_members.push(test_secondary(2, 3));
+
+        let disp = vec![
+            [8.0, 0.0, 0.0, 0.0, 0.0, 0.0], // 0
+            [8.0, 0.0, 0.0, 0.0, 0.0, 0.0], // 1（両端同変位＝剛体移動）
+            [0.0; 6],                       // 2（未参照）
+            [0.0; 6],                       // 3（未参照）
+            [0.0; 6],                       // 4
+            [0.0; 6],                       // 5
+        ];
+        let out = interpolate_unreferenced_disp(&model, disp);
+        // node 2, 3 とも連鎖を辿って node 1 の変位 8.0 に追従する。
+        assert!((out[2][0] - 8.0).abs() < 1e-9, "node2={:?}", out[2]);
+        assert!((out[3][0] - 8.0).abs() < 1e-9, "node3={:?}", out[3]);
     }
 }
