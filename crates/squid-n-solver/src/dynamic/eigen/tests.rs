@@ -315,16 +315,17 @@ fn test_eigen_mass_rank_deficient_returns_explicit_error() {
     );
 }
 
+/// `gevd_jacobi` は M=I（単位行列）を渡すと標準固有値問題 K z = θ z に一致する。
 #[test]
-fn test_jacobi_2x2() {
-    let a = vec![2.0, 1.0, 1.0, 3.0];
-    let (vals, vecs) = jacobi_evd(&a, 2);
-    let mut sorted = vals.clone();
-    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+fn test_gevd_jacobi_2x2_identity_mass() {
+    let k = vec![2.0, 1.0, 1.0, 3.0];
+    let m = vec![1.0, 0.0, 0.0, 1.0];
+    let (vals, vecs) = gevd_jacobi(&k, &m, 2);
     let expected_1 = (5.0 - 5.0_f64.sqrt()) / 2.0;
     let expected_2 = (5.0 + 5.0_f64.sqrt()) / 2.0;
-    assert!((sorted[0] - expected_1).abs() < 1e-10, "val0={}", sorted[0]);
-    assert!((sorted[1] - expected_2).abs() < 1e-10, "val1={}", sorted[1]);
+    assert!((vals[0] - expected_1).abs() < 1e-10, "val0={}", vals[0]);
+    assert!((vals[1] - expected_2).abs() < 1e-10, "val1={}", vals[1]);
+    // M=I 正規直交（zᵀz=1）であることを確認する。
     for j in 0..2 {
         let mut norm = 0.0;
         for i in 0..2 {
@@ -554,6 +555,40 @@ fn test_eigen_portal_frame_density_mass_two_modes() {
         result.period[0] > 0.01 && result.period[0] < 5.0,
         "T1={} は非物理的なオーダー",
         result.period[0]
+    );
+}
+
+/// 質量方式 LumpedOnly では部材密度による要素質量を質量行列に算入しないことを、
+/// 固有周期で確認する回帰テスト。密度を持つ 1 自由度ばねモデルで、
+/// 既定（CorrectedLumped: 要素質量＋節点質量）では周期が節点質量のみの
+/// 理論値からずれ、LumpedOnly では理論値 T=2π√(m/k) に一致する。
+#[test]
+fn test_eigen_mass_method_lumped_only_skips_element_mass() {
+    let mut model = make_1dof_spring_model();
+    // 密度を与えて要素質量を発生させる（値は節点質量と同程度のオーダー）。
+    model.materials[0].density = 1.0e-3;
+
+    let dofmap = DofMap::build(&model);
+    let reducer = Reducer::build(&model, &dofmap);
+    let t_default = solve_eigen(&model, &dofmap, &reducer, 1).unwrap().period[0];
+
+    model.mass_method = squid_n_core::model::MassMethod::LumpedOnly;
+    let t_lumped = solve_eigen(&model, &dofmap, &reducer, 1).unwrap().period[0];
+
+    let k = 1000.0_f64;
+    let m = 1.0;
+    let t_theory = 2.0 * std::f64::consts::PI * (m / k).sqrt();
+    assert!(
+        (t_lumped - t_theory).abs() < 1e-9 * t_theory,
+        "LumpedOnly の周期 {} が節点質量のみの理論値 {} と不一致",
+        t_lumped,
+        t_theory
+    );
+    assert!(
+        t_default > t_theory * 1.01,
+        "既定方式の周期 {} は要素質量の分だけ理論値 {} より長くなるはず",
+        t_default,
+        t_theory
     );
 }
 
@@ -936,4 +971,199 @@ fn test_eigen_mass_rank_translation_rotation_scale_mix() {
             top_mass
         );
     }
+}
+
+/// 部分空間反復の質量重み付け（`K·y=M·x`）が正しく効いていることを、
+/// 質量が非対称（m1≠m2）な2層軸ばねモデルの解析解と比較して確認する。
+/// M∝I（等質量）の [`test_2dof_shear_period_and_mass`] では質量重み付けの
+/// 有無が結果に影響しないため区別できない（この2つは相補的な回帰テスト）。
+#[test]
+fn test_2dof_shear_unequal_mass_matches_analytic() {
+    let k = 1000.0_f64;
+    let young = k * 1000.0;
+    let node = |id: u32, x: f64, restraint: Dof6Mask, mass: Option<[f64; 6]>| Node {
+        id: NodeId(id),
+        coord: [x, 0.0, 0.0],
+        restraint,
+        mass,
+        story: None,
+    };
+    let beam = |id: u32, a: u32, b: u32| ElementData {
+        id: ElemId(id),
+        kind: ElementKind::Beam,
+        nodes: smallvec::smallvec![NodeId(a), NodeId(b)],
+        section: Some(SectionId(0)),
+        material: Some(MaterialId(0)),
+        local_axis: LocalAxis {
+            ref_vector: [0.0, 0.0, 1.0],
+        },
+        end_cond: [EndCondition::Fixed, EndCondition::Fixed],
+        force_regime: ForceRegime::Auto,
+        rigid_zone: Default::default(),
+        plastic_zone: None,
+        spring: None,
+    };
+    let model = Model {
+        nodes: vec![
+            node(0, 0.0, Dof6Mask::FIXED, None),
+            node(1, 1000.0, FREE_UX, Some([1.0, 0.0, 0.0, 0.0, 0.0, 0.0])),
+            node(2, 2000.0, FREE_UX, Some([2.0, 0.0, 0.0, 0.0, 0.0, 0.0])),
+        ],
+        elements: vec![beam(1, 0, 1), beam(2, 1, 2)],
+        sections: vec![Section {
+            id: SectionId(0),
+            name: "spring".into(),
+            area: 1.0,
+            iy: 1.0,
+            iz: 1.0,
+            j: 1.0,
+            depth: 1.0,
+            width: 1.0,
+            as_y: 1.0,
+            as_z: 1.0,
+            panel_thickness: None,
+            thickness: None,
+            shape: None,
+        }],
+        materials: vec![Material {
+            concrete_class: Default::default(),
+            id: MaterialId(0),
+            name: "mat".into(),
+            young,
+            poisson: 0.0,
+            density: 0.0,
+            shear: None,
+            fc: None,
+            fy: None,
+        }],
+        ..Default::default()
+    };
+    let dofmap = DofMap::build(&model);
+    let reducer = Reducer::build(&model, &dofmap);
+    let result = solve_eigen(&model, &dofmap, &reducer, 2).unwrap();
+
+    // 2λ² - 5000λ + 1e6 = 0 の根（K=[[2000,-1000],[-1000,1000]], M=diag(1,2)）
+    let disc = (5000.0_f64.powi(2) - 4.0 * 2.0 * 1.0e6).sqrt();
+    let lam1 = (5000.0 - disc) / 4.0;
+    let lam2 = (5000.0 + disc) / 4.0;
+    assert!(
+        (result.omega2[0] - lam1).abs() / lam1 < 1e-6,
+        "λ1計算値={} 理論値={}",
+        result.omega2[0],
+        lam1
+    );
+    assert!(
+        (result.omega2[1] - lam2).abs() / lam2 < 1e-6,
+        "λ2計算値={} 理論値={}",
+        result.omega2[1],
+        lam2
+    );
+}
+
+#[test]
+fn test_eigen_subspace_matches_dense_ground_truth_q_lt_n() {
+    // n_modes=1 で q(=5) < n(=8) となる直列質点鎖を作り、部分空間反復の結果
+    // solve_eigen(...,1) を、同じ K_red/M_red を dense 化して gevd_jacobi に
+    // 直接渡した「厳密解（反復なし）」と比較する回帰テスト。
+    // 質量を大小交互（1.0, 50.0, ...）にして質量分布を強く非一様にし、
+    // 部分空間が n を張れない条件でも最低次モードへ正しく収束することを確認する。
+    let k = 1000.0_f64;
+    let young = k * 1000.0;
+    let n_masses = 8usize;
+    let mut nodes = vec![Node {
+        id: NodeId(0),
+        coord: [0.0, 0.0, 0.0],
+        restraint: Dof6Mask::FIXED,
+        mass: None,
+        story: None,
+    }];
+    for i in 1..=n_masses {
+        let m = if i % 2 == 1 { 1.0 } else { 50.0 };
+        nodes.push(Node {
+            id: NodeId(i as u32),
+            coord: [1000.0 * i as f64, 0.0, 0.0],
+            restraint: FREE_UX,
+            mass: Some([m, 0.0, 0.0, 0.0, 0.0, 0.0]),
+            story: None,
+        });
+    }
+    let elements = (0..n_masses)
+        .map(|i| ElementData {
+            id: ElemId(i as u32 + 1),
+            kind: ElementKind::Beam,
+            nodes: smallvec::smallvec![NodeId(i as u32), NodeId(i as u32 + 1)],
+            section: Some(SectionId(0)),
+            material: Some(MaterialId(0)),
+            local_axis: LocalAxis {
+                ref_vector: [0.0, 0.0, 1.0],
+            },
+            end_cond: [EndCondition::Fixed, EndCondition::Fixed],
+            force_regime: ForceRegime::Auto,
+            rigid_zone: Default::default(),
+            plastic_zone: None,
+            spring: None,
+        })
+        .collect();
+    let model = Model {
+        nodes,
+        elements,
+        sections: vec![Section {
+            id: SectionId(0),
+            name: "spring".into(),
+            area: 1.0,
+            iy: 1.0,
+            iz: 1.0,
+            j: 1.0,
+            depth: 1.0,
+            width: 1.0,
+            as_y: 1.0,
+            as_z: 1.0,
+            panel_thickness: None,
+            thickness: None,
+            shape: None,
+        }],
+        materials: vec![Material {
+            concrete_class: Default::default(),
+            id: MaterialId(0),
+            name: "mat".into(),
+            young,
+            poisson: 0.0,
+            density: 0.0,
+            shear: None,
+            fc: None,
+            fy: None,
+        }],
+        ..Default::default()
+    };
+    let dofmap = DofMap::build(&model);
+    let reducer = Reducer::build(&model, &dofmap);
+
+    let result = solve_eigen(&model, &dofmap, &reducer, 1).unwrap();
+
+    // 同じ K_red/M_red を dense 化し、gevd_jacobi へ直接渡す（反復なしの厳密解）。
+    let k_free = assemble_global_k(&model, &dofmap);
+    let k_red = reducer.reduce_k(&k_free);
+    let m_free = assemble_global_m(
+        &model,
+        &dofmap,
+        squid_n_element::behavior::MassOption::Consistent,
+    );
+    let m_red = reducer.reduce_k(&m_free);
+    let n = k_red.nrows();
+    let mut k_dense = vec![0.0; n * n];
+    let mut m_dense = vec![0.0; n * n];
+    for i in 0..n {
+        for j in 0..n {
+            k_dense[i * n + j] = k_red.get(i, j).copied().unwrap_or(0.0);
+            m_dense[i * n + j] = m_red.get(i, j).copied().unwrap_or(0.0);
+        }
+    }
+    let (exact_vals, _) = gevd_jacobi(&k_dense, &m_dense, n);
+
+    assert!(
+        (result.omega2[0] - exact_vals[0]).abs() / exact_vals[0] < 1e-6,
+        "部分空間反復の結果 {} が厳密解 {} と不一致（q<n での収束先ずれの疑い）",
+        result.omega2[0],
+        exact_vals[0]
+    );
 }

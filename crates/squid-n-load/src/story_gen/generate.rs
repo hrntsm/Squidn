@@ -44,7 +44,7 @@ pub fn generate_stories_multi(
     model: &Model,
     gravity_lcs: &[LoadCaseId],
 ) -> Result<StoryGenResult, String> {
-    generate_stories_with_opts(model, gravity_lcs, true)
+    generate_stories_with_opts(model, gravity_lcs, true, MassMethod::default())
 }
 
 /// [`generate_stories_multi`] の自重算入方法を選べる版。
@@ -57,10 +57,17 @@ pub fn generate_stories_multi(
 ///   （[`crate::self_weight::self_weight_case_content`] の内容を含む「DL」）が
 ///   重力ケースに含まれるモデル向け（自重・雑壁ともケース側に含まれるため、
 ///   直接算入すると二重計上になる）。
+///
+/// `mass_method`: 剛床代表節点（マスター）へ与える質点質量（[`Node::mass`]）の
+/// 算定方式（[`MassMethod`]）。`include_density_self_weight` の真偽によらず、
+/// `CorrectedLumped` は解析の質量行列に部材密度質量として計上される自重
+/// （主架構線材・壁パネル）を地震用重量から控除した残りを、`LumpedOnly` は
+/// 地震用重量の全量をマスターの質点質量とする。
 pub fn generate_stories_with_opts(
     model: &Model,
     gravity_lcs: &[LoadCaseId],
     include_density_self_weight: bool,
+    mass_method: MassMethod,
 ) -> Result<StoryGenResult, String> {
     if model.nodes.is_empty() {
         return Err("節点がありません".into());
@@ -150,38 +157,63 @@ pub fn generate_stories_with_opts(
     //   両節点へ、が節点標高から自然に成立する）。
     // - 壁・シェル: 頂点配分（三方スリットは最上位標高の頂点へ全量）。
     //
-    // 自重が重力ケース（「DL」自動同期）側に含まれる場合は、二重計上を避ける
-    // ため密度からの直接算入を行わない（include_density_self_weight = false）。
+    // CorrectedLumped のマスター補正質点算定（後段）が「解析の質量行列に部材密度
+    // 質量として計上される自重（線材・壁パネル）」の節点配分を必要とするため、
+    // `include_density_self_weight` の真偽によらず列挙自体は常に行う。
+    let self_weight_items = enumerate_self_weight(model, &load_cfg);
+
+    // 線材（柱梁・ブレース）・壁パネルの自重を対象 Vec へ配分する（K型ブレースの
+    // 再配分規則込み）。node_weight（地震用重量の合算）と node_self_weight
+    // （解析質量行列に部材密度質量として計上される自重の控除用）の双方で使う。
+    let distribute_line_panel = |target: &mut Vec<f64>, item: &SelfWeightItem| match item {
+        SelfWeightItem::Line { elem_idx, total } => {
+            let elem = &model.elements[*elem_idx];
+            let ni = elem.nodes[0].index();
+            let nj = elem.nodes[1].index();
+            if matches!(elem.kind, ElementKind::Brace { .. })
+                && load_cfg.k_brace_rule == KBraceWeightRule::BaseNodesOnly
+            {
+                k_brace_redistribute(target, ni, nj, *total / 2.0, *total / 2.0);
+            } else {
+                target[ni] += *total / 2.0;
+                target[nj] += *total / 2.0;
+            }
+        }
+        SelfWeightItem::Panel { shares } => {
+            for &(i, w) in shares {
+                target[i] += w;
+            }
+        }
+        SelfWeightItem::Damper { .. } | SelfWeightItem::SecondaryLine { .. } => {}
+    };
+
+    // §CorrectedLumped の控除対象: 解析の質量行列に部材密度質量として計上される
+    // 要素（主架構の線材・壁パネル）の自重のみ。ダンパー・二次部材（小梁・間柱）・
+    // フレーム外雑壁は解析質量に算入されない（assemble_global_m がダンパーの
+    // mass_matrix を零で返し、二次部材・雑壁は model.elements にすら現れない）
+    // ため控除しない。
+    let mut node_self_weight = vec![0.0f64; model.nodes.len()];
+    for item in &self_weight_items {
+        distribute_line_panel(&mut node_self_weight, item);
+    }
+
+    // 自重が重力ケース（「DL」自動同期）側に含まれる場合は、地震用重量の合算
+    // (node_weight) への直接算入を行わない（include_density_self_weight = false）。
     if include_density_self_weight {
-        for item in enumerate_self_weight(model, &load_cfg) {
+        for item in &self_weight_items {
             match item {
                 SelfWeightItem::Damper { ni, nj, total } => {
-                    node_weight[ni] += total / 2.0;
-                    node_weight[nj] += total / 2.0;
-                }
-                SelfWeightItem::Line { elem_idx, total } => {
-                    let elem = &model.elements[elem_idx];
-                    let ni = elem.nodes[0].index();
-                    let nj = elem.nodes[1].index();
-                    if matches!(elem.kind, ElementKind::Brace { .. })
-                        && load_cfg.k_brace_rule == KBraceWeightRule::BaseNodesOnly
-                    {
-                        k_brace_redistribute(&mut node_weight, ni, nj, total / 2.0, total / 2.0);
-                    } else {
-                        node_weight[ni] += total / 2.0;
-                        node_weight[nj] += total / 2.0;
-                    }
-                }
-                SelfWeightItem::Panel { shares } => {
-                    for (i, w) in shares {
-                        node_weight[i] += w;
-                    }
+                    node_weight[*ni] += total / 2.0;
+                    node_weight[*nj] += total / 2.0;
                 }
                 // 二次部材（小梁・間柱）: 両端節点へ 1/2 ずつ（節点は所属階の
                 // レベルでクラスタリングされるため、階重量へ自然に算入される）。
                 SelfWeightItem::SecondaryLine { ni, nj, total } => {
-                    node_weight[ni] += total / 2.0;
-                    node_weight[nj] += total / 2.0;
+                    node_weight[*ni] += total / 2.0;
+                    node_weight[*nj] += total / 2.0;
+                }
+                SelfWeightItem::Line { .. } | SelfWeightItem::Panel { .. } => {
+                    distribute_line_panel(&mut node_weight, item);
                 }
             }
         }
@@ -308,11 +340,43 @@ pub fn generate_stories_with_opts(
             next_new_id += 1;
             id
         });
+
+        // マスターへ与える質点質量（mass_method による。§CorrectedLumped/LumpedOnly）。
+        // 控除後重量 net_i:
+        // - CorrectedLumped: 地震用重量から、解析の質量行列に部材密度質量として
+        //   計上される自重（線材・壁パネル）を控除した残り（負にはしない）。
+        // - LumpedOnly: 控除せず地震用重量そのもの。
+        let net_i = |idx: usize| -> f64 {
+            match mass_method {
+                MassMethod::CorrectedLumped => (node_weight[idx] - node_self_weight[idx]).max(0.0),
+                MassMethod::LumpedOnly => node_weight[idx],
+            }
+        };
+        let mt_weight: f64 = node_ids.iter().map(|n| net_i(n.index())).sum();
+        // 質点質量が算定できる階のみ設定する（Σnet_i ≦ 0 は None のまま）。
+        let mass = if mt_weight > 0.0 {
+            let mt = squid_n_core::units::to_internal::weight_n_to_mass(mt_weight);
+            // 回転慣性 j = Σ(net_i/g)·r_i²（r_i はマスター座標 (gx,gy) からの平面距離）。
+            let j: f64 = node_ids
+                .iter()
+                .map(|n| {
+                    let idx = n.index();
+                    let mi = squid_n_core::units::to_internal::weight_n_to_mass(net_i(idx));
+                    let dx = model.nodes[idx].coord[0] - gx;
+                    let dy = model.nodes[idx].coord[1] - gy;
+                    mi * (dx * dx + dy * dy)
+                })
+                .sum();
+            Some([mt, mt, 0.0, 0.0, 0.0, j])
+        } else {
+            None
+        };
+
         rep_nodes.push(Node {
             id: master,
             coord: [gx, gy, elev],
             restraint: rep_restraint,
-            mass: None,
+            mass,
             story: Some(story_id),
         });
         generated_masters.push(master);

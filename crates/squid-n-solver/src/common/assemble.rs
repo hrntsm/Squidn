@@ -20,18 +20,31 @@ pub fn assemble_global_k(model: &Model, dofmap: &DofMap) -> SparseColMat<usize, 
     assemble_csc(dofmap.n_active(), all_triplets)
 }
 
+/// 全体質量行列を組み立てる。
+///
+/// 質量源は「部材密度による要素質量」と「節点集中質量（`Node::mass`）」の 2 つで、
+/// どちらを算入するかはモデルの質量方式（[`squid_n_core::model::MassMethod`]、
+/// `Model::mass_method`）に従う:
+///
+/// - `CorrectedLumped`（既定）: 要素質量＋節点質量（従来どおりの合算）。
+///   剛床マスターの節点質量は階生成が「地震用重量−分布質量計上分」の補正値を
+///   与えるため、二重計上にならない。
+/// - `LumpedOnly`: 節点質量のみ（要素質量は算入しない）。剛床マスターには
+///   階生成が地震用重量の全量を与える（水平質点系モデル化）。
 pub fn assemble_global_m(
     model: &Model,
     dofmap: &DofMap,
     opt: squid_n_element::behavior::MassOption,
 ) -> SparseColMat<usize, f64> {
     let mut all_triplets = Vec::new();
-    for elem in &model.elements {
-        let (behavior, _state) = build_behavior(elem, model);
-        let gdofs = behavior.global_dofs(dofmap);
-        let m_local = behavior.mass_matrix(opt);
-        let triplets = m_local.to_triplets(&gdofs);
-        all_triplets.extend(triplets);
+    if model.mass_method != squid_n_core::model::MassMethod::LumpedOnly {
+        for elem in &model.elements {
+            let (behavior, _state) = build_behavior(elem, model);
+            let gdofs = behavior.global_dofs(dofmap);
+            let m_local = behavior.mass_matrix(opt);
+            let triplets = m_local.to_triplets(&gdofs);
+            all_triplets.extend(triplets);
+        }
     }
 
     // 節点集中質量（Node.mass）を対角へ加算する。

@@ -1207,6 +1207,7 @@ fn test_apply_stories_roundtrip_with_generated_masters() {
         }],
         rep_nodes: vec![rep_node],
         generated_masters: vec![NodeId(2)],
+        mass_method: Default::default(),
     };
 
     stack.run(&mut model, Box::new(cmd));
@@ -1227,6 +1228,44 @@ fn test_apply_stories_roundtrip_with_generated_masters() {
     assert_eq!(model.generated_masters, vec![NodeId(2)]);
     assert_eq!(model.stories.len(), 1);
     assert_eq!(model.constraints.len(), 1);
+}
+
+/// `ApplyStories` が `model.mass_method` を設定し、undo で変更前の値へ復元されること。
+#[test]
+fn test_apply_stories_sets_and_restores_mass_method() {
+    use squid_n_core::model::MassMethod;
+
+    let mut model = empty_model();
+    for i in 0..2u32 {
+        model.nodes.push(Node {
+            id: NodeId(i),
+            coord: [i as f64 * 1000.0, 0.0, 3000.0],
+            restraint: Dof6Mask::FREE,
+            mass: None,
+            story: None,
+        });
+    }
+    // 変更前は既定（CorrectedLumped）。
+    assert_eq!(model.mass_method, MassMethod::CorrectedLumped);
+    let mut stack = UndoStack::new();
+
+    let cmd = ApplyStories {
+        stories: vec![],
+        node_story: vec![None, None],
+        constraints: vec![],
+        rep_nodes: vec![],
+        generated_masters: vec![],
+        mass_method: MassMethod::LumpedOnly,
+    };
+
+    stack.run(&mut model, Box::new(cmd));
+    assert_eq!(model.mass_method, MassMethod::LumpedOnly);
+
+    stack.undo(&mut model);
+    assert_eq!(model.mass_method, MassMethod::CorrectedLumped);
+
+    stack.redo(&mut model);
+    assert_eq!(model.mass_method, MassMethod::LumpedOnly);
 }
 
 /// 階数が減って不活性化された剛床代表節点（`generated_masters` には残るが

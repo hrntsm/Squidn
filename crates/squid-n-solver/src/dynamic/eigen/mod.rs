@@ -7,8 +7,9 @@ use squid_n_math::solver::{make_solver, LinearSolver, SolveError, SolverBackend}
 
 const EIGEN_TOL: f64 = 1e-10;
 const EIGEN_MAX_ITER: usize = 200;
-/// 部分空間内で射影質量行列 M̄ の固有値をこの相対値未満とみなしたら
-/// 「質量を持たない方向」として扱う（質量ランク判定の相対許容誤差）。
+/// 一般化 Jacobi で同時対角化した後の質量対角成分 m̂ᵢᵢ が、その最大値との
+/// 相対でこの値未満の方向を「質量を持たない方向」として扱う
+/// （質量ランク判定の相対許容誤差。[`gevd_jacobi`] 参照）。
 const MASS_RANK_REL_TOL: f64 = 1e-9;
 
 pub struct ModalResult {
@@ -131,7 +132,8 @@ pub fn solve_eigen_with_solver(
     for _iteration in 0..EIGEN_MAX_ITER {
         let mut y = vec![0.0; n * q];
         for col in 0..q {
-            let rhs: Vec<f64> = (0..n).map(|r| x[r * q + col]).collect();
+            let x_col: Vec<f64> = (0..n).map(|r| x[r * q + col]).collect();
+            let rhs = spmv(&m_red, &x_col);
             let yi = solver.solve(&rhs)?;
             for r in 0..n {
                 y[r * q + col] = yi[r];
@@ -356,37 +358,40 @@ fn m_norm(phi: &[f64], m_red: &faer::sparse::SparseColMat<usize, f64>) -> f64 {
     phi.iter().zip(m_phi.iter()).map(|(p, mp)| p * mp).sum()
 }
 
-/// Generalized eigenvalue problem K*z = θ*M*z。
+/// Generalized eigenvalue problem K*z = θ*M*z（Bathe の一般化 Jacobi 法）。
 ///
 /// M は理論上は半正定値だが、部分空間反復の作業次元 q が実際の質量ランク r を
 /// 超える場合（回転自由度など質量を持たない自由度が混在するモデルでは一般的）、
 /// 射影質量行列 M̄ は必ずランク落ち（半正定値だが正定値でない）になる。
-/// Cholesky 分解はこの場合ピボットが 0 に潰れて失敗するため、以前の実装は
-/// 「対角成分のみで θ=k/m を計算する」という数学的に誤った近似
-/// （非対角の結合を無視し、質量ゼロ方向には f64::MAX を注入する）にフォールバック
-/// していた。これは q が要求モード数よりオーバーサンプリングされている限り
-/// ほぼ必ず発生し、結果に f64::MAX が混入する原因になっていた。
+/// このため Cholesky ベースの標準固有値問題化は使えない。また「M̄ を固有分解して
+/// 質量部分空間と質量ゼロ部分空間に分離してから解く」方式は、反復ごとの
+/// ランク判定が数値ノイズで揺らぐと「ランク落ち判定→ヌルベクトル注入→
+/// K⁻¹ の冪乗反復による最低次モード方向への倒れ込み（平行化）→再ランク落ち」
+/// という周期2のリミットサイクルに陥り永久に収束しない（剛床マスターの
+/// 並進質量 t と回転慣性 t·mm² のようにスケール差が大きい質量分布で顕在化）。
 ///
-/// 正しい扱いは、M̄ 自体を固有分解して「質量を持つ部分空間」（固有値 > 0）と
-/// 「質量を持たない部分空間」（固有値 ≈ 0）に分離し、質量を持つ部分空間内だけで
-/// 標準固有値問題に変換して解くこと。質量を持たない方向には物理的な固有振動数が
-/// 存在しないため、θ=+∞（有限な f64::MAX ではなく明示的な無限大）を割り当て、
-/// 呼び出し側で「要求モード数に対して質量ランクが不足している」ことを検出できる
-/// ようにする。
+/// そこで Bathe の一般化 Jacobi 法（Bathe, Finite Element Procedures, §11.3.3）で
+/// K と M を**反復中のランク判定なしに**同時対角化する。各 2×2 ペアについて
+/// 両行列の非対角成分を同時に零化する正則な合同変換 P（対角 1、非対角 α・γ）を
+/// 掛ける掃引を収束まで繰り返す。M が半正定値でも常に正則な変換で進むため、
+/// 基底の特異化が構造的に起きない。対角化後に θᵢ = k̂ᵢᵢ/m̂ᵢᵢ を読み出し、
+/// 質量を持たない方向（m̂ᵢᵢ が相対許容誤差 [`MASS_RANK_REL_TOL`] 未満）には
+/// θ=+∞（有限な f64::MAX ではなく明示的な無限大）を割り当て、呼び出し側で
+/// 「要求モード数に対して質量ランクが不足している」ことを検出できるようにする。
 ///
-/// 質量ランクの判定は、M̄ をそのまま固有分解すると失敗する。並進質量（t）と
-/// 回転慣性（t·mm²、並進の 10^6〜10^8 倍のスケール）が混在するモデルでは、
-/// M̄ の固有値の大小が「質量の有無」ではなく単位系・基底ベクトルのスケールを
-/// 反映してしまい、物理的に有意な並進方向が相対許容誤差
-/// （[`MASS_RANK_REL_TOL`]×最大固有値）未満に落ちて「質量なし」と誤判定される
-/// （剛床モデルで質量ランクが過少検出され、解けるはずの要求モード数で
-/// InvalidInput になる）。そこで K̄ の対角で両行列を対称スケーリングする:
-/// S = diag(1/√k̄ᵢᵢ) とし K̃ = S·K̄·S（単位対角）、M̃ = S·M̄·S。合同変換なので
-/// 一般化固有値 θ は不変で、固有ベクトルは z = S·z̃ で戻る。M̃ の固有値は
-/// 各方向の「柔性あたりの質量」（≈1/θ）というスケール不変量になり、
-/// 相対許容誤差での質量ランク判定が単位系・基底スケールに依存しなくなる。
+/// 数値スケーリング: 並進質量（t）と回転慣性（t·mm²、並進の 10^6〜10^8 倍）が
+/// 混在するモデルでは、m̂ᵢᵢ の大小が「質量の有無」ではなく単位系・基底ベクトルの
+/// スケールを反映してしまい、相対許容誤差での質量判定が破綻する（剛床モデルで
+/// 質量ランクが過少検出され、解けるはずの要求モード数で InvalidInput になる）。
+/// そこで K̄ の対角で両行列を対称スケーリングする: S = diag(1/√k̄ᵢᵢ) とし
+/// K̃ = S·K̄·S（単位対角）、M̃ = S·M̄·S。合同変換なので一般化固有値 θ は不変で、
+/// 固有ベクトルは z = S·z̃ で戻る。対角化後の m̂ᵢᵢ は各方向の「柔性あたりの質量」
+/// （≈1/θ）というスケール不変量になり、質量判定が単位系・基底スケールに
+/// 依存しなくなる。
 ///
-/// Returns (eigenvalues ascending, +∞ が質量ゼロ方向; eigenvectors as columns).
+/// Returns (eigenvalues ascending, +∞ が質量ゼロ方向; eigenvectors as columns)。
+/// 質量を持つ方向の固有ベクトルは M̄ 正規直交（zᵀM̄z = 1）、質量ゼロ方向は
+/// 単位ノルムに正規化して返す。
 fn gevd_jacobi(k_in: &[f64], m_in: &[f64], n: usize) -> (Vec<f64>, Vec<f64>) {
     // K̄ の対角によるスケーリング係数。K̄ は正定値（縮約後剛性の射影）のため
     // 対角は正のはずだが、数値的な退化に備え非正・非有限なら 1 とする。
@@ -408,78 +413,130 @@ fn gevd_jacobi(k_in: &[f64], m_in: &[f64], n: usize) -> (Vec<f64>, Vec<f64>) {
             m[i * n + j] = s[i] * m_in[i * n + j] * s[j];
         }
     }
-    let (k, m) = (&k[..], &m[..]);
-
-    let (mu, u) = jacobi_evd(m, n);
-    let mu_max = mu.iter().cloned().fold(0.0_f64, f64::max);
-
-    let tol = MASS_RANK_REL_TOL * mu_max;
-    let mut kept: Vec<usize> = Vec::new();
-    let mut dropped: Vec<usize> = Vec::new();
-    for i in 0..n {
-        if mu_max > 0.0 && mu[i] > tol {
-            kept.push(i);
-        } else {
-            dropped.push(i);
-        }
-    }
-    let r = kept.len();
-
-    let mut vals = vec![f64::INFINITY; n];
     let mut vecs = vec![0.0; n * n];
+    for i in 0..n {
+        vecs[i * n + i] = 1.0;
+    }
 
-    if r > 0 {
-        // W の列 = M̄-固有ベクトル / sqrt(質量固有値)。W^T M̄ W = I_r となる
-        // （質量に関して正規直交な）基底で、質量を持つ部分空間だけを張る。
-        let mut w = vec![0.0; n * r];
-        for (col, &ki) in kept.iter().enumerate() {
-            let inv_sqrt = 1.0 / mu[ki].sqrt();
-            for row in 0..n {
-                w[row * r + col] = u[row * n + ki] * inv_sqrt;
-            }
-        }
+    // 一般化 Jacobi 掃引: 全ペア (i,j) について K̃・M̃ の (i,j) 成分を同時に
+    // 零化する合同変換を、回転が発生しなくなるまで繰り返す。
+    // 結合度のしきい値は Bathe の収束判定に倣い「非対角/対角比の2乗」で測る。
+    const MAX_SWEEPS: usize = 100;
+    const COUPLE_TOL: f64 = 1e-24; // 結合度（比の2乗）のしきい値 = (1e-12)²
+    for _sweep in 0..MAX_SWEEPS {
+        // M̃ の対角は質量ゼロ方向で 0 になり得るため、比の分母には
+        // 対角最大値×質量判定許容誤差を床として使う。
+        let m_diag_max = (0..n)
+            .map(|i| m[i * n + i].max(0.0))
+            .fold(0.0_f64, f64::max);
+        let m_floor = (m_diag_max * MASS_RANK_REL_TOL).max(f64::MIN_POSITIVE);
+        let mut rotated = false;
+        for i in 0..n {
+            for j in (i + 1)..n {
+                let kii = k[i * n + i];
+                let kjj = k[j * n + j];
+                let kij = k[i * n + j];
+                let mii = m[i * n + i];
+                let mjj = m[j * n + j];
+                let mij = m[i * n + j];
 
-        // A = W^T K W（r×r 対称行列）。この基底では一般化固有値問題が
-        // A z' = θ z' という標準固有値問題になる。
-        let a = mat_wt_k_w(k, &w, n, r);
-        let (theta_r, v_r) = jacobi_evd(&a, r);
-
-        // 元の q 次元部分空間へ戻す: Z = W * V。
-        for col in 0..r {
-            vals[col] = theta_r[col];
-            for row in 0..n {
-                let mut s = 0.0;
-                for l in 0..r {
-                    s += w[row * r + l] * v_r[l * r + col];
+                let k_couple = kij * kij / (kii * kjj).max(f64::MIN_POSITIVE);
+                let m_couple = mij * mij / (mii.max(m_floor) * mjj.max(m_floor));
+                if k_couple < COUPLE_TOL && m_couple < COUPLE_TOL {
+                    continue;
                 }
-                vecs[row * n + col] = s;
+
+                // Bathe の係数: (i,j) 成分を K̃・M̃ 双方で零化する α・γ。
+                let a1 = kii * mij - mii * kij;
+                let a2 = kjj * mij - mjj * kij;
+                let a3 = kii * mjj - kjj * mii;
+                // K 正定値・M 半正定値なら理論上 判別式 ≥ 0。数値誤差の負は 0 に丸める。
+                let root = ((a3 * 0.5) * (a3 * 0.5) + a1 * a2).max(0.0).sqrt();
+                let x = if a3 >= 0.0 {
+                    a3 * 0.5 + root
+                } else {
+                    a3 * 0.5 - root
+                };
+                let (alpha, gamma) = if x.abs() > f64::MIN_POSITIVE && (a1 != 0.0 || a2 != 0.0) {
+                    (a2 / x, -a1 / x)
+                } else if kjj.abs() > f64::MIN_POSITIVE {
+                    // 退化ペア（例: 両方向とも質量ゼロで M̃ 成分がすべて 0）は
+                    // K̃ 側だけをガウス消去式に零化する。
+                    (-kij / kjj, 0.0)
+                } else {
+                    (0.0, 0.0)
+                };
+                if alpha == 0.0 && gamma == 0.0 {
+                    continue;
+                }
+                rotated = true;
+
+                // 合同変換 A ← PᵀAP、P = I + α·eᵢeⱼᵀ + γ·eⱼeᵢᵀ。
+                // 列更新（A·P）: colᵢ += γ·colⱼ、colⱼ += α·colᵢ(旧)。
+                // 続く行更新（Pᵀ·A）も同様。旧値を使うため両成分を同時に読む。
+                for mat in [&mut k, &mut m] {
+                    for row in 0..n {
+                        let ai = mat[row * n + i];
+                        let aj = mat[row * n + j];
+                        mat[row * n + i] = ai + gamma * aj;
+                        mat[row * n + j] = aj + alpha * ai;
+                    }
+                    for col in 0..n {
+                        let ai = mat[i * n + col];
+                        let aj = mat[j * n + col];
+                        mat[i * n + col] = ai + gamma * aj;
+                        mat[j * n + col] = aj + alpha * ai;
+                    }
+                }
+                for row in 0..n {
+                    let vi = vecs[row * n + i];
+                    let vj = vecs[row * n + j];
+                    vecs[row * n + i] = vi + gamma * vj;
+                    vecs[row * n + j] = vj + alpha * vi;
+                }
+            }
+        }
+        if !rotated {
+            break;
+        }
+    }
+
+    // 対角から固有値を読み出す。質量判定はスケール不変な m̂ᵢᵢ（≈1/θ）の
+    // 相対値で行い、質量を持たない方向は θ=+∞ とする。
+    let m_diag_max = (0..n)
+        .map(|i| m[i * n + i].max(0.0))
+        .fold(0.0_f64, f64::max);
+    let mass_tol = MASS_RANK_REL_TOL * m_diag_max;
+    let mut vals = vec![f64::INFINITY; n];
+    for i in 0..n {
+        let mii = m[i * n + i];
+        if m_diag_max > 0.0 && mii > mass_tol {
+            vals[i] = k[i * n + i] / mii;
+        }
+    }
+
+    // 正規化とスケーリングの逆変換（z = S·z̃）。質量を持つ列は M̃ 正規直交
+    // （z̃ᵀM̃z̃ = 1、合同変換なので逆変換後も zᵀM̄z = 1）にそろえる。
+    // 質量ゼロ方向は M̄ ノルムが定義できないため、逆変換後に単位ノルムへ
+    // そろえて基底の有界性を保つ（固有ベクトルの定数倍は部分空間反復の
+    // 張る空間・収束判定 θ のいずれにも影響しない）。
+    for col in 0..n {
+        if vals[col].is_finite() {
+            let inv = 1.0 / m[col * n + col].sqrt();
+            for row in 0..n {
+                vecs[row * n + col] *= inv;
             }
         }
     }
-
-    // 質量ゼロ方向は θ=+∞。固有ベクトルは M̃ の（質量的に意味を持たない）
-    // 対応する固有ベクトルをそのまま使う（直交性は保たれ、次の反復の
-    // K^-1 変換に使っても数値的に安全）。
-    for (offset, &di) in dropped.iter().enumerate() {
-        let col = r + offset;
-        for row in 0..n {
-            vecs[row * n + col] = u[row * n + di];
-        }
-    }
-
-    // スケーリングを逆変換（z = S·z̃）して元の基底の固有ベクトルへ戻す。
-    // 質量を持つ列（col < r）は W の構成により逆変換後も M̄ 正規直交
-    // （zᵀM̄z = z̃ᵀM̃z̃ = 1）でスケールが定まるが、質量ゼロ方向（col ≥ r）は
-    // M̄ ノルムが定義できず S の逆変換でスケールが不揃いになる。放置すると
-    // 次反復の部分空間基底が数値的に退化して収束しなくなるため、
-    // 単位ノルムへ正規化して有界性を保つ（固有ベクトルの定数倍は反復の
-    // 張る空間・収束判定 θ のいずれにも影響しない）。
     for row in 0..n {
         for col in 0..n {
             vecs[row * n + col] *= s[row];
         }
     }
-    for col in r..n {
+    for col in 0..n {
+        if vals[col].is_finite() {
+            continue;
+        }
         let norm2: f64 = (0..n).map(|row| vecs[row * n + col].powi(2)).sum();
         if norm2 > 0.0 {
             let inv = 1.0 / norm2.sqrt();
@@ -502,95 +559,6 @@ fn gevd_jacobi(k_in: &[f64], m_in: &[f64], n: usize) -> (Vec<f64>, Vec<f64>) {
     }
 
     (sorted_vals, sorted_vecs)
-}
-
-/// A = W^T K W （n×r の W と n×n の K から r×r 対称行列を作る）。
-fn mat_wt_k_w(k: &[f64], w: &[f64], n: usize, r: usize) -> Vec<f64> {
-    // kw = K * W (n×r)
-    let mut kw = vec![0.0; n * r];
-    for i in 0..n {
-        for j in 0..r {
-            let mut s = 0.0;
-            for l in 0..n {
-                s += k[i * n + l] * w[l * r + j];
-            }
-            kw[i * r + j] = s;
-        }
-    }
-    // a = W^T * kw (r×r)
-    let mut a = vec![0.0; r * r];
-    for i in 0..r {
-        for j in 0..r {
-            let mut s = 0.0;
-            for l in 0..n {
-                s += w[l * r + i] * kw[l * r + j];
-            }
-            a[i * r + j] = s;
-        }
-    }
-    a
-}
-
-/// Classical Jacobi eigenvalue decomposition for symmetric matrix.
-/// Returns (eigenvalues, eigenvectors as columns).
-fn jacobi_evd(a_in: &[f64], n: usize) -> (Vec<f64>, Vec<f64>) {
-    let mut a = a_in.to_vec();
-    let mut v = vec![0.0; n * n];
-    for i in 0..n {
-        v[i * n + i] = 1.0;
-    }
-
-    const MAX_SWEEPS: usize = 100;
-    const EPS: f64 = 1e-14;
-
-    for _ in 0..MAX_SWEEPS {
-        let mut off = 0.0;
-        for i in 0..n {
-            for j in (i + 1)..n {
-                off += a[i * n + j].abs();
-            }
-        }
-        if off < EPS {
-            break;
-        }
-
-        for p in 0..n {
-            for q in (p + 1)..n {
-                let apq = a[p * n + q];
-                if apq.abs() < EPS {
-                    continue;
-                }
-                let app = a[p * n + p];
-                let aqq = a[q * n + q];
-                let theta = (aqq - app) / (2.0 * apq);
-                let t = theta.signum() / (theta.abs() + (1.0 + theta * theta).sqrt());
-                let c = 1.0 / (1.0 + t * t).sqrt();
-                let s = t * c;
-
-                for i in 0..n {
-                    let aip = a[i * n + p];
-                    let aiq = a[i * n + q];
-                    a[i * n + p] = c * aip - s * aiq;
-                    a[i * n + q] = s * aip + c * aiq;
-                }
-                for i in 0..n {
-                    let api = a[p * n + i];
-                    let aqi = a[q * n + i];
-                    a[p * n + i] = c * api - s * aqi;
-                    a[q * n + i] = s * api + c * aqi;
-                }
-                for i in 0..n {
-                    let vip = v[i * n + p];
-                    let viq = v[i * n + q];
-                    v[i * n + p] = c * vip - s * viq;
-                    v[i * n + q] = s * vip + c * viq;
-                }
-            }
-        }
-    }
-
-    let eigvals: Vec<f64> = (0..n).map(|i| a[i * n + i]).collect();
-    (eigvals, v)
 }
 
 fn compute_participation(

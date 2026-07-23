@@ -35,6 +35,11 @@ pub struct Model {
     /// 構造節点と区別するために保持し、再生成時に再利用する。
     #[serde(default)]
     pub generated_masters: Vec<NodeId>,
+    /// 動的解析の質量モデルの方式（[`MassMethod`]）。階の自動生成が剛床マスターへ
+    /// 与える質点質量の算定と、質量行列組立での部材密度質量の要否を規定する。
+    /// 旧スキーマは補正質点方式（従来の密度質量＋節点質量と同じ組立）扱い。
+    #[serde(default)]
+    pub mass_method: MassMethod,
     /// 剛性計算用の床スラブ厚 [mm]（建物全体で一律。スラブ協力幅による梁剛性
     /// 増大の算定に用いる。RC 規準）。0 以下でスラブ協力幅による梁剛性増大を無効化（既定）。
     #[serde(default)]
@@ -310,6 +315,7 @@ impl Model {
             && self.load_cases == other.load_cases
             && self.combinations == other.combinations
             && self.generated_masters == other.generated_masters
+            && self.mass_method == other.mass_method
             && self.load_cfg == other.load_cfg
             && self.wall_attrs == other.wall_attrs
             && self.misc_walls == other.misc_walls
