@@ -184,6 +184,9 @@ pub struct ApplyStories {
     pub rep_nodes: Vec<squid_n_core::model::Node>,
     /// 適用後の `model.generated_masters` の全量。
     pub generated_masters: Vec<NodeId>,
+    /// 適用する動的解析の質量方式（[`squid_n_core::model::MassMethod`]）。
+    /// `rep_nodes` の質点質量はこの方式で算定済みの前提（呼び出し側の責務）。
+    pub mass_method: squid_n_core::model::MassMethod,
 }
 
 impl EditCommand for ApplyStories {
@@ -192,6 +195,7 @@ impl EditCommand for ApplyStories {
         // 変更前の全量スナップショット（rep_nodes の置換/追加も含めて丸ごと復元できるようにする）。
         let old_nodes = model.nodes.clone();
         let old_generated_masters = model.generated_masters.clone();
+        let old_mass_method = model.mass_method;
 
         let old_stories = std::mem::replace(&mut model.stories, self.stories.clone());
         for (node, st) in model.nodes.iter_mut().zip(self.node_story.iter()) {
@@ -215,12 +219,14 @@ impl EditCommand for ApplyStories {
             }
         }
         model.generated_masters = self.generated_masters.clone();
+        model.mass_method = self.mass_method;
 
         Box::new(RestoreStories {
             stories: old_stories,
             nodes: old_nodes,
             constraints: old_constraints,
             generated_masters: old_generated_masters,
+            mass_method: old_mass_method,
         })
     }
 
@@ -236,6 +242,7 @@ pub struct RestoreStories {
     pub nodes: Vec<squid_n_core::model::Node>,
     pub constraints: Vec<squid_n_core::model::Constraint>,
     pub generated_masters: Vec<NodeId>,
+    pub mass_method: squid_n_core::model::MassMethod,
 }
 
 impl EditCommand for RestoreStories {
@@ -245,11 +252,13 @@ impl EditCommand for RestoreStories {
         let new_constraints = std::mem::replace(&mut model.constraints, self.constraints.clone());
         let new_generated_masters =
             std::mem::replace(&mut model.generated_masters, self.generated_masters.clone());
+        let new_mass_method = std::mem::replace(&mut model.mass_method, self.mass_method);
         Box::new(RestoreStories {
             stories: new_stories,
             nodes: new_nodes,
             constraints: new_constraints,
             generated_masters: new_generated_masters,
+            mass_method: new_mass_method,
         })
     }
 

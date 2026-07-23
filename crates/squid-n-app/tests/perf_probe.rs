@@ -262,10 +262,12 @@ fn timed_generate_stories(app: &mut App) -> [std::time::Duration; 5] {
 
     // --- stage 2: squid_n_load::story_gen::generate_stories_with_opts (pub) ---
     let t0 = Instant::now();
+    let mass_method = squid_n_core::model::MassMethod::default();
     let gen = squid_n_load::story_gen::generate_stories_with_opts(
         &app.model,
         &gravity_lcs,
         include_density,
+        mass_method,
     )
     .expect("story generation should succeed on a well-formed grid model");
     let d2 = t0.elapsed();
@@ -280,6 +282,7 @@ fn timed_generate_stories(app: &mut App) -> [std::time::Duration; 5] {
             constraints: gen.constraints,
             rep_nodes: gen.rep_nodes,
             generated_masters: gen.generated_masters,
+            mass_method,
         }),
     );
     let d3 = t0.elapsed();

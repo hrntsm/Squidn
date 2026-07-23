@@ -17,9 +17,15 @@
 //! 並進慣性重量は ΣiW、回転慣性重量は ΣiW·ir² となり、スレーブ節点の面内応答は
 //! `crates/squid-n-solver/src/constraint.rs` の RigidDiaphragm 縮約で
 //! ix = Gx − iry·Gθz, iy = Gy + irx·Gθz として復元される。
-//! 回転慣性重量 ΣiW·ir² は質量を代表節点自体に持たせなくても、要素・節点側に残った
-//! 質量が Reducer の TᵀMT 縮約（`eigen.rs`）で自動的にマスターへ集約されるため、
-//! 代表節点の `mass` は常に `None` とする（二重計上を避ける）。
+//!
+//! 代表節点の `mass`（[`squid_n_core::model::Node::mass`]）は質量方式
+//! （[`MassMethod`]、`Model::mass_method`）に従って設定する。
+//! `CorrectedLumped`（既定）は、要素・節点側に残った分布質量が Reducer の
+//! TᵀMT 縮約（`eigen.rs`）で自動的にマスターへ集約されることを踏まえ、
+//! 代表節点へは「地震用重量のうち分布質量として計上されない分」
+//! （主架構線材・壁パネル以外＝床・仕上げ・積載・二次部材・雑壁など）を
+//! 補正質点として与える（二重計上を避ける）。`LumpedOnly` は分布質量を
+//! 質量行列に算入しないため、代表節点へ地震用重量の全量を与える。
 //!
 //! 責務ごとに以下のサブモジュールへ分割している。
 //!
@@ -32,8 +38,8 @@
 use squid_n_core::dof::{Dof, Dof6Mask};
 use squid_n_core::ids::{LoadCaseId, NodeId, StoryId};
 use squid_n_core::model::{
-    Constraint, DiaphragmDef, ElementData, ElementKind, KBraceWeightRule, LoadCfg, MemberLoadKind,
-    MiscWallTransfer, Model, Node, Story,
+    Constraint, DiaphragmDef, ElementData, ElementKind, KBraceWeightRule, LoadCfg, MassMethod,
+    MemberLoadKind, MiscWallTransfer, Model, Node, Story,
 };
 
 /// 重力加速度 [mm/s²]（内部単位系 N-mm-s、質量 ton）。

@@ -871,6 +871,32 @@ impl App {
                         self.run_eigen(self.analysis_cfg.n_modes);
                     }
                 });
+                ui.horizontal_wrapped(|ui| {
+                    use squid_n_core::model::MassMethod;
+                    ui.label("質量方式:");
+                    egui::ComboBox::from_id_salt("mass_method")
+                        .selected_text(match self.analysis_cfg.mass_method {
+                            MassMethod::CorrectedLumped => "補正質点（既定）",
+                            MassMethod::LumpedOnly => "質点のみ",
+                        })
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(
+                                &mut self.analysis_cfg.mass_method,
+                                MassMethod::CorrectedLumped,
+                                "補正質点（既定）",
+                            );
+                            ui.selectable_value(
+                                &mut self.analysis_cfg.mass_method,
+                                MassMethod::LumpedOnly,
+                                "質点のみ",
+                            );
+                        })
+                        .response
+                        .on_hover_text(
+                            "階の自動生成の実行時にモデルへ反映される。\
+                             固有値・時刻歴・精算周期の質量に共通で効く。",
+                        );
+                });
             });
         ui.add_space(6.0);
 

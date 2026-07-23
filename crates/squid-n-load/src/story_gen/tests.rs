@@ -3,8 +3,8 @@ use squid_n_core::dof::Dof6Mask;
 use squid_n_core::ids::{ElemId, MaterialId, SectionId};
 use squid_n_core::model::{
     DamperSpec, ElementData, EndCondition, ForceRegime, LoadCase, LoadCaseKind, LoadCfg, LocalAxis,
-    Material, MemberLoad, MiscWall, MiscWallTransfer, NodalLoad, Node, RigidZone, Section,
-    WallAttr,
+    Material, MemberLoad, MiscWall, MiscWallTransfer, NodalLoad, Node, RigidZone, SecondaryMember,
+    SecondaryMemberKind, Section, WallAttr,
 };
 
 /// 2 層 × 1 スパンの平面ラーメン（各レベル 2 節点）。
@@ -125,7 +125,16 @@ fn test_generate_two_stories() {
     assert_eq!(gen.rep_nodes.len(), 2);
     assert_eq!(gen.generated_masters, vec![NodeId(6), NodeId(7)]);
     for rep in &gen.rep_nodes {
-        assert_eq!(rep.mass, None, "質量は Reducer 側の TᵀMT 縮約に委ねる");
+        // CorrectedLumped(既定): 柱梁の密度自重は解析の質量行列に部材密度質量として
+        // 計上されるため控除され、荷重ケース分（節点・部材荷重）のみが質点質量として残る。
+        let mass = rep
+            .mass
+            .expect("CorrectedLumped: 荷重ケース分の質点質量が設定される");
+        assert_eq!(mass[0], mass[1], "並進質量 Ux=Uy");
+        assert_eq!(mass[2], 0.0);
+        assert_eq!(mass[3], 0.0);
+        assert_eq!(mass[4], 0.0);
+        assert!(mass[0] > 0.0, "mass[0]={}", mass[0]);
         assert!(rep.restraint.is_fixed(squid_n_core::dof::Dof::Uz));
         assert!(rep.restraint.is_fixed(squid_n_core::dof::Dof::Rx));
         assert!(rep.restraint.is_fixed(squid_n_core::dof::Dof::Ry));
@@ -224,7 +233,29 @@ fn test_generate_weighted_centroid_matches_hand_calc() {
     assert!((rep.coord[0] - 3000.0).abs() < 1e-6, "Gx={}", rep.coord[0]);
     assert!((rep.coord[1] - 0.0).abs() < 1e-6, "Gy={}", rep.coord[1]);
     assert_eq!(rep.coord[2], 3000.0);
-    assert_eq!(rep.mass, None);
+    // 自重を持つ要素が無いモデルなので CorrectedLumped でも控除は発生せず、
+    // 節点荷重の全量がそのまま質点質量になる。
+    // mt = ΣiW/g = 400000/g、j = Σ(iW/g)·r² = (100000*3000² + 300000*1000²)/g
+    let mass = rep
+        .mass
+        .expect("CorrectedLumped: 自重が無いため全量が質点質量になる");
+    let expected_mt = 400000.0 / GRAVITY_MM_S2;
+    assert!(
+        (mass[0] - expected_mt).abs() < 1e-9 * expected_mt,
+        "mt={}",
+        mass[0]
+    );
+    assert_eq!(mass[0], mass[1]);
+    assert_eq!(mass[2], 0.0);
+    assert_eq!(mass[3], 0.0);
+    assert_eq!(mass[4], 0.0);
+    let expected_j =
+        (100000.0 * 3000.0_f64.powi(2) + 300000.0 * 1000.0_f64.powi(2)) / GRAVITY_MM_S2;
+    assert!(
+        (mass[5] - expected_j).abs() < 1e-9 * expected_j,
+        "j={}",
+        mass[5]
+    );
     assert_eq!(rep.story, Some(StoryId(0)));
     assert!(rep.restraint.is_fixed(Dof::Uz));
     assert!(rep.restraint.is_fixed(Dof::Rx));
@@ -264,6 +295,261 @@ fn test_generate_zero_weight_falls_back_to_geometric_centroid() {
     let rep = &gen.rep_nodes[0];
     // 幾何重心(単純平均) = (0 + 6000) / 2 = 3000
     assert!((rep.coord[0] - 3000.0).abs() < 1e-6, "Gx={}", rep.coord[0]);
+}
+
+// ------------------------------------------------------------------
+// §マスター節点の質点質量（MassMethod: CorrectedLumped / LumpedOnly）
+// ------------------------------------------------------------------
+
+/// 密度>0の柱2本（非対称断面配置ではなく非対称 DL 節点荷重）を持つ 1 層モデル。
+/// マスターの質点質量算定（CorrectedLumped の控除／LumpedOnly の全量）を検証する
+/// 共通土台。
+fn two_columns_with_dl_model() -> Model {
+    let mut model = Model::default();
+    let coords = [
+        [0.0, 0.0, 0.0],
+        [4000.0, 0.0, 0.0],
+        [0.0, 0.0, 3000.0],
+        [4000.0, 0.0, 3000.0],
+    ];
+    for (i, c) in coords.iter().enumerate() {
+        model.nodes.push(Node {
+            id: NodeId(i as u32),
+            coord: *c,
+            restraint: if i < 2 {
+                Dof6Mask::FIXED
+            } else {
+                Dof6Mask::FREE
+            },
+            mass: None,
+            story: None,
+        });
+    }
+    model.sections.push(Section {
+        id: SectionId(0),
+        name: "COL".into(),
+        area: 10000.0,
+        iy: 1.0e8,
+        iz: 1.0e8,
+        j: 1.0e8,
+        depth: 300.0,
+        width: 300.0,
+        as_y: 8000.0,
+        as_z: 8000.0,
+        panel_thickness: None,
+        thickness: None,
+        shape: None,
+    });
+    model.materials.push(Material {
+        concrete_class: Default::default(),
+        id: MaterialId(0),
+        name: "S".into(),
+        young: 205000.0,
+        poisson: 0.3,
+        density: 7.85e-9,
+        shear: None,
+        fc: None,
+        fy: None,
+    });
+    for (i, (a, b)) in [(0u32, 2u32), (1, 3)].into_iter().enumerate() {
+        model.elements.push(ElementData {
+            id: ElemId(i as u32),
+            kind: ElementKind::Beam,
+            nodes: [NodeId(a), NodeId(b)].into_iter().collect(),
+            section: Some(SectionId(0)),
+            material: Some(MaterialId(0)),
+            local_axis: LocalAxis {
+                ref_vector: [1.0, 0.0, 0.0],
+            },
+            end_cond: [EndCondition::Fixed, EndCondition::Fixed],
+            force_regime: ForceRegime::Auto,
+            rigid_zone: Default::default(),
+            plastic_zone: None,
+            spring: None,
+        });
+    }
+    model.load_cases.push(LoadCase {
+        kind: Default::default(),
+        id: LoadCaseId(0),
+        name: "DL".into(),
+        nodal: vec![
+            NodalLoad {
+                node: NodeId(2),
+                values: [0.0, 0.0, -100000.0, 0.0, 0.0, 0.0],
+            },
+            NodalLoad {
+                node: NodeId(3),
+                values: [0.0, 0.0, -300000.0, 0.0, 0.0, 0.0],
+            },
+        ],
+        member: vec![],
+    });
+    model
+}
+
+#[test]
+fn test_master_mass_corrected_lumped_deducts_density_self_weight() {
+    let model = two_columns_with_dl_model();
+    let gen =
+        generate_stories_with_opts(&model, &[LoadCaseId(0)], true, MassMethod::CorrectedLumped)
+            .unwrap();
+    assert_eq!(gen.rep_nodes.len(), 1);
+
+    // 柱の自重（1本あたり。両柱とも同一断面・材料・長さ）。柱は両端(基部+上端)へ
+    // 半分ずつ配分されるが、基部は階に含まれないため上端の質量にのみ効く。
+    let sw_per_column = 7.85e-9 * 10000.0 * 3000.0 * GRAVITY_MM_S2;
+    let sw_half = sw_per_column / 2.0;
+    let w2 = sw_half + 100000.0; // NodeId(2), x=0
+    let w3 = sw_half + 300000.0; // NodeId(3), x=4000
+    let gx = (w2 * 0.0 + w3 * 4000.0) / (w2 + w3);
+
+    let rep = &gen.rep_nodes[0];
+    assert!((rep.coord[0] - gx).abs() < 1e-6, "Gx={}", rep.coord[0]);
+
+    // CorrectedLumped: 柱の自重は解析の質量行列に部材密度質量として計上されるため
+    // 控除され、net_i は DL 節点荷重分のみが残る（sw_half が各節点でちょうど相殺する）。
+    let mass = rep
+        .mass
+        .expect("CorrectedLumped: DL節点荷重分の質点質量が設定される");
+    let expected_mt = 400000.0 / GRAVITY_MM_S2;
+    assert!(
+        (mass[0] - expected_mt).abs() < 1e-9 * expected_mt,
+        "mt={} expected={}",
+        mass[0],
+        expected_mt
+    );
+    assert_eq!(mass[0], mass[1], "並進質量 Ux=Uy");
+    assert_eq!(mass[2], 0.0);
+    assert_eq!(mass[3], 0.0);
+    assert_eq!(mass[4], 0.0);
+
+    let expected_j =
+        (100000.0 * (0.0 - gx).powi(2) + 300000.0 * (4000.0 - gx).powi(2)) / GRAVITY_MM_S2;
+    assert!(
+        (mass[5] - expected_j).abs() < 1e-9 * expected_j,
+        "j={} expected={}",
+        mass[5],
+        expected_j
+    );
+}
+
+#[test]
+fn test_master_mass_lumped_only_keeps_density_self_weight() {
+    let model = two_columns_with_dl_model();
+    let gen =
+        generate_stories_with_opts(&model, &[LoadCaseId(0)], true, MassMethod::LumpedOnly).unwrap();
+    assert_eq!(gen.rep_nodes.len(), 1);
+
+    let sw_per_column = 7.85e-9 * 10000.0 * 3000.0 * GRAVITY_MM_S2;
+    let sw_half = sw_per_column / 2.0;
+    let w2 = sw_half + 100000.0;
+    let w3 = sw_half + 300000.0;
+    let gx = (w2 * 0.0 + w3 * 4000.0) / (w2 + w3);
+
+    let rep = &gen.rep_nodes[0];
+    // LumpedOnly: 控除せず、柱の自重を含む地震用重量の全量が質点質量になる。
+    let mass = rep
+        .mass
+        .expect("LumpedOnly: 地震用重量の全量が質点質量になる");
+    let expected_mt = (w2 + w3) / GRAVITY_MM_S2;
+    assert!(
+        (mass[0] - expected_mt).abs() < 1e-9 * expected_mt,
+        "mt={} expected={}",
+        mass[0],
+        expected_mt
+    );
+    assert_eq!(mass[0], mass[1], "並進質量 Ux=Uy");
+
+    let expected_j = (w2 * (0.0 - gx).powi(2) + w3 * (4000.0 - gx).powi(2)) / GRAVITY_MM_S2;
+    assert!(
+        (mass[5] - expected_j).abs() < 1e-9 * expected_j,
+        "j={} expected={}",
+        mass[5],
+        expected_j
+    );
+}
+
+/// 二次部材（小梁）1 本のみを持つ 1 層モデル（主架構要素なし）。
+/// 二次部材の自重は解析の質量行列（部材密度質量）に算入されないことの確認用。
+fn secondary_joist_model() -> Model {
+    let mut model = Model::default();
+    model.nodes.push(Node {
+        id: NodeId(0),
+        coord: [0.0, 0.0, 0.0],
+        restraint: Dof6Mask::FIXED,
+        mass: None,
+        story: None,
+    });
+    model.nodes.push(Node {
+        id: NodeId(1),
+        coord: [0.0, 0.0, 3000.0],
+        restraint: Dof6Mask::FREE,
+        mass: None,
+        story: None,
+    });
+    model.nodes.push(Node {
+        id: NodeId(2),
+        coord: [2000.0, 0.0, 3000.0],
+        restraint: Dof6Mask::FREE,
+        mass: None,
+        story: None,
+    });
+    model.sections.push(Section {
+        id: SectionId(0),
+        name: "JOIST".into(),
+        area: 5000.0,
+        iy: 1.0e7,
+        iz: 1.0e7,
+        j: 1.0e7,
+        depth: 200.0,
+        width: 100.0,
+        as_y: 4000.0,
+        as_z: 4000.0,
+        panel_thickness: None,
+        thickness: None,
+        shape: None,
+    });
+    model.materials.push(Material {
+        concrete_class: Default::default(),
+        id: MaterialId(0),
+        name: "S".into(),
+        young: 205000.0,
+        poisson: 0.3,
+        density: 7.85e-9,
+        shear: None,
+        fc: None,
+        fy: None,
+    });
+    model.secondary_members.push(SecondaryMember {
+        kind: SecondaryMemberKind::Joist,
+        nodes: [NodeId(1), NodeId(2)],
+        section: Some(SectionId(0)),
+        material: Some(MaterialId(0)),
+        name: "G1".into(),
+    });
+    model
+}
+
+#[test]
+fn test_master_mass_corrected_lumped_does_not_deduct_secondary_member_self_weight() {
+    let model = secondary_joist_model();
+    let gen = generate_stories_with_opts(&model, &[], true, MassMethod::CorrectedLumped).unwrap();
+    assert_eq!(gen.rep_nodes.len(), 1);
+
+    // 二次部材（小梁）の自重は主架構要素ではなく解析の質量行列（部材密度質量）に
+    // 算入されないため、CorrectedLumped でも控除されずそのまま残る。
+    let sw = 7.85e-9 * 5000.0 * 2000.0 * GRAVITY_MM_S2;
+    let rep = &gen.rep_nodes[0];
+    let mass = rep
+        .mass
+        .expect("二次部材の自重は控除されずそのまま質点質量になる");
+    let expected_mt = sw / GRAVITY_MM_S2;
+    assert!(
+        (mass[0] - expected_mt).abs() < 1e-9 * expected_mt,
+        "mt={} expected={}",
+        mass[0],
+        expected_mt
+    );
 }
 
 /// 基部(z=0, 固定)と上端(z=`len`, 自由)を結ぶ 1 部材の最小モデル。
@@ -847,7 +1133,8 @@ fn test_generate_stories_with_opts_self_weight_via_case_matches_density() {
         nodal,
         member,
     });
-    let by_case = generate_stories_with_opts(&model, &[LoadCaseId(0)], false).unwrap();
+    let by_case =
+        generate_stories_with_opts(&model, &[LoadCaseId(0)], false, MassMethod::default()).unwrap();
 
     assert_eq!(by_density.stories.len(), by_case.stories.len());
     for (a, b) in by_density.stories.iter().zip(by_case.stories.iter()) {
@@ -863,7 +1150,8 @@ fn test_generate_stories_with_opts_self_weight_via_case_matches_density() {
 
     // include_density_self_weight = true のままケースも渡すと二重計上になる
     // （ガード側の except 選択が必要な旧構成の確認）。
-    let doubled = generate_stories_with_opts(&model, &[LoadCaseId(0)], true).unwrap();
+    let doubled =
+        generate_stories_with_opts(&model, &[LoadCaseId(0)], true, MassMethod::default()).unwrap();
     let w1 = by_density.stories[0].seismic_weight.unwrap();
     assert!(
         (doubled.stories[0].seismic_weight.unwrap() - 2.0 * w1).abs() < 1e-6 * w1,

@@ -1131,10 +1131,12 @@ impl App {
         self.sync_gravity_load_cases_action();
         let gravity_lcs = gravity_cases_for_seismic_weight(&self.model);
         let include_density = density_self_weight_for_stories(&self.model);
+        let mass_method = self.analysis_cfg.mass_method;
         match squid_n_load::story_gen::generate_stories_with_opts(
             &self.model,
             &gravity_lcs,
             include_density,
+            mass_method,
         ) {
             Ok(gen) => {
                 self.undo.run(
@@ -1145,6 +1147,7 @@ impl App {
                         constraints: gen.constraints,
                         rep_nodes: gen.rep_nodes,
                         generated_masters: gen.generated_masters,
+                        mass_method,
                     }),
                 );
                 self.staleness.mark_edited();

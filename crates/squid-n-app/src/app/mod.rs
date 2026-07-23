@@ -356,6 +356,10 @@ pub struct AnalysisSettings {
     pub parapet_mm: f64,
     /// 解析の並列スレッド数（0=自動(全コア)、1=単一スレッド(結果の完全再現性を保証)、n=固定）。
     pub threads: usize,
+    /// 動的解析（固有値・時刻歴・精算周期）の質量モデルの方式
+    /// （[`squid_n_core::model::MassMethod`]）。階の自動生成の実行時にモデルへ
+    /// 反映される（`generate_stories_action`）。
+    pub mass_method: squid_n_core::model::MassMethod,
 }
 
 /// 時刻歴の入力方向選択（UI 用）。X・Y に加え、同一波形を両方向へ同時入力する
@@ -433,6 +437,7 @@ impl Default for AnalysisSettings {
             roughness: squid_n_load::wind::TerrainRoughness::III,
             parapet_mm: 0.0,
             threads: 0,
+            mass_method: squid_n_core::model::MassMethod::default(),
         }
     }
 }
