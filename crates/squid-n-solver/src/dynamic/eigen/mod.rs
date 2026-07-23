@@ -14,7 +14,15 @@ const MASS_RANK_REL_TOL: f64 = 1e-9;
 pub struct ModalResult {
     pub omega2: Vec<f64>,
     pub period: Vec<f64>,
+    /// モード形状（縮約後の独立自由度座標、長さ = `Reducer::n_indep`）。
+    /// 時刻歴のモード減衰（`crate::damping::Damping::modal`）など、縮約空間で
+    /// 計算する消費者向け。節点単位の形状が必要な場合は [`Self::node_shapes`] を使う。
     pub shapes: Vec<Vec<f64>>,
+    /// モード形状を節点×6成分（UX,UY,UZ,RX,RY,RZ）へ展開したもの
+    /// （`shapes` を `Reducer::expand_u` → `DofMap` 散布した結果）。
+    /// 可視化・レポートなど節点単位の消費者向け。剛床のスレーブ自由度にも
+    /// マスターと整合した値が入る。
+    pub node_shapes: Vec<Vec<[f64; 6]>>,
     pub participation: Vec<[f64; 3]>,
     pub effective_mass: Vec<[f64; 3]>,
 }
@@ -31,6 +39,7 @@ pub fn solve_eigen(
             omega2: vec![],
             period: vec![],
             shapes: vec![],
+            node_shapes: vec![],
             participation: vec![],
             effective_mass: vec![],
         });
@@ -73,6 +82,7 @@ pub fn solve_eigen_with_solver(
             omega2: vec![],
             period: vec![],
             shapes: vec![],
+            node_shapes: vec![],
             participation: vec![],
             effective_mass: vec![],
         });
@@ -216,13 +226,42 @@ node.mass や材料の密度(ρ)で並進質量を追加するか、要求モー
     let (participation, effective_mass) =
         compute_participation(&shapes, &m_free, &m_red, reducer, dofmap, model);
 
+    let node_shapes = shapes
+        .iter()
+        .map(|phi_red| expand_node_shape(phi_red, reducer, dofmap, model.nodes.len()))
+        .collect();
+
     Ok(ModalResult {
         omega2,
         period,
         shapes,
+        node_shapes,
         participation,
         effective_mass,
     })
+}
+
+/// 縮約座標のモード形状を節点×6成分へ展開する
+/// （縮約独立自由度 → `Reducer::expand_u` → DofMap active順 → 節点×6散布）。
+/// 静的解析の変位展開（`crate::analysis::Analysis` の `expand_disp`）と同じ経路で、
+/// 剛床のスレーブ自由度にはマスターに従属した値が入る。fixed・非構造自由度は 0。
+fn expand_node_shape(
+    phi_red: &[f64],
+    reducer: &Reducer,
+    dofmap: &DofMap,
+    n_nodes: usize,
+) -> Vec<[f64; 6]> {
+    let phi_free = reducer.expand_u(phi_red);
+    let mut disp = vec![[0.0; 6]; n_nodes];
+    for (ni, d6) in disp.iter_mut().enumerate() {
+        for (d, slot) in d6.iter_mut().enumerate() {
+            let g = ni * squid_n_core::dof::DOF_PER_NODE + d;
+            if let Some(active) = dofmap.active(g) {
+                *slot = phi_free[active as usize];
+            }
+        }
+    }
+    disp
 }
 
 /// 部分空間反復の開始ベクトルを Bathe の定石に従って選ぶ。
@@ -335,8 +374,42 @@ fn m_norm(phi: &[f64], m_red: &faer::sparse::SparseColMat<usize, f64>) -> f64 {
 /// 呼び出し側で「要求モード数に対して質量ランクが不足している」ことを検出できる
 /// ようにする。
 ///
+/// 質量ランクの判定は、M̄ をそのまま固有分解すると失敗する。並進質量（t）と
+/// 回転慣性（t·mm²、並進の 10^6〜10^8 倍のスケール）が混在するモデルでは、
+/// M̄ の固有値の大小が「質量の有無」ではなく単位系・基底ベクトルのスケールを
+/// 反映してしまい、物理的に有意な並進方向が相対許容誤差
+/// （[`MASS_RANK_REL_TOL`]×最大固有値）未満に落ちて「質量なし」と誤判定される
+/// （剛床モデルで質量ランクが過少検出され、解けるはずの要求モード数で
+/// InvalidInput になる）。そこで K̄ の対角で両行列を対称スケーリングする:
+/// S = diag(1/√k̄ᵢᵢ) とし K̃ = S·K̄·S（単位対角）、M̃ = S·M̄·S。合同変換なので
+/// 一般化固有値 θ は不変で、固有ベクトルは z = S·z̃ で戻る。M̃ の固有値は
+/// 各方向の「柔性あたりの質量」（≈1/θ）というスケール不変量になり、
+/// 相対許容誤差での質量ランク判定が単位系・基底スケールに依存しなくなる。
+///
 /// Returns (eigenvalues ascending, +∞ が質量ゼロ方向; eigenvectors as columns).
-fn gevd_jacobi(k: &[f64], m: &[f64], n: usize) -> (Vec<f64>, Vec<f64>) {
+fn gevd_jacobi(k_in: &[f64], m_in: &[f64], n: usize) -> (Vec<f64>, Vec<f64>) {
+    // K̄ の対角によるスケーリング係数。K̄ は正定値（縮約後剛性の射影）のため
+    // 対角は正のはずだが、数値的な退化に備え非正・非有限なら 1 とする。
+    let s: Vec<f64> = (0..n)
+        .map(|i| {
+            let d = k_in[i * n + i];
+            if d.is_finite() && d > 0.0 {
+                1.0 / d.sqrt()
+            } else {
+                1.0
+            }
+        })
+        .collect();
+    let mut k = vec![0.0; n * n];
+    let mut m = vec![0.0; n * n];
+    for i in 0..n {
+        for j in 0..n {
+            k[i * n + j] = s[i] * k_in[i * n + j] * s[j];
+            m[i * n + j] = s[i] * m_in[i * n + j] * s[j];
+        }
+    }
+    let (k, m) = (&k[..], &m[..]);
+
     let (mu, u) = jacobi_evd(m, n);
     let mu_max = mu.iter().cloned().fold(0.0_f64, f64::max);
 
@@ -384,13 +457,35 @@ fn gevd_jacobi(k: &[f64], m: &[f64], n: usize) -> (Vec<f64>, Vec<f64>) {
         }
     }
 
-    // 質量ゼロ方向は θ=+∞。固有ベクトルは M̄ の（質量的に意味を持たない）
+    // 質量ゼロ方向は θ=+∞。固有ベクトルは M̃ の（質量的に意味を持たない）
     // 対応する固有ベクトルをそのまま使う（直交性は保たれ、次の反復の
     // K^-1 変換に使っても数値的に安全）。
     for (offset, &di) in dropped.iter().enumerate() {
         let col = r + offset;
         for row in 0..n {
             vecs[row * n + col] = u[row * n + di];
+        }
+    }
+
+    // スケーリングを逆変換（z = S·z̃）して元の基底の固有ベクトルへ戻す。
+    // 質量を持つ列（col < r）は W の構成により逆変換後も M̄ 正規直交
+    // （zᵀM̄z = z̃ᵀM̃z̃ = 1）でスケールが定まるが、質量ゼロ方向（col ≥ r）は
+    // M̄ ノルムが定義できず S の逆変換でスケールが不揃いになる。放置すると
+    // 次反復の部分空間基底が数値的に退化して収束しなくなるため、
+    // 単位ノルムへ正規化して有界性を保つ（固有ベクトルの定数倍は反復の
+    // 張る空間・収束判定 θ のいずれにも影響しない）。
+    for row in 0..n {
+        for col in 0..n {
+            vecs[row * n + col] *= s[row];
+        }
+    }
+    for col in r..n {
+        let norm2: f64 = (0..n).map(|row| vecs[row * n + col].powi(2)).sum();
+        if norm2 > 0.0 {
+            let inv = 1.0 / norm2.sqrt();
+            for row in 0..n {
+                vecs[row * n + col] *= inv;
+            }
         }
     }
 

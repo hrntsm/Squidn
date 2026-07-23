@@ -674,25 +674,14 @@ pub fn viewer_panel(ui: &mut egui::Ui, app: &mut App) {
         ViewMode::N | ViewMode::Q | ViewMode::M if app.overlay_deform => {
             app.current_static().map(|s| s.disp.clone())
         }
+        // `ModalResult::shapes` は剛床等の縮約後独立自由度座標のため直接は使えない。
+        // ソルバが節点×6へ展開済みの `node_shapes` を用いる。
         ViewMode::Mode => app
             .results
             .as_ref()
             .and_then(|r| r.modal.as_ref())
-            .and_then(|m| m.shapes.get(mode_idx))
-            .map(|shape| {
-                // shape は自由度順の平坦ベクトル → [node][6] に分解
-                let n = app.model.nodes.len();
-                let mut disp = vec![[0.0; 6]; n];
-                for (ni, row) in disp.iter_mut().enumerate() {
-                    for (d, slot) in row.iter_mut().enumerate().take(6) {
-                        let g = ni * 6 + d;
-                        if g < shape.len() {
-                            *slot = shape[g];
-                        }
-                    }
-                }
-                disp
-            }),
+            .and_then(|m| m.node_shapes.get(mode_idx))
+            .cloned(),
         _ => None,
     };
 

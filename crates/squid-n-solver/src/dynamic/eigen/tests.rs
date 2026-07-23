@@ -1,9 +1,10 @@
 use super::*;
 use crate::constraint::Reducer;
-use squid_n_core::dof::{Dof6Mask, DofMap};
-use squid_n_core::ids::{ElemId, MaterialId, NodeId, SectionId};
+use squid_n_core::dof::{Dof, Dof6Mask, DofMap};
+use squid_n_core::ids::{ElemId, MaterialId, NodeId, SectionId, StoryId};
 use squid_n_core::model::{
-    ElementData, ElementKind, EndCondition, ForceRegime, LocalAxis, Material, Model, Node, Section,
+    Constraint, ElementData, ElementKind, EndCondition, ForceRegime, LocalAxis, Material, Model,
+    Node, Section,
 };
 
 /// Ux のみ自由（並進1方向）にするマスク。
@@ -578,5 +579,361 @@ fn test_eigen_deterministic() {
                 assert_eq!(va.to_bits(), vb.to_bits());
             }
         }
+    }
+}
+
+/// 柱2本(柱脚とも同一節点で固定)＋剛床モデル。柱頭2節点(スレーブ)を
+/// 浮遊マスター節点(Uz/Rx/Ry固定)へ RigidDiaphragm で従属させ、マスターには
+/// 並進(Ux,Uy)と回転(Rz)の集中質量を与える（質量ランクはちょうど3＝Ux,Uy,Rz）。
+/// `node_shapes` が縮約座標からの展開後も剛床の面内剛体変位の運動学
+/// （ix = mx − θz·dy, iy = my + θz・dx）を満たすことを検証するためのモデル
+/// （`constraint.rs` の `test_rigid_diaphragm_master_recovers_translation_and_torsion`
+/// と同じ式）。
+///
+/// 本テストは `node_shapes` の展開処理そのものの正しさを検証することが目的の
+/// ため、最小構成（縮約後独立自由度9・柱2本）を用いる。並進質量と回転慣性の
+/// スケール差による質量ランク過少検出（かつて柱4本構成で顕在化していた）の
+/// 回帰は `test_eigen_mass_rank_translation_rotation_scale_mix`（柱4本・
+/// `make_four_column_diaphragm_model`）が担う。
+fn make_diaphragm_columns_model(top_mass: f64, rot_mass: f64) -> Model {
+    let col_section = Section {
+        id: SectionId(0),
+        name: "col".into(),
+        area: 11980.0,
+        iy: 2.04e8,
+        iz: 6.75e7,
+        j: 3.54e6,
+        depth: 300.0,
+        width: 300.0,
+        as_y: 6000.0,
+        as_z: 6000.0,
+        panel_thickness: None,
+        thickness: None,
+        shape: None,
+    };
+    let mut master_restraint = Dof6Mask::FREE;
+    master_restraint.set_fixed(Dof::Uz);
+    master_restraint.set_fixed(Dof::Rx);
+    master_restraint.set_fixed(Dof::Ry);
+
+    Model {
+        nodes: vec![
+            Node {
+                id: NodeId(0),
+                coord: [0.0, 0.0, 0.0],
+                restraint: Dof6Mask::FIXED,
+                mass: None,
+                story: None,
+            },
+            // 柱頭(スレーブ1): X方向にオフセット
+            Node {
+                id: NodeId(1),
+                coord: [0.0, 0.0, 3500.0],
+                restraint: Dof6Mask::FREE,
+                mass: None,
+                story: None,
+            },
+            // マスター(剛床代表節点): 面内(Ux,Uy,Rz)のみ自由
+            Node {
+                id: NodeId(2),
+                coord: [1000.0, 0.0, 3500.0],
+                restraint: master_restraint,
+                mass: Some([top_mass, top_mass, 0.0, 0.0, 0.0, rot_mass]),
+                story: None,
+            },
+            // 柱頭(スレーブ2): Y方向にオフセット（マスターから見て非対称な配置）
+            Node {
+                id: NodeId(3),
+                coord: [0.0, 1000.0, 3500.0],
+                restraint: Dof6Mask::FREE,
+                mass: None,
+                story: None,
+            },
+        ],
+        elements: vec![
+            ElementData {
+                id: ElemId(0),
+                kind: ElementKind::Beam,
+                nodes: smallvec::smallvec![NodeId(0), NodeId(1)],
+                section: Some(SectionId(0)),
+                material: Some(MaterialId(0)),
+                local_axis: LocalAxis {
+                    ref_vector: [1.0, 0.0, 0.0],
+                },
+                end_cond: [EndCondition::Fixed, EndCondition::Fixed],
+                force_regime: ForceRegime::Auto,
+                rigid_zone: Default::default(),
+                plastic_zone: None,
+                spring: None,
+            },
+            ElementData {
+                id: ElemId(1),
+                kind: ElementKind::Beam,
+                nodes: smallvec::smallvec![NodeId(0), NodeId(3)],
+                section: Some(SectionId(0)),
+                material: Some(MaterialId(0)),
+                local_axis: LocalAxis {
+                    ref_vector: [1.0, 0.0, 0.0],
+                },
+                end_cond: [EndCondition::Fixed, EndCondition::Fixed],
+                force_regime: ForceRegime::Auto,
+                rigid_zone: Default::default(),
+                plastic_zone: None,
+                spring: None,
+            },
+        ],
+        sections: vec![col_section],
+        materials: vec![Material {
+            concrete_class: Default::default(),
+            id: MaterialId(0),
+            name: "SN400B".into(),
+            young: 205000.0,
+            poisson: 0.3,
+            density: 0.0, // 質量はマスター節点の集中質量のみ
+            shear: None,
+            fc: None,
+            fy: Some(235.0),
+        }],
+        constraints: vec![Constraint::RigidDiaphragm {
+            story: StoryId(0),
+            master: NodeId(2),
+            slaves: vec![NodeId(1), NodeId(3)],
+        }],
+        ..Default::default()
+    }
+}
+
+/// 回帰テスト: `ModalResult::node_shapes`（`shapes` を節点×6成分へ展開したもの）
+/// が、剛床(RigidDiaphragm)のスレーブ節点でも剛体変位の運動学
+/// ix = mx − θz·(y_s−y_m), iy = my + θz·(x_s−x_m) を満たすこと、
+/// 固定節点の成分が0であること、モード数・節点数が `shapes` と整合することを確認する。
+#[test]
+fn test_eigen_node_shapes_rigid_diaphragm_kinematics() {
+    let top_mass = 1.0e-3;
+    let rot_mass = 5.0e4;
+    let model = make_diaphragm_columns_model(top_mass, rot_mass);
+    let dofmap = DofMap::build(&model);
+    let reducer = Reducer::build(&model, &dofmap);
+    let n_modes = 3;
+    let result = solve_eigen(&model, &dofmap, &reducer, n_modes)
+        .expect("質量ランク(Ux,Uy,Rz=3)ちょうどの要求モード数(3)は解けるべき");
+
+    // (a) モード数・節点数の整合
+    assert_eq!(
+        result.node_shapes.len(),
+        result.shapes.len(),
+        "node_shapes のモード数が shapes と不一致"
+    );
+    assert_eq!(result.node_shapes.len(), n_modes);
+    for ns in &result.node_shapes {
+        assert_eq!(ns.len(), model.nodes.len(), "node_shapes の節点数が不一致");
+    }
+
+    let master = 2usize;
+    let master_coord = model.nodes[master].coord;
+    let slaves = [1usize, 3];
+
+    // (c) 全モードで水平成分が自明にゼロにならないことの確認用
+    let mut max_horizontal: f64 = 0.0;
+    // 回転成分についても同様に確認する（θz が全モードでゼロなら、
+    // 剛床の回転項(θz·dx, θz·dy)を実質的に検証していないことになるため）。
+    let mut max_rotation: f64 = 0.0;
+
+    for ns in &result.node_shapes {
+        let ux_m = ns[master][0];
+        let uy_m = ns[master][1];
+        let theta_z = ns[master][5];
+        max_horizontal = max_horizontal.max(ux_m.abs()).max(uy_m.abs());
+        max_rotation = max_rotation.max(theta_z.abs());
+
+        // (b) 剛床スレーブの水平成分が剛体条件と整合すること。
+        // 許容誤差は「相対1e-9」を基本としつつ、期待値がモード内の代表的な
+        // 変位スケールに対してほぼ0になる場合でも誤って厳しくなりすぎない
+        // よう、モード内の最大変位スケールに対する絶対誤差1e-9も許容する
+        // （相対誤差1e-9 と 絶対誤差1e-9・(モード内最大スケール) の緩い方）。
+        let mode_scale = ux_m
+            .abs()
+            .max(uy_m.abs())
+            .max((theta_z * 1000.0_f64).abs())
+            .max(1.0);
+        for &s in &slaves {
+            let dx = model.nodes[s].coord[0] - master_coord[0];
+            let dy = model.nodes[s].coord[1] - master_coord[1];
+            let expected_ux = ux_m - theta_z * dy;
+            let expected_uy = uy_m + theta_z * dx;
+
+            let tol_ux = 1e-9 * expected_ux.abs().max(mode_scale);
+            let tol_uy = 1e-9 * expected_uy.abs().max(mode_scale);
+            assert!(
+                (ns[s][0] - expected_ux).abs() < tol_ux,
+                "slave{} ux: got={} want={}",
+                s,
+                ns[s][0],
+                expected_ux
+            );
+            assert!(
+                (ns[s][1] - expected_uy).abs() < tol_uy,
+                "slave{} uy: got={} want={}",
+                s,
+                ns[s][1],
+                expected_uy
+            );
+        }
+
+        // (d) 固定(柱脚)節点は全成分0
+        for (comp, &v) in ns[0].iter().enumerate() {
+            assert_eq!(v, 0.0, "固定節点0 成分{} は0であるべき: {}", comp, v);
+        }
+    }
+
+    assert!(
+        max_horizontal > 1e-6,
+        "全モードで水平成分がほぼ0（自明に成立するだけの検証になっている）: max={}",
+        max_horizontal
+    );
+    assert!(
+        max_rotation > 1e-9,
+        "全モードで回転成分θzがほぼ0（剛床の回転項を実質検証できていない）: max={}",
+        max_rotation
+    );
+}
+
+/// 柱4本（正方形配置・柱脚固定）＋剛床の1層モデル。柱頭4節点をスレーブとし、
+/// 床重心の浮遊マスター節点（Uz/Rx/Ry固定）に並進(Ux,Uy)と回転(Rz)の集中質量を
+/// 与える（質量ランクはちょうど3＝Ux,Uy,Rz）。剛床付き建物の最も標準的な
+/// モデル化（各階を水平2並進＋回転1の質点で代表させる）に対応する。
+fn make_four_column_diaphragm_model(top_mass: f64, rot_mass: f64) -> Model {
+    let col_section = Section {
+        id: SectionId(0),
+        name: "col".into(),
+        area: 11980.0,
+        iy: 2.04e8,
+        iz: 6.75e7,
+        j: 3.54e6,
+        depth: 300.0,
+        width: 300.0,
+        as_y: 6000.0,
+        as_z: 6000.0,
+        panel_thickness: None,
+        thickness: None,
+        shape: None,
+    };
+    let mut master_restraint = Dof6Mask::FREE;
+    master_restraint.set_fixed(Dof::Uz);
+    master_restraint.set_fixed(Dof::Rx);
+    master_restraint.set_fixed(Dof::Ry);
+
+    let bases = [[0.0, 0.0], [6000.0, 0.0], [0.0, 6000.0], [6000.0, 6000.0]];
+    let mut nodes = Vec::new();
+    let mut elements = Vec::new();
+    let mut slaves = Vec::new();
+    for (i, [x, y]) in bases.iter().enumerate() {
+        let base_id = NodeId((i * 2) as u32);
+        let top_id = NodeId((i * 2 + 1) as u32);
+        nodes.push(Node {
+            id: base_id,
+            coord: [*x, *y, 0.0],
+            restraint: Dof6Mask::FIXED,
+            mass: None,
+            story: None,
+        });
+        nodes.push(Node {
+            id: top_id,
+            coord: [*x, *y, 3500.0],
+            restraint: Dof6Mask::FREE,
+            mass: None,
+            story: None,
+        });
+        elements.push(ElementData {
+            id: ElemId(i as u32),
+            kind: ElementKind::Beam,
+            nodes: smallvec::smallvec![base_id, top_id],
+            section: Some(SectionId(0)),
+            material: Some(MaterialId(0)),
+            local_axis: LocalAxis {
+                ref_vector: [1.0, 0.0, 0.0],
+            },
+            end_cond: [EndCondition::Fixed, EndCondition::Fixed],
+            force_regime: ForceRegime::Auto,
+            rigid_zone: Default::default(),
+            plastic_zone: None,
+            spring: None,
+        });
+        slaves.push(top_id);
+    }
+    let master_id = NodeId(8);
+    nodes.push(Node {
+        id: master_id,
+        coord: [3000.0, 3000.0, 3500.0],
+        restraint: master_restraint,
+        mass: Some([top_mass, top_mass, 0.0, 0.0, 0.0, rot_mass]),
+        story: None,
+    });
+
+    Model {
+        nodes,
+        elements,
+        sections: vec![col_section],
+        materials: vec![Material {
+            concrete_class: Default::default(),
+            id: MaterialId(0),
+            name: "SN400B".into(),
+            young: 205000.0,
+            poisson: 0.3,
+            density: 0.0, // 質量はマスター節点の集中質量のみ
+            shear: None,
+            fc: None,
+            fy: Some(235.0),
+        }],
+        constraints: vec![Constraint::RigidDiaphragm {
+            story: StoryId(0),
+            master: master_id,
+            slaves,
+        }],
+        ..Default::default()
+    }
+}
+
+/// 回帰テスト: 並進質量(t オーダー)と回転慣性(t·mm² オーダー、単位系due to
+/// 並進の 10^6〜10^8 倍のスケール)が混在する剛床モデルで、質量ランク判定が
+/// スケール差により過少検出されないこと。
+///
+/// 従来の実装は射影質量行列 M̄ の固有値を「最大固有値との相対値」で
+/// 切り捨てていたため、回転慣性の固有値が支配的になると並進方向の質量が
+/// 「質量なし」と誤判定され、真の質量ランク(3)未満しか見つからず
+/// InvalidInput エラーになっていた（剛床で縮約後の独立自由度が多い＝
+/// 部分空間に質量ゼロ方向が多く混ざるほど顕在化する）。
+#[test]
+fn test_eigen_mass_rank_translation_rotation_scale_mix() {
+    let top_mass = 1.0e-3;
+    let rot_mass = 5.0e4;
+    let model = make_four_column_diaphragm_model(top_mass, rot_mass);
+    let dofmap = DofMap::build(&model);
+    let reducer = Reducer::build(&model, &dofmap);
+    let result = solve_eigen(&model, &dofmap, &reducer, 3)
+        .expect("質量ランク3（マスターのUx,Uy,Rz）に対し3モードの要求は解けるべき");
+
+    assert_eq!(result.period.len(), 3);
+    for (i, &t) in result.period.iter().enumerate() {
+        assert!(
+            t.is_finite() && t > 0.0,
+            "モード{}の周期が正の有限値でない: {}",
+            i + 1,
+            t
+        );
+    }
+
+    // 正方形対称配置なので X/Y 並進は同一周期の縮退モード、回転(Rz)モードが
+    // 別周期で現れる。有効質量は X・Y 各方向とも全質量（top_mass）が
+    // 並進モードに現れるはず（合計で相対誤差1e-6以内）。
+    for dir in 0..2 {
+        let sum: f64 = result.effective_mass.iter().map(|em| em[dir]).sum();
+        assert!(
+            (sum - top_mass).abs() < 1e-6 * top_mass,
+            "方向{}の有効質量合計 {} が全質量 {} と不一致",
+            dir,
+            sum,
+            top_mass
+        );
     }
 }
