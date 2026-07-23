@@ -4,6 +4,7 @@ use crate::theme;
 mod viewcube;
 use squid_n_core::dof::{Dof, Dof6Mask};
 
+mod check_ratio;
 mod diagram;
 mod solid;
 
@@ -60,6 +61,8 @@ pub enum ViewMode {
     M,
     /// CMQ 図（両端固定端モーメント C とせん断 Q）
     Cmq,
+    /// 検定比図（部材検定の最大検定比で着色）
+    CheckRatio,
 }
 
 /// CMQ 図で表示する成分（C: 固定端モーメント／M: 単純梁中央モーメント／Q: せん断）。
@@ -437,6 +440,7 @@ pub fn viewer_panel(ui: &mut egui::Ui, app: &mut App) {
         ui.selectable_value(&mut mode, ViewMode::Q, "Q図");
         ui.selectable_value(&mut mode, ViewMode::M, "M図");
         ui.selectable_value(&mut mode, ViewMode::Cmq, "CMQ図");
+        ui.selectable_value(&mut mode, ViewMode::CheckRatio, "検定比");
         ui.separator();
         // 断面表示: 部材を断面形状の押し出しソリッドで立体表示（全モードと併用可）
         ui.toggle_value(&mut app.show_sections, "断面表示");
@@ -968,6 +972,9 @@ pub fn viewer_panel(ui: &mut egui::Ui, app: &mut App) {
     }
     if mode == ViewMode::Cmq {
         draw_cmq_diagram(&painter, app, &coords3, center3, &cam, scale, center);
+    }
+    if mode == ViewMode::CheckRatio {
+        check_ratio::draw_check_ratio(&painter, app, &pts);
     }
 
     // 変形の実効倍率（バウンディングボックスから自動計算）の注記。
