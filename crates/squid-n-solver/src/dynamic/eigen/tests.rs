@@ -63,6 +63,7 @@ fn make_1dof_spring_model() -> Model {
             shape: None,
         }],
         materials: vec![Material {
+            strength_factor: None,
             concrete_class: Default::default(),
             id: MaterialId(0),
             name: "mat".into(),
@@ -129,6 +130,7 @@ fn make_shear_2dof_model() -> Model {
             shape: None,
         }],
         materials: vec![Material {
+            strength_factor: None,
             concrete_class: Default::default(),
             id: MaterialId(0),
             name: "mat".into(),
@@ -233,6 +235,7 @@ fn make_portal_frame_like_model(top_mass: f64) -> Model {
         elements,
         sections: vec![col_section, beam_section],
         materials: vec![Material {
+            strength_factor: None,
             concrete_class: Default::default(),
             id: MaterialId(0),
             name: "SN400B".into(),
@@ -511,6 +514,7 @@ fn make_portal_frame_density_mass_model() -> Model {
         elements,
         sections: vec![col_section, beam_section],
         materials: vec![Material {
+            strength_factor: None,
             concrete_class: Default::default(),
             id: MaterialId(0),
             name: "SN400B".into(),

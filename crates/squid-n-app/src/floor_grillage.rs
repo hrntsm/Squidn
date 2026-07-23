@@ -347,6 +347,7 @@ pub fn build_slab_grillage(model: &Model, slab: &Slab, w: f64) -> Option<SlabGri
         .collect();
 
     let materials = vec![Material {
+        strength_factor: None,
         concrete_class: Default::default(),
         id: MaterialId(0),
         name: "小梁鋼材(既定)".into(),
@@ -615,6 +616,7 @@ mod tests {
     }
     fn steel(id: u32) -> Material {
         Material {
+            strength_factor: None,
             concrete_class: Default::default(),
             id: MaterialId(id),
             name: "SN400".into(),

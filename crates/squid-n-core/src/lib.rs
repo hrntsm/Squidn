@@ -1,6 +1,7 @@
 pub mod dof;
 pub mod error;
 pub mod ids;
+pub mod material_grade;
 pub mod model;
 pub mod rc_capacity;
 pub mod section_shape;

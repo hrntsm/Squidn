@@ -127,6 +127,7 @@ fn test_shear_modulus_explicit() {
     let mat = Material {
         concrete_class: Default::default(),
         id: MaterialId(0),
+        strength_factor: None,
         name: "Test".to_string(),
         young: 205000.0,
         poisson: 0.3,
@@ -143,6 +144,7 @@ fn test_shear_modulus_derived() {
     let mat = Material {
         concrete_class: Default::default(),
         id: MaterialId(0),
+        strength_factor: None,
         name: "Test".to_string(),
         young: 205000.0,
         poisson: 0.3,

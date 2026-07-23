@@ -17,7 +17,7 @@ use smallvec::SmallVec;
 use squid_n_core::dof::{DofMap, DOF_PER_NODE};
 use squid_n_core::model::Model;
 use squid_n_element::behavior::{Ctx, LocalVec, MassOption};
-use squid_n_element::factory::build_nonlinear_behavior;
+use squid_n_element::factory::{build_nonlinear_behavior, StrengthBasis};
 use squid_n_math::solver::{make_solver, SolveError, SolverBackend};
 use squid_n_math::sparse::{sparse_matvec, weighted_sum_csc};
 
@@ -446,7 +446,8 @@ pub fn nonlinear_time_history_analysis(
 fn build_behaviors(model: &Model) -> Vec<Box<dyn squid_n_element::behavior::ElementBehavior>> {
     let mut behaviors = Vec::new();
     for elem in &model.elements {
-        let (mut b, _) = build_nonlinear_behavior(elem, model);
+        // 時刻歴応答解析は公称値（材料強度割増なし）。
+        let (mut b, _) = build_nonlinear_behavior(elem, model, StrengthBasis::Nominal);
         // 動的解析: コンクリート履歴は原点指向型（各履歴則の原典）。
         b.set_concrete_hysteresis(true);
         behaviors.push(b);

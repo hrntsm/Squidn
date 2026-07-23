@@ -12,12 +12,14 @@ pub struct AddMaterial {
     pub density: f64,
     pub fc: Option<f64>,
     pub fy: Option<f64>,
+    pub strength_factor: Option<f64>,
 }
 
 impl EditCommand for AddMaterial {
     fn apply(&self, model: &mut Model) -> Box<dyn EditCommand> {
         let new_id = MaterialId(model.materials.len() as u32);
         model.materials.push(squid_n_core::model::Material {
+            strength_factor: self.strength_factor,
             concrete_class: Default::default(),
             id: new_id,
             name: self.name.clone(),
@@ -116,9 +118,10 @@ pub enum MaterialField {
     Density,
     Fc,
     Fy,
+    StrengthFactor,
 }
 
-/// 材料プロパティ変更（E・ポアソン比・密度・Fc・Fy）。
+/// 材料プロパティ変更（E・ポアソン比・密度・Fc・Fy・保有耐力計算用強度割増係数）。
 pub struct SetMaterialField {
     pub id: MaterialId,
     pub field: MaterialField,
@@ -150,6 +153,9 @@ impl EditCommand for SetMaterialField {
             }
             MaterialField::Fc => std::mem::replace(&mut mat.fc, self.value),
             MaterialField::Fy => std::mem::replace(&mut mat.fy, self.value),
+            MaterialField::StrengthFactor => {
+                std::mem::replace(&mut mat.strength_factor, self.value)
+            }
         };
         Box::new(SetMaterialField {
             id: self.id,

@@ -4,6 +4,7 @@ use squid_n_core::units::ConcreteClass;
 
 fn make_material(fc: f64, grade: &str) -> Material {
     Material {
+        strength_factor: None,
         concrete_class: Default::default(),
         id: MaterialId(0),
         name: grade.to_string(),
@@ -18,6 +19,7 @@ fn make_material(fc: f64, grade: &str) -> Material {
 
 fn make_material_no_fc(grade: &str) -> Material {
     Material {
+        strength_factor: None,
         concrete_class: Default::default(),
         id: MaterialId(0),
         name: grade.to_string(),

@@ -277,7 +277,10 @@ fn cft_box_check(
     // 軽量コンクリート1種・2種は許容圧縮応力度を 0.9 倍に低減（class 対応版）。
     let fc_allow = concrete_allowable_compression_class(fc_raw, mat.concrete_class, long_term);
 
-    let f_value = steel_f_value_prefix(&mat.name, thick).unwrap_or(235.0);
+    // プリセット外の直接入力材料は fy を基準強度として用いる（それも無ければ 235）。
+    let f_value = steel_f_value_prefix(&mat.name, thick)
+        .or(mat.fy)
+        .unwrap_or(235.0);
     let (sa, sz_z, sz_y) = cft_box_steel_props(height, width, thick);
     // 鋼管単体の断面二次モーメントを強軸・弱軸個別に評価し、各軸の座屈長さ
     // lk_y/lk_z と対にして λ=max(λ_y,λ_z) を求める（安全側。充填コンクリート
@@ -418,7 +421,10 @@ fn cft_pipe_check(
     // 軽量コンクリート1種・2種は許容圧縮応力度を 0.9 倍に低減（class 対応版）。
     let fc_allow = concrete_allowable_compression_class(fc_raw, mat.concrete_class, long_term);
 
-    let f_value = steel_f_value_prefix(&mat.name, thick).unwrap_or(235.0);
+    // プリセット外の直接入力材料は fy を基準強度として用いる（それも無ければ 235）。
+    let f_value = steel_f_value_prefix(&mat.name, thick)
+        .or(mat.fy)
+        .unwrap_or(235.0);
     let (sa, sz) = cft_pipe_steel_props(outer_dia, thick);
     // 鋼管単体の断面二次モーメントで細長比を評価（安全側）。円形は等方性の
     // ため iy=iz だが、lk_y/lk_z が異なれば λ=max(λ_y,λ_z) は方向により変わる。

@@ -102,6 +102,7 @@ fn build_grid_model(nx: usize, ny: usize, n_stories: usize, with_slabs: bool) ->
         shape: None,
     });
     model.materials.push(Material {
+        strength_factor: None,
         concrete_class: Default::default(),
         id: MaterialId(0),
         name: "Fc24".into(),

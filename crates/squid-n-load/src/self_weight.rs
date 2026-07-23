@@ -155,6 +155,7 @@ mod tests {
 
     fn rc_material() -> Material {
         Material {
+            strength_factor: None,
             concrete_class: Default::default(),
             id: MaterialId(0),
             name: "Fc24".into(),

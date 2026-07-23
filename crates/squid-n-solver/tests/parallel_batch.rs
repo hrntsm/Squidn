@@ -82,6 +82,7 @@ fn make_model(n_cases: usize) -> Model {
             shape: None,
         }],
         materials: vec![Material {
+            strength_factor: None,
             concrete_class: Default::default(),
             id: MaterialId(0),
             name: "mat".into(),

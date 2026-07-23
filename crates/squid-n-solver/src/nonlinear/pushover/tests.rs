@@ -62,6 +62,7 @@ fn single_column_model(fy: f64, seismic_weight: f64) -> Model {
             shape: None,
         }],
         materials: vec![Material {
+            strength_factor: None,
             concrete_class: Default::default(),
             id: MaterialId(0),
             name: "steel".to_string(),
@@ -363,6 +364,7 @@ fn two_story_model() -> Model {
         shape: None,
     };
     let mat = Material {
+        strength_factor: None,
         concrete_class: Default::default(),
         id: MaterialId(0),
         name: "s".to_string(),
@@ -602,6 +604,7 @@ fn test_compute_static_indeterminacy_indeterminate_portal() {
             shape: None,
         }],
         materials: vec![Material {
+            strength_factor: None,
             concrete_class: Default::default(),
             id: MaterialId(0),
             name: "s".to_string(),
@@ -793,6 +796,7 @@ fn portal_frame_model(fy: f64, seismic_weight: f64) -> Model {
             shape: None,
         }],
         materials: vec![Material {
+            strength_factor: None,
             concrete_class: Default::default(),
             id: MaterialId(0),
             name: "steel".to_string(),
@@ -944,6 +948,7 @@ fn test_portal_frame_mechanism_classified() {
 fn test_compute_shear_yield_qy_steel() {
     // 鋼系（fy 設定あり）: Qy = as・fy/√3（RcRect 形状の有無・方向によらない）。
     let mat = Material {
+        strength_factor: None,
         concrete_class: Default::default(),
         id: MaterialId(0),
         name: "s".to_string(),
@@ -967,6 +972,7 @@ fn test_compute_shear_yield_qy_rc_fallback_without_rc_rect_shape() {
     // RC系（fy 無し・fc 設定あり）かつ断面形状情報（RcRect）が無い場合:
     // Qy = as・0.7√fc（慣用値へフォールバック）。
     let mat = Material {
+        strength_factor: None,
         concrete_class: Default::default(),
         id: MaterialId(0),
         name: "rc".to_string(),
@@ -989,6 +995,7 @@ fn test_compute_shear_yield_qy_rc_fallback_without_rc_rect_shape() {
 fn test_compute_shear_yield_qy_zero_as_is_infinite() {
     // 有効せん断断面積が 0 の断面は判定対象外（Qy=∞扱い）。
     let mat = Material {
+        strength_factor: None,
         concrete_class: Default::default(),
         id: MaterialId(0),
         name: "s".to_string(),
@@ -1043,6 +1050,7 @@ fn test_compute_shear_yield_qy_rc_rect_matches_arakawa_handcalc() {
     };
     let sec = shape.to_section(SectionId(0), "RC-400x600".into());
     let mat = Material {
+        strength_factor: None,
         concrete_class: Default::default(),
         id: MaterialId(0),
         name: "rc".to_string(),
@@ -1057,13 +1065,16 @@ fn test_compute_shear_yield_qy_rc_rect_matches_arakawa_handcalc() {
 
     // y 方向（強軸曲げのせん断）: b=幅, d=せい, 引張鉄筋 main_x。
     // しきい値のせん断有効断面積は断面 as_z（ウェブ）由来（クロス変換）。
+    // 本モジュール（shear_yield.rs）は保有水平耐力計算専用のため、主筋 σy には
+    // 材料強度係数（直接入力係数優先、無ければ一律1.1）を無条件で乗じる
+    // （`material_strength_factor_rebar`）。せん断補強筋 σwy=295 は割増対象外。
     let bar_area = |bs: &BarSet| bs.count as f64 * std::f64::consts::PI / 4.0 * bs.dia * bs.dia;
     let qsu_y_handcalc = rc_qsu_simple(&RcCapacityInput {
         b,
         d,
         at: bar_area(&rebar.main_x) / 2.0,
         d_eff: d - rebar.cover - rebar.main_x.dia / 2.0,
-        sigma_y: 345.0,
+        sigma_y: 345.0 * 1.1,
         fc: 24.0,
         pw: (std::f64::consts::PI / 4.0 * 10.0 * 10.0 * 2.0) / (b * 100.0),
         sigma_wy: 295.0,
@@ -1082,7 +1093,7 @@ fn test_compute_shear_yield_qy_rc_rect_matches_arakawa_handcalc() {
         d: b,
         at: bar_area(&rebar.main_y) / 2.0,
         d_eff: b - rebar.cover - rebar.main_y.dia / 2.0,
-        sigma_y: 345.0,
+        sigma_y: 345.0 * 1.1,
         fc: 24.0,
         pw: (std::f64::consts::PI / 4.0 * 10.0 * 10.0 * 2.0) / (d * 100.0),
         sigma_wy: 295.0,
@@ -1251,6 +1262,7 @@ fn rc_column_model_with_rigid_zone(rigid_zone: RigidZone) -> (Model, RcRebar, f6
     };
     let sec = shape.to_section(SectionId(0), "RC-400x600".into());
     let mat = Material {
+        strength_factor: None,
         concrete_class: Default::default(),
         id: MaterialId(0),
         name: "rc".to_string(),
@@ -1316,13 +1328,14 @@ fn test_compute_shear_yield_thresholds_rc_rect_uses_rigid_zone_reduced_clear_spa
     let expected_clear_span = 2400.0;
 
     // y方向（強軸・main_x。クロス変換で局所 y が強軸側）: RcArakawa を採用し、
-    // h0=2400 での rc_qsu_simple 手計算に一致。
+    // h0=2400 での rc_qsu_simple 手計算に一致。σy は主筋の材料強度係数（一律1.1）を
+    // 乗じた 345×1.1（保有水平耐力計算専用モジュールのため無条件で適用）。
     let qsu_y_handcalc = rc_qsu_simple(&RcCapacityInput {
         b,
         d,
         at: bar_area(&rebar.main_x) / 2.0,
         d_eff: d - rebar.cover - rebar.main_x.dia / 2.0,
-        sigma_y: 345.0,
+        sigma_y: 345.0 * 1.1,
         fc: 24.0,
         pw: (std::f64::consts::PI / 4.0 * 10.0 * 10.0 * 2.0) / (b * 100.0),
         sigma_wy: 295.0,
@@ -1368,7 +1381,8 @@ fn test_compute_shear_yield_thresholds_rc_rect_falls_back_when_rigid_zone_exceed
         d,
         at: bar_area(&rebar.main_x) / 2.0,
         d_eff: d - rebar.cover - rebar.main_x.dia / 2.0,
-        sigma_y: 345.0,
+        // 主筋の材料強度係数（一律1.1）を乗じた 345×1.1。
+        sigma_y: 345.0 * 1.1,
         fc: 24.0,
         pw: (std::f64::consts::PI / 4.0 * 10.0 * 10.0 * 2.0) / (b * 100.0),
         sigma_wy: 295.0,
@@ -1564,4 +1578,248 @@ fn test_track_shear_yield_axial_compression_raises_qy_end_to_end() {
         !events_zero.is_empty(),
         "without axial compression the same Vz demand should still trigger the event"
     );
+}
+
+// ---- 保有水平耐力計算（プッシュオーバー）の材料強度割増: 部材組み立て時の
+// 係数配線方式（`build_nonlinear_behavior(.., StrengthBasis::MaterialStrength)`
+// および pushover 専用モジュール hinge.rs / shear_yield.rs の無条件適用）の検証。
+// 旧方式（モデル複製 `scale_steel_material_strength`）は廃止したため、
+// `compute_hinge_thresholds` / `compute_shear_yield_thresholds` が返す
+// 実効降伏応力（My・σy）を直接検証する。 ----
+
+/// 鋼材断面1本の片持ち柱モデル（形状情報なし＝フォールバック分岐、
+/// `member_moment_thresholds` の σy·Ze 経路）を作る。
+fn steel_hinge_model(name: &str, fy: f64, strength_factor: Option<f64>) -> Model {
+    Model {
+        nodes: vec![
+            Node {
+                id: NodeId(0),
+                coord: [0.0, 0.0, 0.0],
+                restraint: Dof6Mask::FIXED,
+                mass: None,
+                story: None,
+            },
+            Node {
+                id: NodeId(1),
+                coord: [0.0, 0.0, 3000.0],
+                restraint: Dof6Mask::FREE,
+                mass: None,
+                story: None,
+            },
+        ],
+        elements: vec![ElementData {
+            id: ElemId(0),
+            kind: ElementKind::Fiber,
+            nodes: smallvec::smallvec![NodeId(0), NodeId(1)],
+            section: Some(SectionId(0)),
+            material: Some(MaterialId(0)),
+            local_axis: LocalAxis {
+                ref_vector: [1.0, 0.0, 0.0],
+            },
+            end_cond: [EndCondition::Fixed, EndCondition::Fixed],
+            force_regime: ForceRegime::Auto,
+            rigid_zone: Default::default(),
+            plastic_zone: None,
+            spring: None,
+        }],
+        sections: vec![Section {
+            id: SectionId(0),
+            name: "c".to_string(),
+            area: 10000.0,
+            iy: 8.333e6,
+            iz: 8.333e6,
+            j: 1.0e6,
+            depth: 100.0,
+            width: 100.0,
+            as_y: 0.0,
+            as_z: 0.0,
+            panel_thickness: None,
+            thickness: None,
+            shape: None,
+        }],
+        materials: vec![Material {
+            strength_factor,
+            concrete_class: Default::default(),
+            id: MaterialId(0),
+            name: name.to_string(),
+            young: 205000.0,
+            poisson: 0.3,
+            density: 0.0,
+            shear: None,
+            fc: None,
+            fy: Some(fy),
+        }],
+        ..Default::default()
+    }
+}
+
+/// 鋼材文脈: 既知の鋼材グレード名（SS400=1.1倍、SA440=590N級で1.05倍）は
+/// `compute_hinge_thresholds` の My に材料強度係数がそのまま反映され、
+/// 未知名称の材料に対する比が係数と一致することを確認する。
+#[test]
+fn test_compute_hinge_thresholds_steel_uses_material_strength_factor() {
+    let my_of =
+        |name: &str, fy: f64| compute_hinge_thresholds(&steel_hinge_model(name, fy, None))[0].my;
+
+    let my_unknown = my_of("未知鋼材", 235.0);
+    let my_ss400 = my_of("SS400", 235.0);
+    assert!(
+        (my_ss400 / my_unknown - 1.1).abs() < 1e-9,
+        "SS400（既知グレード）は未知名称の1.1倍のはず: {my_ss400}/{my_unknown}"
+    );
+
+    let my_unknown2 = my_of("未知鋼材2", 440.0);
+    let my_sa440 = my_of("SA440", 440.0);
+    assert!(
+        (my_sa440 / my_unknown2 - 1.05).abs() < 1e-9,
+        "SA440（590N級）は未知名称の1.05倍のはず: {my_sa440}/{my_unknown2}"
+    );
+}
+
+/// 直接入力の割増係数（`Material::strength_factor`）は、名称から鋼材グレードを
+/// 解決できない材料でも最優先で使われることを確認する。
+#[test]
+fn test_compute_hinge_thresholds_direct_strength_factor_overrides_name_lookup() {
+    let my_of = |factor: Option<f64>| {
+        compute_hinge_thresholds(&steel_hinge_model("カスタム材料", 235.0, factor))[0].my
+    };
+    let my_default = my_of(None); // 未知名称 → 係数 1.0
+    let my_scaled = my_of(Some(1.25));
+    assert!(
+        (my_scaled / my_default - 1.25).abs() < 1e-9,
+        "直接入力係数1.25が最優先で使われるはず: {my_scaled}/{my_default}"
+    );
+}
+
+/// RC 矩形断面 + 配筋情報を持つ片持ち柱モデル（fy 未設定＝既定345）を作る。
+fn rc_hinge_model() -> (Model, RcRebar, f64, f64) {
+    let rebar = RcRebar {
+        main_x: BarSet {
+            count: 6,
+            dia: 25.0,
+            layers: 1,
+        },
+        main_y: BarSet {
+            count: 4,
+            dia: 19.0,
+            layers: 1,
+        },
+        cover: 40.0,
+        shear: ShearBar {
+            dia: 10.0,
+            pitch: 100.0,
+            legs: 2,
+            grade: None,
+        },
+    };
+    let (b, d) = (400.0, 600.0);
+    let shape = SectionShape::RcRect {
+        b,
+        d,
+        rebar: rebar.clone(),
+    };
+    let sec = shape.to_section(SectionId(0), "RC-400x600".into());
+    let mat = Material {
+        strength_factor: None,
+        concrete_class: Default::default(),
+        id: MaterialId(0),
+        name: "rc".to_string(),
+        young: 23000.0,
+        poisson: 0.2,
+        density: 0.0,
+        shear: None,
+        fc: Some(24.0),
+        fy: None,
+    };
+    let model = Model {
+        nodes: vec![
+            Node {
+                id: NodeId(0),
+                coord: [0.0, 0.0, 0.0],
+                restraint: Dof6Mask::FIXED,
+                mass: None,
+                story: None,
+            },
+            Node {
+                id: NodeId(1),
+                coord: [0.0, 0.0, 3000.0],
+                restraint: Dof6Mask::FREE,
+                mass: None,
+                story: None,
+            },
+        ],
+        elements: vec![ElementData {
+            id: ElemId(0),
+            kind: ElementKind::Fiber,
+            nodes: smallvec::smallvec![NodeId(0), NodeId(1)],
+            section: Some(SectionId(0)),
+            material: Some(MaterialId(0)),
+            local_axis: LocalAxis {
+                ref_vector: [1.0, 0.0, 0.0],
+            },
+            end_cond: [EndCondition::Fixed, EndCondition::Fixed],
+            force_regime: ForceRegime::Auto,
+            rigid_zone: Default::default(),
+            plastic_zone: None,
+            spring: None,
+        }],
+        sections: vec![sec],
+        materials: vec![mat],
+        ..Default::default()
+    };
+    (model, rebar, b, d)
+}
+
+/// RC 主筋文脈: fy 未設定（既定 SD345=345）の RC 矩形で、`compute_hinge_thresholds`
+/// の My が主筋の材料強度係数（一律1.1）を乗じた σy=345×1.1 の
+/// `rc_mu_simple` 相当になることを確認する。
+#[test]
+fn test_compute_hinge_thresholds_rc_rebar_uses_material_strength_factor() {
+    let (model, rebar, _b, d) = rc_hinge_model();
+    let thresholds = compute_hinge_thresholds(&model);
+
+    let bar_area = |bs: &BarSet| bs.count as f64 * std::f64::consts::PI / 4.0 * bs.dia * bs.dia;
+    let at = bar_area(&rebar.main_x) / 2.0;
+    let d_eff = (d - rebar.cover - rebar.main_x.dia / 2.0).max(0.0);
+    let expected_my = rc_mu_simple(&RcCapacityInput {
+        b: 1.0,
+        d,
+        at,
+        d_eff,
+        sigma_y: 345.0 * 1.1,
+        fc: 24.0,
+        pw: 0.0,
+        sigma_wy: 0.0,
+        clear_span: 1.0,
+        sigma_0: 0.0,
+    });
+    assert!(
+        (thresholds[0].my - expected_my).abs() < 1e-6,
+        "my={} expected={}",
+        thresholds[0].my,
+        expected_my
+    );
+}
+
+/// せん断降伏側（shear_yield.rs）: RC 矩形の主筋 σy には材料強度係数（1.1）が
+/// 乗じられる一方、せん断補強筋 σwy=295 は割増対象外のまま据え置かれることを
+/// 確認する（`rc_rect_capacity_input` の実装）。
+#[test]
+fn test_compute_shear_yield_thresholds_rc_rebar_scaled_but_shear_reinforcement_is_not() {
+    let (model, _rebar, _b, _d) = rc_hinge_model();
+    let thresholds = compute_shear_yield_thresholds(&model);
+    match &thresholds[0].y {
+        DirThreshold::RcArakawa { input, .. } => {
+            assert!(
+                (input.sigma_y - 345.0 * 1.1).abs() < 1e-9,
+                "主筋 σy は1.1倍のはず: {}",
+                input.sigma_y
+            );
+            assert_eq!(
+                input.sigma_wy, 295.0,
+                "せん断補強筋は材料強度割増の対象外のため295のまま"
+            );
+        }
+        DirThreshold::Static(_) => panic!("expected RcArakawa for RcRect with rebar"),
+    }
 }

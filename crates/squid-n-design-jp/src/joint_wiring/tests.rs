@@ -52,6 +52,7 @@ fn wall_model_sized(l: f64, h: f64, thickness: f64, wall_attr: Option<WallAttr>)
         }),
     }];
     let materials = vec![Material {
+        strength_factor: None,
         concrete_class: Default::default(),
         id: MaterialId(0),
         name: "SD345".to_string(),
@@ -588,6 +589,7 @@ fn rc_cross_joint_emits_ultimate_check() {
         beam_shape.to_section(SectionId(1), "B400x700".into()),
     ];
     let materials = vec![Material {
+        strength_factor: None,
         concrete_class: Default::default(),
         id: MaterialId(0),
         name: "SD345".to_string(),

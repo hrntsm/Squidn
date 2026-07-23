@@ -38,6 +38,8 @@ use crate::analysis::SeismicDir;
 #[cfg(test)]
 use geom::axial_compression;
 #[cfg(test)]
+use hinge::compute_hinge_thresholds;
+#[cfg(test)]
 use mechanism::{compute_static_indeterminacy, determine_mechanism};
 #[cfg(test)]
 use shear_yield::{
@@ -49,7 +51,7 @@ use smallvec::SmallVec;
 #[cfg(test)]
 use squid_n_core::model::{Model, RigidZone};
 #[cfg(test)]
-use squid_n_core::rc_capacity::{rc_qsu_simple, RcCapacityInput};
+use squid_n_core::rc_capacity::{rc_mu_simple, rc_qsu_simple, RcCapacityInput};
 #[cfg(test)]
 use squid_n_core::section_shape::{BarSet, RcRebar, SectionShape};
 #[cfg(test)]

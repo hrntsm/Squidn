@@ -1,69 +1,56 @@
 use crate::app::App;
+use squid_n_core::material_grade::{material_presets, MaterialPreset, PresetCategory};
+use squid_n_core::units::{
+    concrete_unit_weight_kn_m3, to_internal::mass_density_from_unit_weight_kn_m3, ConcreteClass,
+    ConcreteComposition,
+};
 use squid_n_edit::{AddMaterial, DeleteMaterial, MaterialField, SetMaterialField, SetMaterialName};
 
-/// (名称, E [N/mm²], ν, 密度 [ton/mm³], Fc, Fy)
-type MaterialPreset = (&'static str, f64, f64, f64, Option<f64>, Option<f64>);
-
-/// コンクリートの質量密度 [ton/mm³] を単位体積重量表（γC/γRC/γSRC）から導出する。
-///
-/// レビュー §1.9: 旧実装は Fc・構造区分によらず `2.4e-9`（γ≈23.5 kN/m³）固定
-/// だったが、単位体積重量表は Fc・普通/軽量・無筋/RC/SRC ごとに
-/// 17.0〜26.5 kN/m³ の範囲で規定する。普通コンクリート・Fc≤36 の場合、
-/// 気乾単位体積重量 γC=23.0、鉄筋込み γRC=γC+1.0=24.0、
-/// 鉄骨鉄筋込み γSRC=γC+2.0=25.0 kN/m³（`squid_n_core::units::concrete_unit_weight_kn_m3`
-/// の表そのもの）。Fc21/24/30 はいずれも Fc≤36 帯のため γRC/γSRC は Fc に依らず
-/// 同一値になる（Fc>36 で初めて変化する）。
-fn concrete_density(fc: f64, comp: squid_n_core::units::ConcreteComposition) -> f64 {
-    use squid_n_core::units::{concrete_unit_weight_kn_m3, to_internal, ConcreteClass};
-    let gamma = concrete_unit_weight_kn_m3(fc, ConcreteClass::Normal, comp);
-    to_internal::mass_density_from_unit_weight_kn_m3(gamma)
+/// プリセット追加 UI の選択状態（区分・グレード名・SRC造トグル）。
+/// `ui.data`/`data_mut` の temp storage に保持する。
+#[derive(Clone, Debug)]
+struct PresetDraft {
+    category: PresetCategory,
+    name: String,
+    /// コンクリート区分のみ有効。ON のとき密度を γSRC 由来に差し替える。
+    src: bool,
 }
 
-/// 材料プリセット（JIS 主要鋼種と普通/SRC コンクリート）を実行時に生成する。
-/// コンクリートの密度は `concrete_density`（γ表からの導出）を用いるため
-/// `const` にできず、呼び出しのたびに構築する（UI 描画1回あたり数件のみで
-/// コストは無視できる）。密度は内部単位系 N-mm-s の質量密度 [ton/mm³]
-/// （鋼は慣用値 γs=77kN/m³ 相当の 7.85e-9 を維持）。
-fn material_presets() -> Vec<MaterialPreset> {
-    use squid_n_core::units::ConcreteComposition::{Rc, Src};
-    vec![
-        ("SN400B", 205000.0, 0.3, 7.85e-9, None, Some(235.0)),
-        ("SS400", 205000.0, 0.3, 7.85e-9, None, Some(235.0)),
-        ("SM490A", 205000.0, 0.3, 7.85e-9, None, Some(325.0)),
-        (
-            "Fc21",
-            21500.0,
-            0.2,
-            concrete_density(21.0, Rc),
-            Some(21.0),
-            None,
-        ),
-        (
-            "Fc24",
-            22700.0,
-            0.2,
-            concrete_density(24.0, Rc),
-            Some(24.0),
-            None,
-        ),
-        (
-            "Fc30",
-            24800.0,
-            0.2,
-            concrete_density(30.0, Rc),
-            Some(30.0),
-            None,
-        ),
-        // SRC 造（鉄骨鉄筋コンクリート）用: γSRC = γC + 2.0（レビュー §1.9）。
-        (
-            "Fc24(SRC)",
-            22700.0,
-            0.2,
-            concrete_density(24.0, Src),
-            Some(24.0),
-            None,
-        ),
-    ]
+impl PresetDraft {
+    fn new(presets: &[MaterialPreset], category: PresetCategory) -> Self {
+        Self {
+            category,
+            name: first_name_in(presets, category),
+            src: false,
+        }
+    }
+}
+
+fn first_name_in(presets: &[MaterialPreset], category: PresetCategory) -> String {
+    presets
+        .iter()
+        .find(|p| p.category == category)
+        .map(|p| p.name.to_string())
+        .unwrap_or_default()
+}
+
+/// プリセットのグレード選択に添えるホバーテキスト（主要値の要約）。
+fn preset_hover_text(p: &MaterialPreset) -> String {
+    match p.category {
+        PresetCategory::Steel => format!("F={} (t≤40)", p.fy.unwrap_or_default()),
+        PresetCategory::Rebar => format!("降伏点 {}", p.fy.unwrap_or_default()),
+        PresetCategory::Concrete => format!("Fc={}, Ec={:.0}", p.fc.unwrap_or_default(), p.young),
+    }
+}
+
+/// SRC造（鉄骨鉄筋コンクリート）トグル適用時の材料名・密度を計算する。
+///
+/// `fc` は元プリセットのコンクリート設計基準強度。密度は単位体積重量表の
+/// γSRC（鉄骨鉄筋込み。普通コンクリート・Fc≤36 帯で 25.0 kN/m³）から導出する。
+fn apply_src_toggle(name: &str, fc: f64) -> (String, f64) {
+    let gamma = concrete_unit_weight_kn_m3(fc, ConcreteClass::Normal, ConcreteComposition::Src);
+    let rho = mass_density_from_unit_weight_kn_m3(gamma);
+    (format!("{name}(SRC)"), rho)
 }
 
 /// 材料タブ：プリセット追加・カスタム追加・一覧編集・削除。
@@ -71,31 +58,94 @@ pub fn materials_table(ui: &mut egui::Ui, app: &mut App) {
     use egui_extras::{Column, TableBuilder};
 
     // ── プリセット追加 ─────────────────────────────────────────
-    ui.label("プリセット追加:");
-    ui.horizontal_wrapped(|ui| {
-        for (name, e, nu, rho, fc, fy) in material_presets() {
-            if ui.button(name).clicked() {
+    let presets = material_presets();
+    let id_preset_draft = egui::Id::new("material_preset_draft");
+    let mut draft = ui
+        .data(|d| d.get_temp::<PresetDraft>(id_preset_draft))
+        .unwrap_or_else(|| PresetDraft::new(&presets, PresetCategory::Steel));
+
+    ui.horizontal(|ui| {
+        ui.label("プリセット追加:");
+        for cat in [
+            PresetCategory::Steel,
+            PresetCategory::Rebar,
+            PresetCategory::Concrete,
+        ] {
+            if ui
+                .selectable_label(draft.category == cat, cat.label())
+                .clicked()
+                && draft.category != cat
+            {
+                draft.category = cat;
+                draft.name = first_name_in(&presets, cat);
+                draft.src = false;
+            }
+        }
+    });
+
+    let grades: Vec<&MaterialPreset> = presets
+        .iter()
+        .filter(|p| p.category == draft.category)
+        .collect();
+    if !grades.iter().any(|p| p.name == draft.name) {
+        draft.name = grades
+            .first()
+            .map(|p| p.name.to_string())
+            .unwrap_or_default();
+    }
+
+    ui.horizontal(|ui| {
+        ui.label("グレード:");
+        egui::ComboBox::from_id_salt("material_preset_select")
+            .selected_text(&draft.name)
+            .show_ui(ui, |ui| {
+                for p in &grades {
+                    let hover = preset_hover_text(p);
+                    if ui
+                        .selectable_label(draft.name == p.name, p.name)
+                        .on_hover_text(hover)
+                        .clicked()
+                    {
+                        draft.name = p.name.to_string();
+                    }
+                }
+            });
+        if draft.category == PresetCategory::Concrete {
+            ui.checkbox(&mut draft.src, "SRC造(γSRC)");
+        }
+
+        let selected = grades.iter().find(|p| p.name == draft.name).copied();
+        if let Some(preset) = selected {
+            let (name, density) = if draft.category == PresetCategory::Concrete && draft.src {
+                apply_src_toggle(preset.name, preset.fc.unwrap_or_default())
+            } else {
+                (preset.name.to_string(), preset.density)
+            };
+            if ui.button("+ 追加").clicked() {
                 app.undo.run(
                     &mut app.model,
                     Box::new(AddMaterial {
-                        name: name.to_string(),
-                        young: e,
-                        poisson: nu,
-                        density: rho,
-                        fc,
-                        fy,
+                        name,
+                        young: preset.young,
+                        poisson: preset.poisson,
+                        density,
+                        fc: preset.fc,
+                        fy: preset.fy,
+                        strength_factor: None,
                     }),
                 );
                 app.staleness.mark_edited();
             }
         }
     });
+    ui.data_mut(|d| d.insert_temp(id_preset_draft, draft));
 
-    // ── カスタム追加フォーム ────────────────────────────────────
+    // ── 直接入力（カスタム）フォーム ─────────────────────────────
+    // プリセットにない材料は直接入力する。
     let id_draft = egui::Id::new("material_custom_draft");
-    // (名称, E, ν, 密度, Fc, Fy) の文字列ドラフト
-    let mut draft: [String; 6] = ui
-        .data(|d| d.get_temp::<[String; 6]>(id_draft))
+    // (名称, E, ν, 密度, Fc, Fy, 強度割増係数) の文字列ドラフト
+    let mut draft: [String; 7] = ui
+        .data(|d| d.get_temp::<[String; 7]>(id_draft))
         .unwrap_or_else(|| {
             [
                 "新規材料".into(),
@@ -104,24 +154,31 @@ pub fn materials_table(ui: &mut egui::Ui, app: &mut App) {
                 "7.85e-9".into(),
                 String::new(),
                 String::new(),
+                String::new(),
             ]
         });
     let mut do_add_custom = false;
     ui.horizontal(|ui| {
-        ui.label("カスタム:");
+        ui.label("直接入力:");
         ui.add(egui::TextEdit::singleline(&mut draft[0]).desired_width(80.0))
             .on_hover_text("名称");
         for (k, label) in [(1, "E"), (2, "ν"), (3, "ρ"), (4, "Fc"), (5, "Fy")] {
             ui.label(label);
             ui.add(egui::TextEdit::singleline(&mut draft[k]).desired_width(60.0));
         }
+        ui.label("割増");
+        ui.add(egui::TextEdit::singleline(&mut draft[6]).desired_width(50.0))
+            .on_hover_text(
+                "保有水平耐力計算（プッシュオーバー）の材料強度割増係数。\
+                 空欄=自動（鋼材1.1、590N級1.05、RC主筋1.1）",
+            );
         let parsed_e = draft[1].parse::<f64>();
         let parsed_nu = draft[2].parse::<f64>();
         let parsed_rho = draft[3].parse::<f64>();
         let ok = parsed_e.is_ok() && parsed_nu.is_ok() && parsed_rho.is_ok();
         if ui
             .add_enabled(ok, egui::Button::new("+ 追加"))
-            .on_hover_text("E・ν・ρ は必須。Fc・Fy は空欄可")
+            .on_hover_text("E・ν・ρ は必須。Fc・Fy・割増は空欄可")
             .clicked()
         {
             do_add_custom = true;
@@ -130,6 +187,7 @@ pub fn materials_table(ui: &mut egui::Ui, app: &mut App) {
     if do_add_custom {
         let fc = draft[4].parse::<f64>().ok();
         let fy = draft[5].parse::<f64>().ok();
+        let strength_factor = draft[6].parse::<f64>().ok();
         if let (Ok(e), Ok(nu), Ok(rho)) = (
             draft[1].parse::<f64>(),
             draft[2].parse::<f64>(),
@@ -144,6 +202,7 @@ pub fn materials_table(ui: &mut egui::Ui, app: &mut App) {
                     density: rho,
                     fc,
                     fy,
+                    strength_factor,
                 }),
             );
             app.staleness.mark_edited();
@@ -168,11 +227,28 @@ pub fn materials_table(ui: &mut egui::Ui, app: &mut App) {
         .column(Column::initial(70.0))
         .column(Column::initial(50.0))
         .column(Column::initial(50.0))
+        .column(Column::initial(50.0))
         .column(Column::auto())
         .header(20.0, |mut h| {
-            for t in &["ID", "名称", "E [N/mm²]", "ν", "ρ [t/mm³]", "Fc", "Fy", ""] {
+            for t in &[
+                "ID",
+                "名称",
+                "E [N/mm²]",
+                "ν",
+                "ρ [t/mm³]",
+                "Fc",
+                "Fy",
+                "割増",
+                "",
+            ] {
                 h.col(|ui| {
-                    ui.strong(*t);
+                    let resp = ui.strong(*t);
+                    if *t == "割増" {
+                        resp.on_hover_text(
+                            "保有水平耐力計算（プッシュオーバー）の材料強度割増係数。\
+                             空欄=自動（鋼材1.1、590N級1.05、RC主筋1.1）",
+                        );
+                    }
                 });
             }
         })
@@ -195,7 +271,7 @@ pub fn materials_table(ui: &mut egui::Ui, app: &mut App) {
                     }
                 });
                 // 数値セル: フォーカス喪失時に確定
-                let cells: [(MaterialField, String, bool); 5] = [
+                let cells: [(MaterialField, String, bool); 6] = [
                     (MaterialField::Young, format!("{}", mat.young), true),
                     (MaterialField::Poisson, format!("{}", mat.poisson), true),
                     (MaterialField::Density, format!("{:.3e}", mat.density), true),
@@ -207,6 +283,13 @@ pub fn materials_table(ui: &mut egui::Ui, app: &mut App) {
                     (
                         MaterialField::Fy,
                         mat.fy.map(|v| format!("{}", v)).unwrap_or_default(),
+                        false,
+                    ),
+                    (
+                        MaterialField::StrengthFactor,
+                        mat.strength_factor
+                            .map(|v| format!("{}", v))
+                            .unwrap_or_default(),
                         false,
                     ),
                 ];
@@ -286,46 +369,53 @@ pub fn materials_table(ui: &mut egui::Ui, app: &mut App) {
 mod tests {
     use super::*;
 
-    /// レビュー §1.9: コンクリートプリセットの密度が単位体積重量表（γ表）から
-    /// 導出されていることを確認する（Fc・種別に応じた 24.0/25.0 kN/m³ 等）。
+    /// コンクリートプリセット（Fc≤36 帯）の密度が γRC=24.0 kN/m³ 由来であることを確認する。
     #[test]
     fn test_concrete_presets_match_unit_weight_table() {
-        use squid_n_core::units::to_internal::mass_density_from_unit_weight_kn_m3;
-
         let presets = material_presets();
-        let find = |name: &str| {
-            *presets
-                .iter()
-                .find(|p| p.0 == name)
-                .unwrap_or_else(|| panic!("preset {name} not found"))
-        };
-
-        // Fc21/24/30 は全て Fc<=36 帯のため γRC=24.0 kN/m³ で共通。
         let rc_density = mass_density_from_unit_weight_kn_m3(24.0);
-        for name in ["Fc21", "Fc24", "Fc30"] {
-            let p = find(name);
+        for name in ["Fc18", "Fc21", "Fc24", "Fc27", "Fc30", "Fc33", "Fc36"] {
+            let p = presets
+                .iter()
+                .find(|p| p.name == name)
+                .unwrap_or_else(|| panic!("preset {name} not found"));
+            assert_eq!(p.category, PresetCategory::Concrete);
             assert!(
-                (p.3 - rc_density).abs() < 1e-15,
+                (p.density - rc_density).abs() < 1e-18,
                 "{name}: density={} expected={}",
-                p.3,
+                p.density,
                 rc_density
             );
         }
+    }
 
-        // SRC 用プリセットは γSRC=25.0 kN/m³。
+    /// SRC造トグル適用時の密度が γSRC=25.0 kN/m³ 由来であることを確認する
+    /// （Fc≤36 帯。`apply_src_toggle` に切り出したロジックを直接検証する）。
+    #[test]
+    fn test_apply_src_toggle_uses_gamma_src() {
         let src_density = mass_density_from_unit_weight_kn_m3(25.0);
-        let src = find("Fc24(SRC)");
-        assert!((src.3 - src_density).abs() < 1e-15);
-
-        // 旧実装の固定値 2.4e-9 より正しい値の方が大きい（γ=24.0 が実際の表の値）。
-        assert!(rc_density > 2.4e-9);
+        let (name, density) = apply_src_toggle("Fc24", 24.0);
+        assert_eq!(name, "Fc24(SRC)");
         assert!(
-            (rc_density - 2.4473e-9).abs() < 1e-13,
-            "rc_density={rc_density}"
+            (density - src_density).abs() < 1e-18,
+            "density={density} expected={src_density}"
         );
+    }
 
-        // 鋼材の密度は据え置き。
-        let steel = find("SN400B");
-        assert!((steel.3 - 7.85e-9).abs() < 1e-18);
+    /// 鋼材プリセットの密度が γs=77 kN/m³ 由来であることを確認する
+    /// （旧実装の 7.85e-9 ハードコードとは異なる値になる点に注意）。
+    #[test]
+    fn test_steel_presets_match_unit_weight_table() {
+        let presets = material_presets();
+        let steel_density = mass_density_from_unit_weight_kn_m3(77.0);
+        let ss400 = presets
+            .iter()
+            .find(|p| p.name == "SS400")
+            .expect("preset SS400 not found");
+        assert_eq!(ss400.category, PresetCategory::Steel);
+        assert!((ss400.density - steel_density).abs() < 1e-18);
+        // 旧実装の固定値 7.85e-9 とは厳密には一致しない（77/9.80665 が真値）。
+        assert!((steel_density - 7.85e-9).abs() < 1e-11);
+        assert_ne!(steel_density, 7.85e-9);
     }
 }

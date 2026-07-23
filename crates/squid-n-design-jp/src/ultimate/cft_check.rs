@@ -110,7 +110,10 @@ pub fn collect_cft_ultimate_checks(
             SectionShape::CftBox { thick, .. } | SectionShape::CftPipe { thick, .. } => thick,
             _ => 0.0,
         };
-        let fy = crate::material_strength::steel_f_value_prefix(&mat.name, thick).unwrap_or(235.0);
+        // プリセット外の直接入力材料は fy を基準強度として用いる（それも無ければ 235）。
+        let fy = crate::material_strength::steel_f_value_prefix(&mat.name, thick)
+            .or(mat.fy)
+            .unwrap_or(235.0);
         let lk = geometric_length(elem, model);
 
         let inp = cft::CftAxialInput {

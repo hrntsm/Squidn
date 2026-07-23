@@ -251,6 +251,7 @@ mod tests {
             shape: None,
         };
         let material = Material {
+            strength_factor: None,
             concrete_class: Default::default(),
             id: MaterialId(0),
             name: "steel".to_string(),
@@ -453,6 +454,7 @@ mod tests {
             shape: None,
         };
         let material = Material {
+            strength_factor: None,
             concrete_class: Default::default(),
             id: MaterialId(0),
             name: "steel".to_string(),

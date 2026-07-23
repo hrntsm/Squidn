@@ -49,6 +49,7 @@ fn make_diaphragm_model() -> Model {
             shape: None,
         }],
         materials: vec![Material {
+            strength_factor: None,
             concrete_class: Default::default(),
             id: MaterialId(0),
             name: "mat".into(),
@@ -221,7 +222,7 @@ fn test_build_nonlinear_behavior_concentrated_spring_uses_spring_beam() {
         plastic_zone: None,
         spring: None,
     };
-    let (behavior, _state) = build_nonlinear_behavior(&beam, &model);
+    let (behavior, _state) = build_nonlinear_behavior(&beam, &model, StrengthBasis::Nominal);
     let snap = behavior.snapshot_state();
     let is_spring = snap
         .downcast_ref::<(
@@ -258,7 +259,7 @@ fn test_build_nonlinear_behavior_fiber_uses_fiber_beam() {
         plastic_zone: None,
         spring: None,
     };
-    let (behavior, _state) = build_nonlinear_behavior(&col, &model);
+    let (behavior, _state) = build_nonlinear_behavior(&col, &model, StrengthBasis::Nominal);
     let snap = behavior.snapshot_state();
     let is_fiber = snap
         .downcast_ref::<(
@@ -305,6 +306,7 @@ fn make_brace_model(tension_only: bool) -> (Model, ElementData) {
             shape: None,
         }],
         materials: vec![Material {
+            strength_factor: None,
             concrete_class: Default::default(),
             id: MaterialId(0),
             name: "steel".into(),
@@ -364,7 +366,7 @@ fn test_build_behavior_brace_tension_only_full_stiffness() {
 #[test]
 fn test_build_nonlinear_behavior_brace_tension_only_full_stiffness() {
     let (model, elem) = make_brace_model(true);
-    let (behavior, state) = build_nonlinear_behavior(&elem, &model);
+    let (behavior, state) = build_nonlinear_behavior(&elem, &model, StrengthBasis::Nominal);
     let ctx = crate::behavior::Ctx { model: &model };
     let k = behavior.tangent_stiffness(&state, &ctx);
     let ea_l = 205000.0 * 2000.0 / 4000.0;
@@ -407,6 +409,7 @@ fn test_build_behavior_wall_opening_reduces_shear_stiffness() {
             shape: None,
         }],
         materials: vec![Material {
+            strength_factor: None,
             concrete_class: Default::default(),
             id: MaterialId(0),
             name: "FC24".into(),
@@ -586,7 +589,12 @@ fn test_resolve_member_hysteresis_and_flexural_springs() {
         resolve_member_hysteresis(&beam, &model),
         HysteresisModel::Standard
     );
-    let (_i, _j, use_mn) = build_flexural_springs(&beam, &model, HysteresisModel::Standard);
+    let (_i, _j, use_mn) = build_flexural_springs(
+        &beam,
+        &model,
+        HysteresisModel::Standard,
+        StrengthBasis::Nominal,
+    );
     assert!(use_mn);
 
     // RcRect + Fc → RC 系 → 既定=武田型（履歴材料、N-M 相関対象外）。
@@ -605,7 +613,12 @@ fn test_resolve_member_hysteresis_and_flexural_springs() {
         resolve_member_hysteresis(&beam, &model),
         HysteresisModel::Takeda
     );
-    let (_i, _j, use_mn) = build_flexural_springs(&beam, &model, HysteresisModel::Takeda);
+    let (_i, _j, use_mn) = build_flexural_springs(
+        &beam,
+        &model,
+        HysteresisModel::Takeda,
+        StrengthBasis::Nominal,
+    );
     assert!(!use_mn, "武田型(履歴材料)は N-M 相関(set_yield)対象外");
 
     // SteelH → 非 RC → 標準型。
@@ -627,7 +640,12 @@ fn test_resolve_member_hysteresis_and_flexural_springs() {
         resolve_member_hysteresis(&beam, &model),
         HysteresisModel::MaxPointOriented
     );
-    let (_i, _j, use_mn) = build_flexural_springs(&beam, &model, HysteresisModel::MaxPointOriented);
+    let (_i, _j, use_mn) = build_flexural_springs(
+        &beam,
+        &model,
+        HysteresisModel::MaxPointOriented,
+        StrengthBasis::Nominal,
+    );
     assert!(!use_mn);
 }
 
@@ -765,7 +783,7 @@ fn test_rc_beam_flexural_spring_exhibits_takeda_degradation() {
 
     let rule = resolve_member_hysteresis(&beam, &model);
     assert_eq!(rule, HysteresisModel::Takeda);
-    let (mut si, _sj, use_mn) = build_flexural_springs(&beam, &model, rule);
+    let (mut si, _sj, use_mn) = build_flexural_springs(&beam, &model, rule, StrengthBasis::Nominal);
     assert!(!use_mn);
 
     // 初期（弾性）接線。
@@ -828,7 +846,7 @@ fn test_steel_beam_flexural_spring_buckling_degrades() {
 
     let rule = resolve_member_hysteresis(&beam, &model);
     assert_eq!(rule, HysteresisModel::SteelBuckling);
-    let (mut si, _sj, use_mn) = build_flexural_springs(&beam, &model, rule);
+    let (mut si, _sj, use_mn) = build_flexural_springs(&beam, &model, rule, StrengthBasis::Nominal);
     assert!(use_mn, "座屈考慮型は set_yield 対応で N-M 相関適用可");
 
     let (_m0, k0) = si.trial(1e-9);

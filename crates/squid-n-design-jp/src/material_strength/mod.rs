@@ -121,6 +121,7 @@ mod tests {
     #[test]
     fn test_rebar_sigma_y_sources() {
         let mut m = Material {
+            strength_factor: None,
             concrete_class: Default::default(),
             id: squid_n_core::ids::MaterialId(0),
             name: "SD390".to_string(),
@@ -228,6 +229,14 @@ mod tests {
         assert!((steel_f_value("SS400", 40.1).unwrap() - 215.0).abs() < 1e-9);
         assert!((steel_f_value("SM520", 75.0).unwrap() - 335.0).abs() < 1e-9);
         assert!((steel_f_value("SM520", 76.0).unwrap() - 325.0).abs() < 1e-9);
+    }
+
+    /// squid_n_core::material_grade への委譲後も TMCP・LY 系（板厚区分なし）が
+    /// 解決できることを確認する。
+    #[test]
+    fn test_f_value_tmcp_ly() {
+        assert_eq!(steel_f_value("TMCP440", 41.0), Some(440.0));
+        assert_eq!(steel_f_value("LY225", 40.0), Some(205.0));
     }
 
     #[test]

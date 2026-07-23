@@ -59,6 +59,7 @@ fn make_cantilever_model() -> Model {
             shape: None,
         }],
         materials: vec![Material {
+            strength_factor: None,
             concrete_class: Default::default(),
             id: MaterialId(0),
             name: "mat".into(),
@@ -435,6 +436,7 @@ fn two_story_wind_model() -> Model {
         shape: None,
     });
     model.materials.push(Material {
+        strength_factor: None,
         concrete_class: Default::default(),
         id: MaterialId(0),
         name: "SN400B".into(),
@@ -799,6 +801,7 @@ fn test_wind_story_geometry_setback_gives_narrower_upper_story_width() {
         shape: None,
     });
     model.materials.push(Material {
+        strength_factor: None,
         concrete_class: Default::default(),
         id: MaterialId(0),
         name: "SN400B".into(),

@@ -176,6 +176,7 @@ fn rc_column_model() -> Model {
         ],
         sections: vec![shape.to_section(SectionId(0), "C600".into())],
         materials: vec![Material {
+            strength_factor: None,
             concrete_class: Default::default(),
             id: MaterialId(0),
             name: "SD345".into(),

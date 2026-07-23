@@ -92,6 +92,7 @@ pub(crate) mod test_support {
 
         // 材料（共通）
         let mat = Material {
+            strength_factor: None,
             concrete_class: Default::default(),
             id: MaterialId(0),
             name: "steel".to_string(),

@@ -106,6 +106,7 @@ fn rc_column_section(id: u32) -> Section {
 
 fn rc_material(id: u32) -> Material {
     Material {
+        strength_factor: None,
         id: MaterialId(id),
         name: "Fc24".to_string(),
         young: 22_700.0,
@@ -120,6 +121,7 @@ fn rc_material(id: u32) -> Material {
 
 fn steel_material(id: u32) -> Material {
     Material {
+        strength_factor: None,
         id: MaterialId(id),
         name: "SN400B".to_string(),
         young: 205_000.0,

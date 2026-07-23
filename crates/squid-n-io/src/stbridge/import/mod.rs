@@ -1067,6 +1067,7 @@ pub fn import_stbridge_with_report(xml: &str) -> Result<(Model, ImportReport), S
     raw_materials.sort_by_key(|m| m.file_id);
     for m in raw_materials {
         model.materials.push(Material {
+            strength_factor: None,
             concrete_class: Default::default(),
             id: MaterialId(material_index[&m.file_id]),
             name: m.name,
@@ -1103,6 +1104,7 @@ pub fn import_stbridge_with_report(xml: &str) -> Result<(Model, ImportReport), S
             if let Some(std) = material_std::resolve_grade(name) {
                 let id = MaterialId(model.materials.len() as u32);
                 model.materials.push(Material {
+                    strength_factor: None,
                     concrete_class: Default::default(),
                     id,
                     name: name.to_string(),

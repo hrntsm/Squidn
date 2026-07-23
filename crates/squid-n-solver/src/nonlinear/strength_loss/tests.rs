@@ -138,6 +138,7 @@ fn portal_frame_model(fy: f64, seismic_weight: f64) -> Model {
         shape: None,
     };
     let mat = Material {
+        strength_factor: None,
         concrete_class: Default::default(),
         id: MaterialId(0),
         name: "steel".to_string(),

@@ -244,6 +244,7 @@ fn aligned_portal_frame() -> squid_n_core::model::Model {
         .push(beam_shape.to_section(SectionId(1), "梁 RC-200x400".into()));
 
     model.materials.push(Material {
+        strength_factor: None,
         concrete_class: Default::default(),
         id: squid_n_core::ids::MaterialId(0),
         name: "FC24".into(),
@@ -903,6 +904,7 @@ fn shear_2dof_model() -> squid_n_core::model::Model {
             shape: None,
         }],
         materials: vec![Material {
+            strength_factor: None,
             concrete_class: Default::default(),
             id: MaterialId(0),
             name: "mat".into(),
@@ -1706,6 +1708,7 @@ fn test_rc_capacity_input_from_rect_matches_handcalc() {
     };
     // 材料名は "FC24"（is_steel が false になる、かつ fc 設定あり）を想定。
     let mat = Material {
+        strength_factor: None,
         concrete_class: Default::default(),
         id: MaterialId(0),
         name: "FC24".into(),
@@ -1848,6 +1851,7 @@ fn test_holding_capacity_rank_auto_rc_rect_from_shape() {
         ],
         sections: vec![rc_shape.to_section(SectionId(0), "RC-400x600".into())],
         materials: vec![Material {
+            strength_factor: None,
             concrete_class: Default::default(),
             id: MaterialId(0),
             name: "FC24".into(),
@@ -2055,6 +2059,7 @@ fn test_rc_sigma_0_from_compression_axial_force() {
         ],
         sections: vec![rc_shape.to_section(SectionId(0), "RC-400x600".into())],
         materials: vec![Material {
+            strength_factor: None,
             concrete_class: Default::default(),
             id: MaterialId(0),
             name: "FC24".into(),
@@ -2194,6 +2199,7 @@ fn test_rc_sigma_0_prefers_gravity_load_case_over_last_static() {
         ],
         sections: vec![rc_shape.to_section(SectionId(0), "RC-400x600".into())],
         materials: vec![Material {
+            strength_factor: None,
             concrete_class: Default::default(),
             id: MaterialId(0),
             name: "FC24".into(),
@@ -3611,6 +3617,7 @@ fn test_compute_ultimate_checks_rc_frame() {
             beam_shape.to_section(SectionId(1), "B400x700".into()),
         ],
         materials: vec![Material {
+            strength_factor: None,
             concrete_class: Default::default(),
             id: MaterialId(0),
             name: "SD345".into(),
@@ -3696,6 +3703,7 @@ fn test_compute_cft_ultimate_checks() {
         ],
         sections: vec![cft_shape.to_section(SectionId(0), "CFT400".into())],
         materials: vec![Material {
+            strength_factor: None,
             concrete_class: Default::default(),
             id: MaterialId(0),
             name: "BCR295".into(),
@@ -3786,6 +3794,7 @@ fn test_sync_gravity_dl_includes_self_weight_and_slab() {
         shape: None,
     });
     model.materials.push(Material {
+        strength_factor: None,
         concrete_class: Default::default(),
         id: MaterialId(0),
         name: "Fc24".into(),
@@ -4141,6 +4150,7 @@ fn test_import_stbridge_then_run_dl_succeeds() {
         .sections
         .push(col_shape.to_section(SectionId(0), "柱".into()));
     model.materials.push(Material {
+        strength_factor: None,
         concrete_class: Default::default(),
         id: MaterialId(0),
         name: "SN400B".into(),
@@ -4333,6 +4343,7 @@ fn test_secondary_joist_panel_slab_dl_cmq_and_solve() {
             shape: None,
         }],
         materials: vec![Material {
+            strength_factor: None,
             concrete_class: Default::default(),
             id: MaterialId(0),
             name: "Fc24".into(),

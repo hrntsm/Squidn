@@ -555,6 +555,7 @@ mod tests {
 
     fn steel_material() -> Material {
         Material {
+            strength_factor: None,
             id: MaterialId(0),
             name: "SN400B".to_string(),
             young: 205_000.0,

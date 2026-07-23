@@ -426,6 +426,7 @@ mod tests {
         ];
         let sections = vec![shape.to_section(SectionId(0), "beam".to_string())];
         let materials = vec![Material {
+            strength_factor: None,
             concrete_class: Default::default(),
             id: MaterialId(0),
             name: "SD345".to_string(),

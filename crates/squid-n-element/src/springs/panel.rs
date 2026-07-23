@@ -384,6 +384,7 @@ mod tests {
             ],
             sections: vec![make_sec(0, 500.0), make_sec(1, 700.0)], // 0: 梁, 1: 柱
             materials: vec![Material {
+                strength_factor: None,
                 concrete_class: Default::default(),
                 id: MaterialId(0),
                 name: String::new(),

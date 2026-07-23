@@ -148,6 +148,7 @@ fn make_frame(nx: usize, ny: usize, nz: usize, n_cases: usize) -> Model {
             shape: None,
         }],
         materials: vec![Material {
+            strength_factor: None,
             concrete_class: Default::default(),
             id: MaterialId(0),
             name: "SN400".into(),

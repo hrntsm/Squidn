@@ -122,6 +122,7 @@ fn sdof_model() -> Model {
             shape: None,
         }],
         materials: vec![Material {
+            strength_factor: None,
             concrete_class: Default::default(),
             id: MaterialId(0),
             name: "mat".into(),
@@ -190,6 +191,7 @@ fn sdof_model_y() -> Model {
             shape: None,
         }],
         materials: vec![Material {
+            strength_factor: None,
             concrete_class: Default::default(),
             id: MaterialId(0),
             name: "mat".into(),
@@ -414,6 +416,7 @@ fn test_2dof_free_vibration_runs() {
             shape: None,
         }],
         materials: vec![Material {
+            strength_factor: None,
             concrete_class: Default::default(),
             id: MaterialId(0),
             name: "mat".into(),
@@ -525,6 +528,7 @@ fn test_2dof_mode_superposition_consistency() {
             shape: None,
         }],
         materials: vec![Material {
+            strength_factor: None,
             concrete_class: Default::default(),
             id: MaterialId(0),
             name: "mat".into(),
@@ -1235,6 +1239,7 @@ fn fiber_column_model(fy: f64) -> Model {
             shape: None,
         }],
         materials: vec![Material {
+            strength_factor: None,
             concrete_class: Default::default(),
             id: MaterialId(0),
             name: "steel".to_string(),

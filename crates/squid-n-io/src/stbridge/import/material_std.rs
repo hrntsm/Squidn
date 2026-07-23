@@ -4,7 +4,11 @@
 //! グレード名の文字列で表す。日本の建築構造材料は法令・JIS で規格化されており、
 //! グレード名が決まれば物性（ヤング係数・ポアソン比・単位体積重量・基準強度）は一意に定まる。
 //! 本モジュールは代表的な規格材のグレード名から [`StdMat`] を返す（未知の名前は `None`）。
+//!
+//! グレード名→強度の対応表は `squid_n_core::material_grade` に一本化されており、
+//! 本モジュールはそれを利用する（鉄筋・鋼材・コンクリートの表を独自に持たない）。
 
+use squid_n_core::material_grade::{parse_concrete_fc, rebar_f_value, steel_f_value_prefix};
 use squid_n_core::section_shape::{concrete_young_modulus, E_STEEL};
 use squid_n_core::units::to_internal::mass_density_from_unit_weight_kn_m3;
 
@@ -25,8 +29,12 @@ const RC_UNIT_WEIGHT_KN_M3: f64 = 24.0;
 /// グレード名から標準材料物性を解決する。認識できない名前は `None`。
 ///
 /// - コンクリート `FcXX`（`Fc21`・`Fc24` 等）→ 圧縮強度 Fc=XX、Ec は RC 規準式で算定。
-/// - 構造用鋼材（`SN400B`・`SS400`・`STKR400`・`SM490` 等）→ E=205000、基準強度 F を降伏点に。
-/// - 鉄筋（`SD295A`・`SD345`・`SD390` 等）→ E=205000、規格降伏点。
+/// - 鉄筋（`SD295A`・`SD345`・`SD390`・`SR235` 等）→ E=205000、規格降伏点。
+/// - 構造用鋼材（`SN400B`・`SS400`・`STKR400`・`SM490` 等）→ E=205000、基準強度 F を降伏点に
+///   （板厚 40mm 以下の値。板厚区分は ST-Bridge の材料テーブルに無いため一律 40mm 以下とみなす）。
+///
+/// 鉄筋（`SD`/`SR`）は鋼材の前方一致より先に判定する（`SD` は鋼材グレード表と
+/// 前方一致しないため順序自体は結果に影響しないが、意図を明示するため維持する）。
 pub(super) fn resolve_grade(name: &str) -> Option<StdMat> {
     let n = name.trim();
     if n.is_empty() {
@@ -41,7 +49,16 @@ pub(super) fn resolve_grade(name: &str) -> Option<StdMat> {
             fy: None,
         });
     }
-    steel_yield_strength(n).map(|fy| StdMat {
+    if let Some(fy) = rebar_f_value(n) {
+        return Some(StdMat {
+            young: E_STEEL,
+            poisson: 0.3,
+            density: mass_density_from_unit_weight_kn_m3(STEEL_UNIT_WEIGHT_KN_M3),
+            fc: None,
+            fy: Some(fy),
+        });
+    }
+    steel_f_value_prefix(n, 40.0).map(|fy| StdMat {
         young: E_STEEL,
         poisson: 0.3,
         density: mass_density_from_unit_weight_kn_m3(STEEL_UNIT_WEIGHT_KN_M3),
@@ -50,49 +67,62 @@ pub(super) fn resolve_grade(name: &str) -> Option<StdMat> {
     })
 }
 
-/// コンクリートのグレード名 `FcXX` から設計基準強度 Fc [N/mm²] を取り出す。
-/// 大文字小文字を問わず `Fc` で始まり、続く数値を Fc とする（`Fc21`→21）。
-fn parse_concrete_fc(name: &str) -> Option<f64> {
-    let rest = name
-        .strip_prefix("Fc")
-        .or_else(|| name.strip_prefix("FC"))
-        .or_else(|| name.strip_prefix("fc"))?;
-    let digits: String = rest
-        .trim()
-        .chars()
-        .take_while(|c| c.is_ascii_digit() || *c == '.')
-        .collect();
-    digits.parse::<f64>().ok().filter(|v| *v > 0.0)
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-/// 構造用鋼材・鉄筋のグレード名から規格降伏点（設計用 F [N/mm²]）を返す。
-/// 代表的な規格材を網羅する（板厚 40mm 以下の基準強度）。未知は `None`。
-fn steel_yield_strength(name: &str) -> Option<f64> {
-    // 鉄筋（異形 SD・丸鋼 SR）は末尾の数値が規格降伏点を表す（SD295A・SD345・SR235 等）。
-    if let Some(rest) = name.strip_prefix("SD").or_else(|| name.strip_prefix("SR")) {
-        let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
-        if let Ok(v) = digits.parse::<f64>() {
-            if v > 0.0 {
-                return Some(v);
-            }
+    /// 接尾辞なし "SN490" は SM520 系（F=355）ではなく 490 N/mm² 級（F=325）に
+    /// 解決されること（core 委譲前は SM520 の腕に誤って一致していた回帰）。
+    #[test]
+    fn test_resolve_grade_sn490_is_325() {
+        let m = resolve_grade("SN490").unwrap();
+        assert_eq!(m.fy, Some(325.0));
+    }
+
+    /// 旧実装で解決できていた代表的なグレード名が、core 委譲後も解決できることを確認する。
+    #[test]
+    fn test_resolve_grade_known_names() {
+        for (name, fy) in [
+            ("SS400", 235.0),
+            ("SN400A", 235.0),
+            ("SN400B", 235.0),
+            ("SN400C", 235.0),
+            ("SM400A", 235.0),
+            ("SM400", 235.0),
+            ("STK400", 235.0),
+            ("STKR400", 235.0),
+            ("STKN400W", 235.0),
+            ("STKN400B", 235.0),
+            ("SSC400", 235.0),
+            ("SWH400", 235.0),
+            ("BCP235", 235.0),
+            ("BCR235", 235.0),
+            ("SS490", 275.0),
+            ("BCR295", 295.0),
+            ("SM490A", 325.0),
+            ("SM490", 325.0),
+            ("SM490YA", 325.0),
+            ("SM490YB", 325.0),
+            ("SN490B", 325.0),
+            ("SN490C", 325.0),
+            ("STK490", 325.0),
+            ("STKR490", 325.0),
+            ("STKN490B", 325.0),
+            ("BCP325", 325.0),
+            ("SM520B", 355.0),
+            ("SM520", 355.0),
+        ] {
+            let m = resolve_grade(name).unwrap_or_else(|| panic!("{name} が解決できませんでした"));
+            assert_eq!(m.fy, Some(fy), "{name}");
         }
     }
-    // 構造用鋼材は規格ごとに F が定まる（板厚 40mm 以下）。
-    let f = match name {
-        // 400 N/mm² 級（F=235）
-        "SS400" | "SN400A" | "SN400B" | "SN400C" | "SM400A" | "SM400B" | "SM400C" | "SM400"
-        | "STK400" | "STKR400" | "STKN400W" | "STKN400B" | "SSC400" | "SWH400" | "BCP235"
-        | "BCR235" => 235.0,
-        // SS490 級（F=275）
-        "SS490" => 275.0,
-        // 冷間成形角形鋼管 BCR295（F=295）
-        "BCR295" => 295.0,
-        // 490 N/mm² 級（F=325）
-        "SM490A" | "SM490B" | "SM490C" | "SM490" | "SM490YA" | "SM490YB" | "SN490B" | "SN490C"
-        | "STK490" | "STKR490" | "STKN490B" | "BCP325" => 325.0,
-        // 520 N/mm² 級（F=355）
-        "SM520B" | "SM520C" | "SM520" | "SN490" => 355.0,
-        _ => return None,
-    };
-    Some(f)
+
+    #[test]
+    fn test_resolve_grade_rebar_and_concrete() {
+        assert_eq!(resolve_grade("SD345").unwrap().fy, Some(345.0));
+        assert_eq!(resolve_grade("SR235").unwrap().fy, Some(235.0));
+        assert_eq!(resolve_grade("Fc24").unwrap().fc, Some(24.0));
+        assert!(resolve_grade("UNKNOWN999").is_none());
+        assert!(resolve_grade("").is_none());
+    }
 }

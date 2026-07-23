@@ -1,0 +1,459 @@
+//! 材料グレード名（`SS400`・`SD345`・`Fc21` 等）から規格値を解決する対応表。
+//!
+//! 鋼材の基準強度 F・鉄筋の基準強度・コンクリート設計基準強度 Fc の
+//! 「名称 → 数値」対応は本モジュールに一本化する（H12 建告第2464号、
+//! JIS 規格、大臣認定品の基準強度）。設計計算（squid-n-design-jp）・
+//! ST-Bridge 取込（squid-n-io）・UI プリセット（squid-n-app）は
+//! いずれも本対応表を参照し、独立の表を持たない。
+//!
+//! - [`steel_f_value`] — 鋼材の基準強度 F（完全一致、板厚区分対応）
+//! - [`steel_f_value_prefix`] — 同（前方一致。`SN490B` → `SN490` 等）
+//! - [`rebar_f_value`] — 鉄筋の基準強度（`SD345` → 345 等）
+//! - [`parse_concrete_fc`] — コンクリート `FcXX` 名称の解釈
+//! - [`material_presets`] — UI に提示する標準材料プリセット一覧
+
+use crate::section_shape::{concrete_young_modulus_gamma, E_STEEL};
+use crate::units::{
+    concrete_unit_weight_kn_m3, to_internal::mass_density_from_unit_weight_kn_m3, ConcreteClass,
+    ConcreteComposition, STEEL_UNIT_WEIGHT_KN_M3,
+};
+
+/// 板厚 2 区分（`t<=40` / `40<t<=100`）の F 値を返す。
+/// 100mm 超は規定が無いため最終区分値をそのまま用いる（非保守的になり得る）。
+fn bucket2(t: f64, le40: f64, gt40: f64) -> f64 {
+    if t <= 40.0 {
+        le40
+    } else {
+        gt40
+    }
+}
+
+/// 板厚 3 区分（`t<=40` / `40<t<=75` / `75<t<=100`）の F 値を返す（SM520 用）。
+fn bucket3(t: f64, le40: f64, le75: f64, gt75: f64) -> f64 {
+    if t <= 40.0 {
+        le40
+    } else if t <= 75.0 {
+        le75
+    } else {
+        gt75
+    }
+}
+
+/// 鋼材グレード一覧（前方一致の探索対象。`SN490B` のような接尾辞付き名称を
+/// 解決するため、[`steel_f_value_prefix`] は最長一致のグレードを選ぶ）。
+pub const STEEL_GRADES: &[&str] = &[
+    // JIS 規格品
+    "SS400", "SS490", "SM400", "SM490", "SM520", "SN400", "SN490", "STK400", "STK490", "STKN400",
+    "STKN490", "STKR400", "STKR490", "SNR400", "SNR490", "SSC400", "SWH400",
+    // 冷間成形角形鋼管（大臣認定品。BCR235 は旧グレードの互換）
+    "BCR235", "BCR295", "BCP235", "BCP325",
+    // 建築構造用 TMCP 鋼材（HBL 等の大臣認定品の一般名。板厚 40mm 超でも F 低減なし）
+    "TMCP325", "TMCP355", "TMCP385", "TMCP440",
+    // 建築構造用高性能 590N/mm² 鋼材・建築構造用低降伏点鋼材
+    "SA440", "LY100", "LY225",
+];
+
+/// 鋼材の基準強度 F [N/mm²]（完全一致、板厚 [mm] 区分対応。H12 建告第2464号ほか）。
+///
+/// JIS 規格品は厚さ 40mm 以下 / 40mm 超 100mm 以下の 2 区分
+/// （SM520 のみ 40/75/100mm の 3 区分）。大臣認定品（BCR/BCP・TMCP・SA440・LY）は
+/// 板厚区分を持たない。100mm を超える板厚は規定が無いため最終区分値を
+/// そのまま用いる（非保守的になり得るため実運用では要確認）。
+///
+/// 戻り値は F 値。長期許容引張・圧縮・曲げ `ft = F/1.5`、
+/// 長期許容せん断 `fs = F/(1.5·√3)`。短期は長期の 1.5 倍（=F, F/√3）。
+pub fn steel_f_value(grade: &str, thickness: f64) -> Option<f64> {
+    match grade {
+        // 400 N/mm² 級（F=235/215）
+        "SS400" | "SM400" | "SN400" | "STK400" | "STKN400" | "STKR400" | "SNR400" | "SSC400"
+        | "SWH400" => Some(bucket2(thickness, 235.0, 215.0)),
+        // SS490（F=275/255）
+        "SS490" => Some(bucket2(thickness, 275.0, 255.0)),
+        // 490 N/mm² 級（F=325/295）
+        "SM490" | "SN490" | "STK490" | "STKN490" | "STKR490" | "SNR490" => {
+            Some(bucket2(thickness, 325.0, 295.0))
+        }
+        // 520 N/mm² 級（F=355/335/325）
+        "SM520" => Some(bucket3(thickness, 355.0, 335.0, 325.0)),
+        // 冷間成形角形鋼管（大臣認定品。板厚区分なし）
+        "BCR295" => Some(295.0),
+        "BCR235" => Some(235.0),
+        "BCP235" => Some(235.0),
+        "BCP325" => Some(325.0),
+        // 建築構造用 TMCP 鋼材（板厚 40mm 超 100mm 以下でも F 低減なし）
+        "TMCP325" => Some(325.0),
+        "TMCP355" => Some(355.0),
+        "TMCP385" => Some(385.0),
+        "TMCP440" => Some(440.0),
+        // 建築構造用高性能 590N/mm² 鋼材
+        "SA440" => Some(440.0),
+        // 建築構造用低降伏点鋼材（基準強度 F: 100N 級=80、225N 級=205）
+        "LY100" => Some(80.0),
+        "LY225" => Some(205.0),
+        _ => None,
+    }
+}
+
+/// 鋼材の基準強度 F [N/mm²]（前方一致、板厚 [mm] 区分対応）。
+///
+/// `SN490B`・`SM490YA` のような JIS 種別記号付きの名称を、
+/// [`STEEL_GRADES`] の最長一致で解決する（`SN490B` は `SN400` ではなく
+/// `SN490` に一致）。未知の名称は `None`。
+pub fn steel_f_value_prefix(name: &str, thickness: f64) -> Option<f64> {
+    STEEL_GRADES
+        .iter()
+        .filter(|g| name.starts_with(*g))
+        .max_by_key(|g| g.len())
+        .and_then(|g| steel_f_value(g, thickness))
+}
+
+/// 保有水平耐力計算（プッシュオーバー）用の材料強度割増係数。
+///
+/// 材料強度の基準強度は表の数値の 1.1 倍以下（JIS 規格品・大臣認定品）、
+/// ただし 590N 級（SA440・TMCP440。HBL®440/G440 等の認定条件）は 1.05 倍以下と
+/// できる規定（H12 建告第2464号の運用・各認定条件）に基づく。
+/// 名称から鋼材グレードを解決できない材料（直接入力材料）は割増しない（1.0）。
+///
+/// 本係数は保有水平耐力計算（プッシュオーバー）の部材耐力算定にのみ用い、
+/// 許容応力度計算（一次設計）には適用しない。
+pub fn steel_material_strength_factor(name: &str) -> f64 {
+    let Some(grade) = STEEL_GRADES
+        .iter()
+        .filter(|g| name.starts_with(*g))
+        .max_by_key(|g| g.len())
+    else {
+        return 1.0;
+    };
+    match *grade {
+        // 590N 級（建築構造用高性能 590N/mm² 鋼材・TMCP 590N 級）は 1.05 倍
+        "SA440" | "TMCP440" => 1.05,
+        _ => 1.1,
+    }
+}
+
+/// 保有水平耐力計算（プッシュオーバー）で、材料の降伏強度 fy を
+/// **鋼材**として用いる文脈（鋼材断面の集中ばね・純鋼材ファイバー・
+/// 曲げヒンジ・せん断降伏閾値）の材料強度割増係数。
+///
+/// 直接入力の割増係数（[`crate::model::Material::strength_factor`]）があれば
+/// それを優先し、無ければ材料名から自動判定する
+/// （[`steel_material_strength_factor`]: 鋼材グレード=1.1、590N 級=1.05、
+/// 名称から解決できない材料=1.0）。
+pub fn material_strength_factor_steel(mat: &crate::model::Material) -> f64 {
+    mat.strength_factor
+        .unwrap_or_else(|| steel_material_strength_factor(&mat.name))
+}
+
+/// 保有水平耐力計算（プッシュオーバー）で、材料の降伏強度 fy を
+/// **RC 主筋**として用いる文脈（RC 断面の集中ばね・主筋ファイバー・
+/// 曲げヒンジ・せん断降伏の主筋 σy）の材料強度割増係数。
+///
+/// 直接入力の割増係数（[`crate::model::Material::strength_factor`]）があれば
+/// それを優先し、無ければ 1.1（鉄筋の材料強度は基準強度の 1.1 倍以下と
+/// できる規定）。fy 未設定で既定値（SD345 相当の 345）を用いる場合にも
+/// 同係数を乗じる。**せん断補強筋は割増対象外**（本係数を用いないこと）。
+pub fn material_strength_factor_rebar(mat: &crate::model::Material) -> f64 {
+    mat.strength_factor.unwrap_or(1.1)
+}
+
+/// 鉄筋の基準強度 [N/mm²]（H12 建告第2464号）。
+///
+/// 異形鉄筋 `SD` ・丸鋼 `SR` は続く数値が基準強度を表す
+/// （`SD295A`・`SD345`・`SR235` 等）。未知の名称は `None`。
+pub fn rebar_f_value(name: &str) -> Option<f64> {
+    let rest = name
+        .strip_prefix("SD")
+        .or_else(|| name.strip_prefix("SR"))?;
+    let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+    digits.parse::<f64>().ok().filter(|v| *v > 0.0)
+}
+
+/// コンクリートのグレード名 `FcXX` から設計基準強度 Fc [N/mm²] を取り出す。
+/// 大文字小文字を問わず `Fc` で始まり、続く数値を Fc とする（`Fc21`→21）。
+pub fn parse_concrete_fc(name: &str) -> Option<f64> {
+    let rest = name
+        .strip_prefix("Fc")
+        .or_else(|| name.strip_prefix("FC"))
+        .or_else(|| name.strip_prefix("fc"))?;
+    let digits: String = rest
+        .trim()
+        .chars()
+        .take_while(|c| c.is_ascii_digit() || *c == '.')
+        .collect();
+    digits.parse::<f64>().ok().filter(|v| *v > 0.0)
+}
+
+/// プリセット材料の区分（UI の分類表示に用いる）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PresetCategory {
+    /// 構造用鋼材
+    Steel,
+    /// 鉄筋
+    Rebar,
+    /// コンクリート
+    Concrete,
+}
+
+impl PresetCategory {
+    /// UI 表示名。
+    pub fn label(&self) -> &'static str {
+        match self {
+            PresetCategory::Steel => "鋼材",
+            PresetCategory::Rebar => "鉄筋",
+            PresetCategory::Concrete => "コンクリート",
+        }
+    }
+}
+
+/// UI に提示する標準材料プリセット（内部単位系 N-mm-s。密度は ton/mm³）。
+#[derive(Clone, Debug, PartialEq)]
+pub struct MaterialPreset {
+    pub name: &'static str,
+    pub category: PresetCategory,
+    /// ヤング係数 E [N/mm²]
+    pub young: f64,
+    /// ポアソン比 ν
+    pub poisson: f64,
+    /// 質量密度 [ton/mm³]
+    pub density: f64,
+    /// コンクリート設計基準強度 Fc [N/mm²]（鋼材・鉄筋は None）
+    pub fc: Option<f64>,
+    /// 基準強度 F（板厚 40mm 以下）／鉄筋降伏点 [N/mm²]（コンクリートは None）
+    pub fy: Option<f64>,
+}
+
+/// UI プリセットとして提示する鋼材グレード（表示順）。
+const PRESET_STEEL: &[&str] = &[
+    "SS400", "SN400", "SM400", "SM490", "SN490", "BCR295", "BCP235", "TMCP325", "TMCP355",
+    "TMCP385", "TMCP440", "SA440", "LY100", "LY225",
+];
+
+/// UI プリセットとして提示する鉄筋グレード（表示順）。
+const PRESET_REBAR: &[&str] = &["SD295", "SD345", "SD390"];
+
+/// UI プリセットとして提示するコンクリート強度（表示順）。
+const PRESET_CONCRETE_FC: &[f64] = &[
+    18.0, 21.0, 24.0, 27.0, 30.0, 33.0, 36.0, 40.0, 42.0, 45.0, 50.0, 55.0, 60.0,
+];
+
+/// プリセットのコンクリート名（`Fc18`〜`Fc60`）。`PRESET_CONCRETE_FC` と同順。
+const PRESET_CONCRETE_NAMES: &[&str] = &[
+    "Fc18", "Fc21", "Fc24", "Fc27", "Fc30", "Fc33", "Fc36", "Fc40", "Fc42", "Fc45", "Fc50", "Fc55",
+    "Fc60",
+];
+
+/// 標準材料プリセット一覧を生成する。
+///
+/// - 鋼材・鉄筋: E=205000、ν=0.3、γs=77 kN/m³（≒7.85 t/m³）。
+///   `fy` は基準強度 F（板厚 40mm 以下）。設計計算では名称から
+///   [`steel_f_value_prefix`] で板厚区分込みの F を再解決する。
+/// - コンクリート: ν=0.2。E は Ec=3.35·10⁴·(γ/24)²·(Fc/60)^(1/3)
+///   （γ は Fc 帯に応じた普通コンクリートの気乾単位体積重量）。
+///   密度は単位体積重量表の γRC（鉄筋込み）から導出する。
+pub fn material_presets() -> Vec<MaterialPreset> {
+    let steel_density = mass_density_from_unit_weight_kn_m3(STEEL_UNIT_WEIGHT_KN_M3);
+    let mut out = Vec::new();
+    for &name in PRESET_STEEL {
+        out.push(MaterialPreset {
+            name,
+            category: PresetCategory::Steel,
+            young: E_STEEL,
+            poisson: 0.3,
+            density: steel_density,
+            fc: None,
+            fy: steel_f_value(name, 0.0),
+        });
+    }
+    for &name in PRESET_REBAR {
+        out.push(MaterialPreset {
+            name,
+            category: PresetCategory::Rebar,
+            young: E_STEEL,
+            poisson: 0.3,
+            density: steel_density,
+            fc: None,
+            fy: rebar_f_value(name),
+        });
+    }
+    for (&fc, &name) in PRESET_CONCRETE_FC.iter().zip(PRESET_CONCRETE_NAMES) {
+        let gamma_c =
+            concrete_unit_weight_kn_m3(fc, ConcreteClass::Normal, ConcreteComposition::Plain);
+        let gamma_rc =
+            concrete_unit_weight_kn_m3(fc, ConcreteClass::Normal, ConcreteComposition::Rc);
+        out.push(MaterialPreset {
+            name,
+            category: PresetCategory::Concrete,
+            young: concrete_young_modulus_gamma(fc, gamma_c),
+            poisson: 0.2,
+            density: mass_density_from_unit_weight_kn_m3(gamma_rc),
+            fc: Some(fc),
+            fy: None,
+        });
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// H12 建告第2464号の基準強度表と一致することを確認する（板厚 40mm 以下）。
+    #[test]
+    fn test_steel_f_value_le40() {
+        for (g, f) in [
+            ("SS400", 235.0),
+            ("SN400", 235.0),
+            ("SM400", 235.0),
+            ("SM490", 325.0),
+            ("SN490", 325.0),
+            ("SM520", 355.0),
+            ("SS490", 275.0),
+            ("BCR295", 295.0),
+            ("BCP235", 235.0),
+            ("BCP325", 325.0),
+            ("TMCP325", 325.0),
+            ("TMCP355", 355.0),
+            ("TMCP385", 385.0),
+            ("TMCP440", 440.0),
+            ("SA440", 440.0),
+            ("LY100", 80.0),
+            ("LY225", 205.0),
+        ] {
+            assert_eq!(steel_f_value(g, 40.0), Some(f), "{g}");
+        }
+    }
+
+    /// 板厚 40mm 超の低減（JIS 規格品）と、TMCP・SA440・LY・BCR/BCP が
+    /// 板厚によらず一定であることを確認する。
+    #[test]
+    fn test_steel_f_value_gt40() {
+        assert_eq!(steel_f_value("SS400", 41.0), Some(215.0));
+        assert_eq!(steel_f_value("SM490", 41.0), Some(295.0));
+        assert_eq!(steel_f_value("SN490", 41.0), Some(295.0));
+        assert_eq!(steel_f_value("SM520", 41.0), Some(335.0));
+        assert_eq!(steel_f_value("SM520", 76.0), Some(325.0));
+        for g in [
+            "TMCP325", "TMCP355", "TMCP385", "TMCP440", "SA440", "BCR295", "LY225",
+        ] {
+            assert_eq!(steel_f_value(g, 41.0), steel_f_value(g, 40.0), "{g}");
+        }
+    }
+
+    /// 前方一致解決: JIS 種別記号付き名称・最長一致を確認する。
+    #[test]
+    fn test_steel_f_value_prefix() {
+        assert_eq!(steel_f_value_prefix("SN490B", 40.0), Some(325.0));
+        assert_eq!(steel_f_value_prefix("SN400C", 40.0), Some(235.0));
+        assert_eq!(steel_f_value_prefix("SM490YA", 40.0), Some(325.0));
+        assert_eq!(steel_f_value_prefix("STKN400W", 40.0), Some(235.0));
+        assert_eq!(steel_f_value_prefix("STKN490B", 40.0), Some(325.0));
+        assert_eq!(steel_f_value_prefix("SNR400A", 40.0), Some(235.0));
+        assert_eq!(steel_f_value_prefix("SNR490B", 40.0), Some(325.0));
+        assert_eq!(steel_f_value_prefix("未知", 40.0), None);
+    }
+
+    /// 材料強度割増係数: 既知鋼材=1.1、590N 級（SA440/TMCP440）=1.05、未知=1.0。
+    #[test]
+    fn test_steel_material_strength_factor() {
+        assert_eq!(steel_material_strength_factor("SS400"), 1.1);
+        assert_eq!(steel_material_strength_factor("SN490B"), 1.1);
+        assert_eq!(steel_material_strength_factor("BCR295"), 1.1);
+        assert_eq!(steel_material_strength_factor("LY225"), 1.1);
+        assert_eq!(steel_material_strength_factor("TMCP385"), 1.1);
+        assert_eq!(steel_material_strength_factor("SA440"), 1.05);
+        assert_eq!(steel_material_strength_factor("TMCP440"), 1.05);
+        assert_eq!(steel_material_strength_factor("未知の材料"), 1.0);
+        assert_eq!(steel_material_strength_factor("SD345"), 1.0);
+    }
+
+    /// 文脈別係数: 直接入力の割増係数が最優先、無ければ鋼材=名称判定・主筋=1.1。
+    #[test]
+    fn test_material_strength_factor_by_context() {
+        let mk = |name: &str, factor: Option<f64>| crate::model::Material {
+            id: crate::ids::MaterialId(0),
+            name: name.to_string(),
+            young: 205000.0,
+            poisson: 0.3,
+            density: 7.85e-9,
+            shear: None,
+            fc: None,
+            fy: None,
+            concrete_class: Default::default(),
+            strength_factor: factor,
+        };
+        // 鋼材文脈: 名称から自動判定。
+        assert_eq!(material_strength_factor_steel(&mk("SS400", None)), 1.1);
+        assert_eq!(material_strength_factor_steel(&mk("SA440", None)), 1.05);
+        assert_eq!(material_strength_factor_steel(&mk("カスタム", None)), 1.0);
+        // 主筋文脈: 名称によらず 1.1。
+        assert_eq!(material_strength_factor_rebar(&mk("Fc24", None)), 1.1);
+        assert_eq!(material_strength_factor_rebar(&mk("SD345", None)), 1.1);
+        // 直接入力の割増係数は両文脈で最優先。
+        assert_eq!(
+            material_strength_factor_steel(&mk("カスタム", Some(1.2))),
+            1.2
+        );
+        assert_eq!(material_strength_factor_rebar(&mk("Fc24", Some(1.0))), 1.0);
+    }
+
+    #[test]
+    fn test_rebar_f_value() {
+        assert_eq!(rebar_f_value("SD295A"), Some(295.0));
+        assert_eq!(rebar_f_value("SD345"), Some(345.0));
+        assert_eq!(rebar_f_value("SD390"), Some(390.0));
+        assert_eq!(rebar_f_value("SR235"), Some(235.0));
+        assert_eq!(rebar_f_value("SS400"), None);
+    }
+
+    #[test]
+    fn test_parse_concrete_fc() {
+        assert_eq!(parse_concrete_fc("Fc21"), Some(21.0));
+        assert_eq!(parse_concrete_fc("FC36"), Some(36.0));
+        assert_eq!(parse_concrete_fc("fc60"), Some(60.0));
+        assert_eq!(parse_concrete_fc("SD345"), None);
+    }
+
+    /// プリセット一覧: 件数・代表値・コンクリートの γ 帯依存を確認する。
+    #[test]
+    fn test_material_presets() {
+        let presets = material_presets();
+        assert_eq!(presets.len(), 14 + 3 + 13);
+        let find = |name: &str| {
+            presets
+                .iter()
+                .find(|p| p.name == name)
+                .unwrap_or_else(|| panic!("preset {name} not found"))
+        };
+
+        let ss400 = find("SS400");
+        assert_eq!(ss400.category, PresetCategory::Steel);
+        assert_eq!(ss400.young, 205000.0);
+        assert_eq!(ss400.fy, Some(235.0));
+
+        let ly100 = find("LY100");
+        assert_eq!(ly100.fy, Some(80.0));
+
+        let sd345 = find("SD345");
+        assert_eq!(sd345.category, PresetCategory::Rebar);
+        assert_eq!(sd345.fy, Some(345.0));
+
+        // コンクリート: Fc≤36 は γ=23、36<Fc≤48 は γ=23.5、48<Fc は γ=24 で Ec を算定。
+        let fc24 = find("Fc24");
+        assert_eq!(fc24.category, PresetCategory::Concrete);
+        assert_eq!(fc24.fc, Some(24.0));
+        let ec24 = 3.35e4 * (23.0f64 / 24.0).powi(2) * (24.0f64 / 60.0).powf(1.0 / 3.0);
+        assert!((fc24.young - ec24).abs() < 1e-9);
+        let fc42 = find("Fc42");
+        let ec42 = 3.35e4 * (23.5f64 / 24.0).powi(2) * (42.0f64 / 60.0).powf(1.0 / 3.0);
+        assert!((fc42.young - ec42).abs() < 1e-9);
+        let fc60 = find("Fc60");
+        let ec60 = 3.35e4 * (60.0f64 / 60.0).powf(1.0 / 3.0);
+        assert!((fc60.young - ec60).abs() < 1e-9);
+
+        // 密度: 鋼は γs=77 kN/m³、コンクリートは γRC（Fc≤36 で 24.0 kN/m³）。
+        let rho_steel = mass_density_from_unit_weight_kn_m3(77.0);
+        assert!((ss400.density - rho_steel).abs() < 1e-18);
+        let rho_rc = mass_density_from_unit_weight_kn_m3(24.0);
+        assert!((fc24.density - rho_rc).abs() < 1e-18);
+    }
+}

@@ -62,6 +62,7 @@ fn simply_supported_udl_midspan_moment() {
             shape: None,
         }],
         materials: vec![Material {
+            strength_factor: None,
             concrete_class: Default::default(),
             id: MaterialId(0),
             name: "m".into(),
@@ -174,6 +175,7 @@ fn ss_beam(l: f64, member: Vec<MemberLoad>) -> Model {
             shape: None,
         }],
         materials: vec![Material {
+            strength_factor: None,
             concrete_class: Default::default(),
             id: MaterialId(0),
             name: "m".into(),
@@ -317,6 +319,7 @@ fn make_axial_cantilever() -> Model {
             shape: None,
         }],
         materials: vec![Material {
+            strength_factor: None,
             concrete_class: Default::default(),
             id: MaterialId(0),
             name: "mat".to_string(),
@@ -483,6 +486,7 @@ fn test_linear_static_vertical_cantilever_bending() {
             shape: None,
         }],
         materials: vec![Material {
+            strength_factor: None,
             concrete_class: Default::default(),
             id: MaterialId(0),
             name: "mat".to_string(),
@@ -579,6 +583,7 @@ fn test_linear_static_shell_element() {
             shape: None,
         }],
         materials: vec![Material {
+            strength_factor: None,
             concrete_class: Default::default(),
             id: MaterialId(0),
             name: "mat".to_string(),
@@ -805,6 +810,7 @@ fn test_shell_membrane_patch_test() {
             shape: None,
         }],
         materials: vec![Material {
+            strength_factor: None,
             concrete_class: Default::default(),
             id: MaterialId(0),
             name: "mat".to_string(),
@@ -897,6 +903,7 @@ fn test_shell_membrane_off_no_diaphragm() {
             shape: None,
         }],
         materials: vec![Material {
+            strength_factor: None,
             concrete_class: Default::default(),
             id: MaterialId(0),
             name: "mat".to_string(),
@@ -1010,6 +1017,7 @@ fn test_shell_rigid_floor_membrane_off() {
             shape: None,
         }],
         materials: vec![Material {
+            strength_factor: None,
             concrete_class: Default::default(),
             id: MaterialId(0),
             name: "mat".to_string(),
@@ -1156,6 +1164,7 @@ fn make_ss_plate(n: usize, a: f64, t: f64, e: f64, nu: f64, q: f64, clamped: boo
             shape: None,
         }],
         materials: vec![Material {
+            strength_factor: None,
             concrete_class: Default::default(),
             id: MaterialId(0),
             name: "m".into(),
@@ -1284,6 +1293,7 @@ fn braced_frame(kind: squid_n_core::model::LoadCaseKind) -> Model {
         shape: None,
     };
     let mat = Material {
+        strength_factor: None,
         concrete_class: Default::default(),
         id: MaterialId(0),
         name: "steel".into(),
@@ -1422,6 +1432,7 @@ fn column_with_parallel_vertical_brace() -> Model {
         shape: None,
     };
     let mat = Material {
+        strength_factor: None,
         concrete_class: Default::default(),
         id: MaterialId(0),
         name: "steel".into(),
@@ -1748,6 +1759,7 @@ fn tension_only_portal(fx: f64, tension_only: bool) -> Model {
         shape: None,
     };
     let mat = Material {
+        strength_factor: None,
         concrete_class: Default::default(),
         id: MaterialId(0),
         name: "steel".into(),

@@ -8,10 +8,16 @@ use super::constants::{GAMMA_CONCRETE, KAPPA_RC};
 /// コンクリート強度 Fc [N/mm²] からヤング係数 Ec [N/mm²] を算定する
 /// （RC 規準の Ec=3.35·10⁴·(γ/24)²·(Fc/60)^(1/3)、γ=23 固定）。
 pub fn concrete_young_modulus(fc: f64) -> f64 {
+    concrete_young_modulus_gamma(fc, GAMMA_CONCRETE)
+}
+
+/// コンクリート強度 Fc [N/mm²]・気乾単位体積重量 γ [kN/m³] から
+/// ヤング係数 Ec [N/mm²] を算定する（RC 規準の Ec=3.35·10⁴·(γ/24)²·(Fc/60)^(1/3)）。
+pub fn concrete_young_modulus_gamma(fc: f64, gamma_kn_m3: f64) -> f64 {
     if fc <= 0.0 {
         return 0.0;
     }
-    3.35e4 * (GAMMA_CONCRETE / 24.0).powi(2) * (fc / 60.0).powf(1.0 / 3.0)
+    3.35e4 * (gamma_kn_m3 / 24.0).powi(2) * (fc / 60.0).powf(1.0 / 3.0)
 }
 
 /// 耐震壁（壁板＋両側柱＝平面 I 形断面）のせん断形状係数

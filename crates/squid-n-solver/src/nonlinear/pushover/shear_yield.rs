@@ -7,6 +7,9 @@
 
 use super::geom::{axial_compression, dot3};
 use super::types::ShearYieldEvent;
+use squid_n_core::material_grade::{
+    material_strength_factor_rebar, material_strength_factor_steel,
+};
 use squid_n_core::model::{ElementData, Material, Model, RigidZone, Section};
 use squid_n_core::rc_capacity::{rc_qsu_simple, RcCapacityInput};
 use squid_n_core::section_shape::{BarSet, RcRebar, SectionShape};
@@ -120,9 +123,13 @@ fn rc_rect_capacity_input(
         d,
         at,
         d_eff,
-        sigma_y: mat.fy.unwrap_or(345.0), // SD345 相当、要・原典照合
+        // SD345 相当、要・原典照合。本モジュールは保有水平耐力計算専用のため、
+        // 主筋の材料強度割増（直接入力係数優先、無ければ一律1.1）を無条件で乗じる。
+        sigma_y: mat.fy.unwrap_or(345.0) * material_strength_factor_rebar(mat),
         fc,
         pw,
+        // せん断補強筋は材料強度割増の対象外（規定上、主筋のみが割増対象）のため、
+        // sigma_wy は割増を適用せず SD295 相当のまま据え置く。
         sigma_wy: 295.0, // SD295 相当、要・原典照合
         clear_span,
         sigma_0: 0.0, // プレースホルダ。DirThreshold::qy が軸力から都度上書きする。
@@ -156,7 +163,11 @@ fn build_dir_threshold(
         return DirThreshold::Static(f64::INFINITY);
     };
     if let Some(fy) = mat.fy {
-        return DirThreshold::Static(as_area * fy / 3.0_f64.sqrt());
+        // 保有水平耐力計算専用のため、鋼材の材料強度割増を無条件で乗じる
+        // （直接入力係数優先、無ければ鋼材グレード名判定=1.1・590N級=1.05）。
+        return DirThreshold::Static(
+            as_area * fy * material_strength_factor_steel(mat) / 3.0_f64.sqrt(),
+        );
     }
     let Some(fc) = mat.fc else {
         return DirThreshold::Static(f64::INFINITY);

@@ -78,6 +78,7 @@
 | 25 | 編集トランザクション（EditCommand/Undo） | squid-n-edit | lib.rs | `test_*` | P3/P8 | ✅ |
 | 26 | 終局検定（塑性 Qsu・付着 Qbu・軸 Nuc/Nut・2軸せん断・接合部 Vju/Qdu・CFT 軸終局+N-M・柱 Mu の ACI） | squid-n-design-jp | ultimate/{rc_shear,rc_axial,joint,cft,cft_nm,rc_column_aci,mod}.rs | `test_rc_shear_qsu_plastic_*`/`test_rc_joint_ultimate_*`/`test_cft_*`/`test_cft_short_column_mu_*`/`test_rc_column_mu_aci_*`/`test_biaxial_*`/`test_collect_*_ultimate_checks_*` | P7 | 🔶 |
 | 27 | 数量積算（部位別のコンクリート・型枠・鉄筋・鉄骨・継手個所） | squid-n-design-jp | quantity/{mod,member,rebar}.rs | `quantity::member::tests::*`（手計算照合）/`quantity::tests::*`（走査・分類）/`summary::tests::test_quantity_csv_from_sample_model`（CSV 一気通貫）/`test_quantity_takeoff_json_column`（MCP） | 横断 | 🔶 |
+| 28 | 材料グレード対応表（F 値・鉄筋・Fc・プリセット） | squid-n-core | material_grade.rs | `material_grade::tests::*`（告示値一致） | 横断 | ✅ |
 
 凡例: ✅ 実装済み・🔶 一部実装（要拡張）・❌ 未実装
 
@@ -108,6 +109,9 @@
 > #13: 断面検定（許容応力度検定）の 参照実装マニュアル照合結果は
 > `dev_docs/v_and_v/断面検定_参照実装照合.md` を参照（対象: rc.rs/steel.rs/src_cft.rs/
 > joint.rs/joint_wiring.rs/combo.rs）。
+> #28: 材料定数・基準強度・許容応力度の材料強度資料（H12 建告第2464号ほか）との照合結果は
+> `dev_docs/v_and_v/材料強度_基準強度照合.md` を参照（TMCP/LY 追加・SN490 取込不整合の修正・
+> 対応表の `squid_n_core::material_grade` への一本化を実施。材料強度 1.1 倍規定等の残課題も同記）。
 > #27: 数量積算（部位別の概算数量集計）の 参照実装マニュアル照合結果は
 > `dev_docs/v_and_v/数量積算_参照実装照合.md` を参照（対象: quantity/{mod,member,rebar}.rs、
 > quantity_view.rs/summary.rs/mcp）。式は手計算照合済みだがモデル制約による残置項目

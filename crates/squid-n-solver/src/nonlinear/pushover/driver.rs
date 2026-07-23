@@ -24,7 +24,7 @@ use smallvec::SmallVec;
 use squid_n_core::dof::DofMap;
 use squid_n_core::model::Model;
 use squid_n_element::behavior::{Ctx, ElementBehavior, LocalVec};
-use squid_n_element::factory::build_nonlinear_behavior;
+use squid_n_element::factory::{build_nonlinear_behavior, StrengthBasis};
 use squid_n_math::solver::{make_solver, SolverBackend};
 
 /// プッシュオーバー解析（P5 §7）
@@ -78,9 +78,12 @@ pub fn pushover_analysis_recording(
         return Err("no active DOF".into());
     }
 
+    // 保有水平耐力計算の材料強度: 部材組み立て時に鋼材 fy・RC 主筋 σy へ
+    // 材料強度係数（鋼材1.1倍/590N級1.05倍/RC主筋1.1倍、直接入力係数優先）を
+    // 都度乗じる（`StrengthBasis::MaterialStrength`）。モデル自体は複製しない。
     let mut behaviors: Vec<Box<dyn ElementBehavior>> = Vec::new();
     for elem in &model.elements {
-        let (b, _) = build_nonlinear_behavior(elem, model);
+        let (b, _) = build_nonlinear_behavior(elem, model, StrengthBasis::MaterialStrength);
         behaviors.push(b);
     }
     // 静的解析: コンクリート履歴は逆行型（本実装の既定）。

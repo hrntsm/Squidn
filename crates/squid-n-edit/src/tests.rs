@@ -783,6 +783,7 @@ fn test_add_delete_material_roundtrip() {
             density: 7.85e-9,
             fc: None,
             fy: Some(235.0),
+            strength_factor: None,
         }),
     );
     assert_eq!(model.materials.len(), 1);
@@ -808,6 +809,7 @@ fn test_delete_material_in_use_is_noop() {
             density: 7.85e-9,
             fc: None,
             fy: Some(235.0),
+            strength_factor: None,
         }),
     );
     model.elements[0].material = Some(MaterialId(0));
@@ -829,6 +831,7 @@ fn test_delete_material_middle_renumbers() {
                 density: 0.0,
                 fc: None,
                 fy: None,
+                strength_factor: None,
             }),
         );
     }
@@ -856,6 +859,7 @@ fn test_set_material_field_roundtrip() {
             density: 2.3e-9,
             fc: Some(21.0),
             fy: None,
+            strength_factor: None,
         }),
     );
     stack.run(
@@ -869,6 +873,44 @@ fn test_set_material_field_roundtrip() {
     assert_eq!(model.materials[0].fc, Some(24.0));
     stack.undo(&mut model);
     assert_eq!(model.materials[0].fc, Some(21.0));
+}
+
+#[test]
+fn test_set_material_strength_factor_roundtrip() {
+    let mut model = empty_model();
+    let mut stack = UndoStack::new();
+    stack.run(
+        &mut model,
+        Box::new(AddMaterial {
+            name: "SA440".into(),
+            young: 205000.0,
+            poisson: 0.3,
+            density: 7.85e-9,
+            fc: None,
+            fy: Some(440.0),
+            strength_factor: None,
+        }),
+    );
+    assert_eq!(model.materials[0].strength_factor, None, "既定は自動判定");
+
+    stack.run(
+        &mut model,
+        Box::new(SetMaterialField {
+            id: MaterialId(0),
+            field: MaterialField::StrengthFactor,
+            value: Some(1.2),
+        }),
+    );
+    assert_eq!(model.materials[0].strength_factor, Some(1.2));
+
+    stack.undo(&mut model);
+    assert_eq!(
+        model.materials[0].strength_factor, None,
+        "取り消しで自動判定に戻る"
+    );
+
+    stack.redo(&mut model);
+    assert_eq!(model.materials[0].strength_factor, Some(1.2));
 }
 
 #[test]

@@ -24,12 +24,15 @@ fn build_gauss_fibers(
     fc: Option<f64>,
     e: f64,
     fy: Option<f64>,
+    steel_factor: f64,
+    rebar_factor: f64,
 ) -> (FiberSection, Vec<Box<dyn UniaxialMaterial>>) {
-    // 基本格子（コンクリート or 鋼材）。
+    // 基本格子（コンクリート or 鋼材）。保有水平耐力計算時は鋼材文脈の材料強度
+    // 割増（steel_factor）を fy に乗じる（時刻歴応答解析等は steel_factor=1.0）。
     let base: Box<dyn UniaxialMaterial> = match fc {
         Some(fc) if fc <= 60.0 => Box::new(squid_n_material::ConcreteNewRc::new(fc, 2.0)),
         Some(fc) => Box::new(squid_n_material::uniaxial::Concrete::new(fc, 2.0)),
-        None => Box::new(Bilinear::new(e, fy.unwrap_or(1e20), 0.01)),
+        None => Box::new(Bilinear::new(e, fy.unwrap_or(1e20) * steel_factor, 0.01)),
     };
     let grid = squid_n_section::fiber::rect_fiber_section(width, depth, nw, nd, 0);
     let mut fibers = grid.fibers;
@@ -37,8 +40,10 @@ fn build_gauss_fibers(
         (0..fibers.len()).map(|_| base.clone_box()).collect();
 
     // RC 断面: 主筋を点ファイバー（バイリニア鋼材、fy 既定 SD345=345）として追加。
+    // 保有水平耐力計算時は主筋の材料強度割増（rebar_factor）を乗じる
+    // （時刻歴応答解析等は rebar_factor=1.0）。
     if fc.is_some() {
-        let rebar_fy = fy.unwrap_or(345.0);
+        let rebar_fy = fy.unwrap_or(345.0) * rebar_factor;
         let rebar_e = 205000.0;
         match shape {
             Some(SectionShape::RcRect { rebar, b, d }) => {
@@ -244,9 +249,15 @@ pub struct FiberBeam {
 }
 
 impl FiberBeam {
+    /// ファイバー梁の生成（材料強度の基準は `basis` で指定する）。
+    /// 時刻歴応答解析など、材料強度割増を伴わない解析用の薄いラッパー。
+    /// ファイバー梁の生成（材料強度の基準 `basis` を明示指定する版）。
+    /// 保有水平耐力計算（プッシュオーバー）は
+    /// `StrengthBasis::MaterialStrength` を渡す。
     pub fn new(
         data: &squid_n_core::model::ElementData,
         model: &squid_n_core::model::Model,
+        basis: crate::factory::StrengthBasis,
     ) -> Self {
         let n0 = &model.nodes[data.nodes[0].index()];
         let n1 = &model.nodes[data.nodes[1].index()];
@@ -294,9 +305,35 @@ impl FiberBeam {
         let shape = sec.and_then(|s| s.shape.as_ref());
         let fc = mat_ref.and_then(|m| m.fc);
         let fy = mat_ref.and_then(|m| m.fy);
+        // 保有水平耐力計算（basis==MaterialStrength）時のみ材料強度割増を適用する
+        // （鋼材文脈・RC 主筋文脈で係数が異なる。せん断補強筋は割増対象外）。
+        let steel_factor = basis.steel_factor(mat_ref);
+        let rebar_factor = basis.rebar_factor(mat_ref);
         // RC 断面はコンクリート格子＋主筋分離（構造力学のファイバーモデル）。
-        let (sec_a, mats_a) = build_gauss_fibers(width, depth, nw, nd, shape, fc, e, fy);
-        let (sec_b, mats_b) = build_gauss_fibers(width, depth, nw, nd, shape, fc, e, fy);
+        let (sec_a, mats_a) = build_gauss_fibers(
+            width,
+            depth,
+            nw,
+            nd,
+            shape,
+            fc,
+            e,
+            fy,
+            steel_factor,
+            rebar_factor,
+        );
+        let (sec_b, mats_b) = build_gauss_fibers(
+            width,
+            depth,
+            nw,
+            nd,
+            shape,
+            fc,
+            e,
+            fy,
+            steel_factor,
+            rebar_factor,
+        );
         let gauss_points = vec![
             GaussPoint::new(-0.5773502691896257, 1.0, sec_a, mats_a),
             GaussPoint::new(0.5773502691896257, 1.0, sec_b, mats_b),
@@ -377,24 +414,30 @@ impl FiberBeam {
     /// ファイバーモデル化）。端部の塑性化領域（長さ `lp`）にファイバー断面を
     /// 配置（積分点 ξ=∓1、重み Lp）し、中央 [Lp, L−Lp] は断面諸元
     /// （EA・EIy・EIz）による弾性剛性として厳密に B 積分する。
+    /// 塑性化域考慮のファイバー要素の生成（材料強度の基準 `basis` を明示指定する版）。
     pub fn with_plastic_zone(
         data: &squid_n_core::model::ElementData,
         model: &squid_n_core::model::Model,
         lp: f64,
+        basis: crate::factory::StrengthBasis,
     ) -> Self {
-        Self::build_plastic_zone(data, model, lp, 12, 20)
+        Self::build_plastic_zone(data, model, lp, 12, 20, basis)
     }
 
-    /// 塑性化域考慮要素の実体。`nw × nd` は端部断面のファイバ分割数
+    /// 塑性化域考慮要素の実体。
+    /// `nw × nd` は端部断面のファイバ分割数
     /// （マルチファイバー: 12×20、マルチスプリング: 2×5 の粗い配置）。
+    /// 塑性化域考慮要素の実体（材料強度の基準 `basis` を明示指定する版）。
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn build_plastic_zone(
         data: &squid_n_core::model::ElementData,
         model: &squid_n_core::model::Model,
         lp: f64,
         nw: usize,
         nd: usize,
+        basis: crate::factory::StrengthBasis,
     ) -> Self {
-        let mut fb = Self::new(data, model);
+        let mut fb = Self::new(data, model, basis);
         let l = fb.length;
         if l <= 0.0 {
             return fb;
@@ -421,9 +464,34 @@ impl FiberBeam {
         let shape = sec.and_then(|s| s.shape.as_ref());
         let fc = mat_ref.and_then(|m| m.fc);
         let fy = mat_ref.and_then(|m| m.fy);
+        // 保有水平耐力計算（basis==MaterialStrength）時のみ材料強度割増を適用する。
+        let steel_factor = basis.steel_factor(mat_ref);
+        let rebar_factor = basis.rebar_factor(mat_ref);
         // RC 断面はコンクリート格子＋主筋分離（構造力学のファイバーモデル）。
-        let (sec_a, mats_a) = build_gauss_fibers(width, depth, nw, nd, shape, fc, e, fy);
-        let (sec_b, mats_b) = build_gauss_fibers(width, depth, nw, nd, shape, fc, e, fy);
+        let (sec_a, mats_a) = build_gauss_fibers(
+            width,
+            depth,
+            nw,
+            nd,
+            shape,
+            fc,
+            e,
+            fy,
+            steel_factor,
+            rebar_factor,
+        );
+        let (sec_b, mats_b) = build_gauss_fibers(
+            width,
+            depth,
+            nw,
+            nd,
+            shape,
+            fc,
+            e,
+            fy,
+            steel_factor,
+            rebar_factor,
+        );
         fb.gauss_points = vec![
             GaussPoint::new(-1.0, w_end, sec_a, mats_a),
             GaussPoint::new(1.0, w_end, sec_b, mats_b),

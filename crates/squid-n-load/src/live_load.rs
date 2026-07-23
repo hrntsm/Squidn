@@ -135,6 +135,7 @@ mod tests {
             shape: None,
         });
         model.materials.push(Material {
+            strength_factor: None,
             concrete_class: Default::default(),
             id: MaterialId(0),
             name: "Fc24".into(),

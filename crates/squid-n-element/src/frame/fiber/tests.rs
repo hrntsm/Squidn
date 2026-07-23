@@ -1,5 +1,6 @@
 use super::*;
 use crate::behavior::Ctx;
+use crate::factory::StrengthBasis;
 use approx::assert_relative_eq;
 use squid_n_core::ids::{ElemId, MaterialId, NodeId, SectionId};
 use squid_n_core::model::{
@@ -8,7 +9,7 @@ use squid_n_core::model::{
 
 fn make_test_fiber_beam(shear_mod: Option<f64>) -> FiberBeam {
     let model = build_test_model(shear_mod);
-    FiberBeam::new(&model.elements[0], &model)
+    FiberBeam::new(&model.elements[0], &model, StrengthBasis::Nominal)
 }
 
 fn make_test_beam_element(as_val: f64) -> crate::beam::BeamElement {
@@ -90,6 +91,7 @@ fn build_test_model(shear_mod: Option<f64>) -> Model {
             shape: None,
         }],
         materials: vec![Material {
+            strength_factor: None,
             concrete_class: Default::default(),
             id: MaterialId(0),
             name: "steel".to_string(),
@@ -154,6 +156,7 @@ fn make_oriented_fiber(p0: [f64; 3], p1: [f64; 3], ref_vec: [f64; 3]) -> FiberBe
             shape: None,
         }],
         materials: vec![Material {
+            strength_factor: None,
             concrete_class: Default::default(),
             id: MaterialId(0),
             name: "steel".to_string(),
@@ -166,7 +169,7 @@ fn make_oriented_fiber(p0: [f64; 3], p1: [f64; 3], ref_vec: [f64; 3]) -> FiberBe
         }],
         ..Default::default()
     };
-    FiberBeam::new(&model.elements[0], &model)
+    FiberBeam::new(&model.elements[0], &model, StrengthBasis::Nominal)
 }
 
 /// 降伏応力 fy を指定した鋼材ファイバ梁（X 整列・恒等フレーム）を生成するヘルパ。
@@ -219,6 +222,7 @@ fn make_steel_fiber_with_fy(fy: Option<f64>) -> FiberBeam {
             shape: None,
         }],
         materials: vec![Material {
+            strength_factor: None,
             concrete_class: Default::default(),
             id: MaterialId(0),
             name: "steel".to_string(),
@@ -231,7 +235,7 @@ fn make_steel_fiber_with_fy(fy: Option<f64>) -> FiberBeam {
         }],
         ..Default::default()
     };
-    FiberBeam::new(&model.elements[0], &model)
+    FiberBeam::new(&model.elements[0], &model, StrengthBasis::Nominal)
 }
 
 /// ねじり剛性テスト用の FiberBeam を生成する。
@@ -239,7 +243,7 @@ fn make_steel_fiber_with_fy(fy: Option<f64>) -> FiberBeam {
 fn make_torsion_fiber_beam(g: f64, j: f64) -> FiberBeam {
     let mut model = build_test_model(Some(g));
     model.sections[0].j = j;
-    FiberBeam::new(&model.elements[0], &model)
+    FiberBeam::new(&model.elements[0], &model, StrengthBasis::Nominal)
 }
 
 /// 降伏データ検証: Material.fy を与えた鋼材ファイバは、同一の大曲率変形に対して
@@ -555,6 +559,7 @@ fn test_yield_progression() {
                 shape: None,
             }],
             materials: vec![Material {
+                strength_factor: None,
                 concrete_class: Default::default(),
                 id: MaterialId(0),
                 name: "steel".to_string(),
@@ -569,7 +574,7 @@ fn test_yield_progression() {
             }],
             ..Default::default()
         };
-        FiberBeam::new(&model.elements[0], &model)
+        FiberBeam::new(&model.elements[0], &model, StrengthBasis::Nominal)
     };
 
     let ctx = Ctx {
@@ -894,6 +899,7 @@ fn test_vertical_column_rz_nonsingular() {
             shape: None,
         }],
         materials: vec![Material {
+            strength_factor: None,
             concrete_class: Default::default(),
             id: MaterialId(0),
             name: "steel".to_string(),
@@ -907,7 +913,7 @@ fn test_vertical_column_rz_nonsingular() {
         ..Default::default()
     };
 
-    let mut fiber = FiberBeam::new(&model.elements[0], &model);
+    let mut fiber = FiberBeam::new(&model.elements[0], &model, StrengthBasis::Nominal);
     let ctx = Ctx {
         model: &Model::default(),
     };
@@ -953,7 +959,7 @@ fn test_fiber_rigid_rotation_produces_no_force() {
     model.sections[0].iy = 5.2083333e9;
     model.sections[0].iz = 5.2083333e9;
 
-    let mut fiber = FiberBeam::new(&model.elements[0], &model);
+    let mut fiber = FiberBeam::new(&model.elements[0], &model, StrengthBasis::Nominal);
     let ctx = Ctx { model: &model };
 
     let theta = 1.0e-4;
@@ -1004,7 +1010,7 @@ fn test_fiber_initial_lateral_stiffness_matches_timoshenko_theory() {
     model.sections[0].iy = 5.2083333e9;
     model.sections[0].iz = 5.2083333e9;
 
-    let mut fiber = FiberBeam::new(&model.elements[0], &model);
+    let mut fiber = FiberBeam::new(&model.elements[0], &model, StrengthBasis::Nominal);
     let ctx = Ctx { model: &model };
     let zero = LocalVec {
         data: SmallVec::from_elem(0.0, 12),
@@ -1070,7 +1076,7 @@ fn test_fiber_elastic_stiffness_matches_timoshenko_beam_element() {
     model.sections[0].as_y = as_z_elem;
     model.sections[0].j = j;
 
-    let mut fiber = FiberBeam::new(&model.elements[0], &model);
+    let mut fiber = FiberBeam::new(&model.elements[0], &model, StrengthBasis::Nominal);
     let ctx = Ctx { model: &model };
     let zero = LocalVec {
         data: SmallVec::from_elem(0.0, 12),
@@ -1130,7 +1136,8 @@ fn test_plastic_zone_phi_positive_timoshenko_behavior() {
     model.elements[0].plastic_zone = Some(250.0);
     let ctx = Ctx { model: &model };
     let state = ElemState::default();
-    let build = || FiberBeam::with_plastic_zone(&model.elements[0], &model, 250.0);
+    let build =
+        || FiberBeam::with_plastic_zone(&model.elements[0], &model, 250.0, StrengthBasis::Nominal);
 
     // (1) 剛体回転の客観性
     let theta = 1.0e-4;
@@ -1236,7 +1243,7 @@ fn test_fiber_tangent_consistent_with_internal_force() {
         0.1, 0.2, -0.1, 0.0005, 0.001, -0.0005, -0.05, 0.15, 0.1, -0.0005, 0.0008, 0.0002,
     ];
 
-    let mut b0 = FiberBeam::new(&model.elements[0], &model);
+    let mut b0 = FiberBeam::new(&model.elements[0], &model, StrengthBasis::Nominal);
     b0.update_state(
         &LocalVec {
             data: SmallVec::from_slice(&u0),
@@ -1254,7 +1261,7 @@ fn test_fiber_tangent_consistent_with_internal_force() {
     for j in 0..12 {
         let mut up = u0;
         up[j] += h;
-        let mut bp = FiberBeam::new(&model.elements[0], &model);
+        let mut bp = FiberBeam::new(&model.elements[0], &model, StrengthBasis::Nominal);
         bp.update_state(
             &LocalVec {
                 data: SmallVec::from_slice(&up),
@@ -1312,7 +1319,7 @@ fn make_plastic_zone_fiber(lp: f64, fy: Option<f64>) -> FiberBeam {
     let mut model = build_test_model(Some(0.0));
     model.elements[0].plastic_zone = Some(lp);
     model.materials[0].fy = fy;
-    FiberBeam::with_plastic_zone(&model.elements[0], &model, lp)
+    FiberBeam::with_plastic_zone(&model.elements[0], &model, lp, StrengthBasis::Nominal)
 }
 
 #[test]
@@ -1334,7 +1341,7 @@ fn test_plastic_zone_elastic_stiffness_close_to_full_fiber() {
     // Lp = L/20 なら数%以内に収まる。
     let model = build_test_model(Some(0.0));
     let ctx = Ctx { model: &model };
-    let full = FiberBeam::new(&model.elements[0], &model);
+    let full = FiberBeam::new(&model.elements[0], &model, StrengthBasis::Nominal);
     let k_full = full.tangent_stiffness(&ElemState::default(), &ctx);
 
     let pz = make_plastic_zone_fiber(150.0, None); // Lp = L/20
@@ -1483,6 +1490,7 @@ fn test_rc_fiber_section_includes_separated_rebar() {
         }],
         sections: vec![sec],
         materials: vec![Material {
+            strength_factor: None,
             concrete_class: Default::default(),
             id: MaterialId(0),
             name: "FC30".into(),
@@ -1495,7 +1503,7 @@ fn test_rc_fiber_section_includes_separated_rebar() {
         }],
         ..Default::default()
     };
-    let fb = FiberBeam::new(&model.elements[0], &model);
+    let fb = FiberBeam::new(&model.elements[0], &model, StrengthBasis::Nominal);
     let gp = &fb.gauss_points[0];
     // コンクリート格子 12×20=240 に主筋（main_x 4×上下2=8 + main_y 4×側面2=8 = 16 本）が加算。
     assert!(

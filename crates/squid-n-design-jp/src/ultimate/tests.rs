@@ -48,6 +48,7 @@ fn rc_rect_section(id: u32, b: f64, d: f64, main_dia: f64, main_count: u32, pitc
 
 fn material() -> Material {
     Material {
+        strength_factor: None,
         concrete_class: Default::default(),
         id: MaterialId(0),
         name: "SD345".to_string(),
@@ -499,6 +500,7 @@ fn test_collect_cft_ultimate_checks() {
         shape: Some(cft_shape),
     };
     let mat = Material {
+        strength_factor: None,
         concrete_class: Default::default(),
         id: MaterialId(0),
         name: "BCR295".to_string(),

@@ -12,6 +12,7 @@ use squid_n_core::section_shape::SectionShape;
 /// 標準グレード名 `SN400B` の材料（物性は `material_std` の標準表と一致させる）。
 fn sn400b(id: u32) -> Material {
     Material {
+        strength_factor: None,
         concrete_class: Default::default(),
         id: MaterialId(id),
         name: "SN400B".into(),
@@ -303,6 +304,7 @@ fn frame_nodes() -> Model {
         });
     }
     m.materials.push(Material {
+        strength_factor: None,
         concrete_class: Default::default(),
         id: MaterialId(0),
         name: "SN400B".into(),
@@ -1996,6 +1998,7 @@ fn test_member_inherits_section_grade_material() {
 fn test_shared_section_role_material() {
     let mut m = frame_nodes();
     m.materials.push(Material {
+        strength_factor: None,
         concrete_class: Default::default(),
         id: MaterialId(1),
         name: "SN490B".into(),

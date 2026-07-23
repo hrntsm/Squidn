@@ -8,6 +8,7 @@ use squid_n_core::section_shape::{BarSet, RcRebar, SectionShape, ShearBar};
 
 pub(crate) fn make_material(fc: f64, grade: &str) -> Material {
     Material {
+        strength_factor: None,
         concrete_class: Default::default(),
         id: MaterialId(0),
         name: grade.to_string(),
@@ -22,6 +23,7 @@ pub(crate) fn make_material(fc: f64, grade: &str) -> Material {
 
 pub(crate) fn make_material_no_fc(grade: &str) -> Material {
     Material {
+        strength_factor: None,
         concrete_class: Default::default(),
         id: MaterialId(0),
         name: grade.to_string(),

@@ -47,6 +47,7 @@ fn two_story_model() -> Model {
         shape: None,
     });
     model.materials.push(Material {
+        strength_factor: None,
         concrete_class: Default::default(),
         id: MaterialId(0),
         name: "SN400B".into(),
@@ -306,6 +307,7 @@ fn single_beam_model(
         shape: None,
     });
     model.materials.push(Material {
+        strength_factor: None,
         concrete_class: Default::default(),
         id: MaterialId(0),
         name: "M".into(),
@@ -527,6 +529,7 @@ fn test_face_reduction_applies_to_horizontal_concrete_beam() {
         shape: None,
     });
     model.materials.push(Material {
+        strength_factor: None,
         concrete_class: Default::default(),
         id: MaterialId(0),
         name: "Fc24".into(),
@@ -677,6 +680,7 @@ fn wall_model() -> Model {
         shape: None,
     });
     model.materials.push(Material {
+        strength_factor: None,
         concrete_class: Default::default(),
         id: MaterialId(0),
         name: "Fc24".into(),
@@ -1006,6 +1010,7 @@ fn test_misc_wall_column_transfer_splits_to_column_ends() {
         shape: None,
     });
     model.materials.push(Material {
+        strength_factor: None,
         concrete_class: Default::default(),
         id: MaterialId(0),
         name: "Fc24".into(),
@@ -1176,6 +1181,7 @@ fn test_finish_area_weight_beam_perimeter_three_side() {
         shape: None,
     });
     model.materials.push(Material {
+        strength_factor: None,
         concrete_class: Default::default(),
         id: MaterialId(0),
         name: "S".into(),
@@ -1277,6 +1283,7 @@ fn test_base_column_without_lower_column_adds_max_beam_depth() {
         shape: None,
     });
     model.materials.push(Material {
+        strength_factor: None,
         concrete_class: Default::default(),
         id: MaterialId(0),
         name: "Fc24".into(),
@@ -1405,6 +1412,7 @@ fn test_base_column_with_lower_column_does_not_add_beam_depth() {
         shape: None,
     });
     model.materials.push(Material {
+        strength_factor: None,
         concrete_class: Default::default(),
         id: MaterialId(0),
         name: "Fc24".into(),
@@ -1552,6 +1560,7 @@ fn k_brace_model(rule: KBraceWeightRule) -> Model {
         shape: None,
     });
     model.materials.push(Material {
+        strength_factor: None,
         concrete_class: Default::default(),
         id: MaterialId(0),
         name: "S".into(),

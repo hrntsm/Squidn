@@ -13,11 +13,16 @@ use squid_n_material::uniaxial::{Bilinear, UniaxialMaterial};
 use squid_n_material::{HysteresisMaterial, HysteresisRule, SteelBuckling, TsujiYamada};
 
 use super::regime::is_vertical_member;
+use super::StrengthBasis;
 
 /// ファイバー梁の生成。既定で塑性化域考慮モデル（端部 Lp 区間にファイバー断面、
 /// 中央弾性）とし、Lp は `plastic_zone` 指定値、未指定なら断面せいの 0.5 倍
 /// （MS 要素と同じ既定。0.5D は既往検討で標準的に用いられる値）。
-pub(super) fn build_fiber(data: &ElementData, model: &Model) -> crate::fiber::FiberBeam {
+pub(super) fn build_fiber(
+    data: &ElementData,
+    model: &Model,
+    basis: StrengthBasis,
+) -> crate::fiber::FiberBeam {
     let depth = data
         .section
         .and_then(|sid| model.sections.get(sid.index()))
@@ -25,14 +30,14 @@ pub(super) fn build_fiber(data: &ElementData, model: &Model) -> crate::fiber::Fi
         .filter(|d| *d > 0.0)
         .unwrap_or(200.0);
     let lp = data.plastic_zone.unwrap_or(0.5 * depth);
-    crate::fiber::FiberBeam::with_plastic_zone(data, model, lp)
+    crate::fiber::FiberBeam::with_plastic_zone(data, model, lp, basis)
 }
 
 /// 部材の曲げ終局（降伏）モーメント My [N·mm]（技術基準解説書の曲げ終局強度）。
 /// RC=0.9·at·σy·j（[`squid_n_core::rc_capacity::rc_mu_simple`]）、鉄骨=Zp·σy（全塑性 Mp）、
 /// それ以外（複合断面・形状不明）は σy·Z弾性でフォールバックする。
 /// 従来の材端バネは σy·Z弾性を用いていたが、規準の曲げ終局強度へ改良する。
-fn flexural_yield_moment(data: &ElementData, model: &Model) -> f64 {
+fn flexural_yield_moment(data: &ElementData, model: &Model, basis: StrengthBasis) -> f64 {
     use squid_n_core::section_shape::SectionShape;
     let sec = data.section.and_then(|sid| model.sections.get(sid.index()));
     let mat = data
@@ -44,7 +49,9 @@ fn flexural_yield_moment(data: &ElementData, model: &Model) -> f64 {
     let fy = mat.and_then(|m| m.fy);
     match sec.and_then(|s| s.shape.as_ref()) {
         Some(SectionShape::RcRect { rebar, d, .. }) | Some(SectionShape::RcCircle { rebar, d }) => {
-            let sy = fy.unwrap_or(345.0);
+            // RC 主筋: 保有水平耐力計算では σy に主筋の材料強度係数を乗じる
+            // （せん断補強筋は対象外。本分岐は曲げ主筋のみを扱う）。
+            let sy = fy.unwrap_or(345.0) * basis.rebar_factor(mat);
             let fc = mat.and_then(|m| m.fc).unwrap_or(0.0);
             let at = squid_n_core::section_shape::bar_set_area(&rebar.main_x) / 2.0;
             let d_eff = (d - rebar.cover - rebar.main_x.dia / 2.0).max(0.0);
@@ -69,25 +76,32 @@ fn flexural_yield_moment(data: &ElementData, model: &Model) -> f64 {
             }
         }
         Some(shape) => {
-            let sy = fy.unwrap_or(235.0);
+            // 鋼材: 保有水平耐力計算では σy に鋼材の材料強度係数を乗じる。
+            let sy = fy.unwrap_or(235.0) * basis.steel_factor(mat);
             match shape.plastic_modulus_strong() {
                 Some(zp) => sy * zp,
                 None => sy * ze,
             }
         }
-        None => fy.unwrap_or(235.0) * ze,
+        // 複合断面・形状不明: 鋼材文脈として扱う。
+        None => fy.unwrap_or(235.0) * basis.steel_factor(mat) * ze,
     }
 }
 
 /// 集中バネの降伏モーメント My0 と軸許容耐力 N許容 = σy·A（MN 相関用）。
-pub(super) fn yield_moment_and_axial(data: &ElementData, model: &Model) -> (f64, f64) {
+pub(super) fn yield_moment_and_axial(
+    data: &ElementData,
+    model: &Model,
+    basis: StrengthBasis,
+) -> (f64, f64) {
     let sec = data.section.and_then(|sid| model.sections.get(sid.index()));
     let mat = data
         .material
         .and_then(|mid| model.materials.get(mid.index()));
-    let fy_sigma = mat.and_then(|m| m.fy).unwrap_or(235.0);
+    // 軸許容耐力の σy も鋼材文脈（集中ばね梁は鋼材の N-M 相関を想定）。
+    let fy_sigma = mat.and_then(|m| m.fy).unwrap_or(235.0) * basis.steel_factor(mat);
     let area = sec.map(|s| s.area).unwrap_or(1.0e4);
-    (flexural_yield_moment(data, model), fy_sigma * area)
+    (flexural_yield_moment(data, model, basis), fy_sigma * area)
 }
 
 /// 部材の可撓長さ [mm]（= 節点間長 − 両端剛域長。剛域控除後が非正なら全長）。
@@ -108,7 +122,7 @@ fn flexible_length(data: &ElementData, model: &Model) -> f64 {
 
 /// 材端曲げバネの初期回転剛性 k_rot [N·mm/rad] と降伏モーメント My [N·mm]。
 /// k_rot は可とう長 L'（= L − 剛域長。§6.2.1）基準で評価する。
-fn rotational_spring_params(data: &ElementData, model: &Model) -> (f64, f64) {
+fn rotational_spring_params(data: &ElementData, model: &Model, basis: StrengthBasis) -> (f64, f64) {
     let sec = data.section.and_then(|sid| model.sections.get(sid.index()));
     let mat = data
         .material
@@ -116,7 +130,7 @@ fn rotational_spring_params(data: &ElementData, model: &Model) -> (f64, f64) {
     let e = mat.map(|m| m.young).unwrap_or(205000.0);
     let iz = sec.map(|s| s.iz.max(s.iy)).unwrap_or(1.0e6);
     // 材端バネの降伏モーメントは規準の曲げ終局強度（RC=0.9·at·σy·d、鉄骨=Zp·σy）を用いる。
-    let my = flexural_yield_moment(data, model);
+    let my = flexural_yield_moment(data, model, basis);
 
     let l_eff = flexible_length(data, model);
     let k_rot = if l_eff > 0.0 {
@@ -130,8 +144,9 @@ fn rotational_spring_params(data: &ElementData, model: &Model) -> (f64, f64) {
 pub(super) fn build_rotational_springs(
     data: &ElementData,
     model: &Model,
+    basis: StrengthBasis,
 ) -> (Box<dyn UniaxialMaterial>, Box<dyn UniaxialMaterial>) {
-    let (k_rot, my) = rotational_spring_params(data, model);
+    let (k_rot, my) = rotational_spring_params(data, model, basis);
     let spring_i = Box::new(Bilinear::new(k_rot, my, 0.01));
     let spring_j = Box::new(Bilinear::new(k_rot, my, 0.01));
     (spring_i, spring_j)
@@ -241,8 +256,9 @@ pub(super) fn build_flexural_springs(
     data: &ElementData,
     model: &Model,
     rule: HysteresisModel,
+    basis: StrengthBasis,
 ) -> (Box<dyn UniaxialMaterial>, Box<dyn UniaxialMaterial>, bool) {
-    let (k_rot, my) = rotational_spring_params(data, model);
+    let (k_rot, my) = rotational_spring_params(data, model, basis);
     // 標準型・降伏モーメント不定は従来の kinematic バイリニア（＝標準型相当）。
     if my <= 0.0 || k_rot <= 0.0 || rule == HysteresisModel::Standard {
         let my = my.max(1.0);

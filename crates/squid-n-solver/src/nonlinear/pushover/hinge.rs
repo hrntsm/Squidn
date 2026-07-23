@@ -5,6 +5,9 @@
 //! - [`track_hinges`] — 各ステップのヒンジ発生・レベルを判定し記録
 
 use super::types::{HingeEvent, HingeLevel};
+use squid_n_core::material_grade::{
+    material_strength_factor_rebar, material_strength_factor_steel,
+};
 use squid_n_core::model::{ElementData, Model};
 use squid_n_core::rc_capacity::{rc_mu_simple, RcCapacityInput};
 use squid_n_core::section_shape::{bar_set_area, SectionShape};
@@ -20,9 +23,9 @@ const ULTIMATE_DUCTILITY: f64 = 4.0;
 /// RC はひび割れ Mc=κ·Fc·Ze・降伏 My、鉄骨は全塑性 Mp（Mc=My）。
 pub(crate) struct HingeThreshold {
     /// 曲げひび割れモーメント Mc [N·mm]（RC のみ有意。鉄骨は My と同値）。
-    mc: f64,
+    pub(crate) mc: f64,
     /// 曲げ降伏モーメント My [N·mm]。
-    my: f64,
+    pub(crate) my: f64,
 }
 
 /// 鉄骨系の断面形状か。
@@ -42,6 +45,11 @@ fn is_steel_shape(shape: &SectionShape) -> bool {
 /// RC: Mc=κ·√Fc·Ze（κ=0.56、技術基準解説書 P.621-623）・My=0.9·at·σy·d（同 P.623）。
 /// 鉄骨: Mp=Zp·σy（Mc=My）。
 /// 複合断面・形状不明は σy·Ze を降伏とする改良簡易値でフォールバックする。
+///
+/// 本モジュールは保有水平耐力計算（プッシュオーバー）専用のため、降伏応力
+/// σy には無条件で材料強度割増（鋼材=`material_strength_factor_steel`、
+/// RC 主筋=`material_strength_factor_rebar`。直接入力係数優先、無ければ
+/// 鋼材グレード名判定=1.1/590N級=1.05、主筋=一律1.1）を適用する。
 fn member_moment_thresholds(elem: &ElementData, model: &Model) -> HingeThreshold {
     let Some(sec) = elem.section.and_then(|sid| model.sections.get(sid.index())) else {
         return HingeThreshold { mc: 0.0, my: 0.0 };
@@ -57,7 +65,9 @@ fn member_moment_thresholds(elem: &ElementData, model: &Model) -> HingeThreshold
         0.0
     };
     // 降伏応力は部材材料の fy を優先。未設定なら鋼材既定 235 N/mm²（SN400 級）。
-    let sigma_y_steel = mat.and_then(|m| m.fy).unwrap_or(235.0);
+    // 保有水平耐力計算のため材料強度割増を乗じる（mat が無ければ係数 1.0）。
+    let sigma_y_steel = mat.and_then(|m| m.fy).unwrap_or(235.0)
+        * mat.map(material_strength_factor_steel).unwrap_or(1.0);
 
     match &sec.shape {
         Some(SectionShape::RcRect { rebar, d, .. }) | Some(SectionShape::RcCircle { rebar, d }) => {
@@ -65,7 +75,9 @@ fn member_moment_thresholds(elem: &ElementData, model: &Model) -> HingeThreshold
             // 曲げひび割れ Mc = κ·√Fc·Ze（κ=0.56、技術基準解説書 P.621-623）。
             let mc = 0.56 * fc.max(0.0).sqrt() * ze;
             // 曲げ降伏 My = 0.9·at·σy·d（rc_mu_simple）。at は片側引張筋（対称配筋仮定）。
-            let sigma_y_rebar = mat.and_then(|m| m.fy).unwrap_or(345.0);
+            // 保有水平耐力計算のため主筋の材料強度割増を乗じる（せん断補強筋は対象外）。
+            let sigma_y_rebar = mat.and_then(|m| m.fy).unwrap_or(345.0)
+                * mat.map(material_strength_factor_rebar).unwrap_or(1.0);
             let at = bar_set_area(&rebar.main_x) / 2.0;
             let d_eff = (d - rebar.cover - rebar.main_x.dia / 2.0).max(0.0);
             let inp = RcCapacityInput {

@@ -201,7 +201,10 @@ impl DesignCheck for SteelDesign {
         ctx: &DesignCtx,
     ) -> CheckOutcome {
         let t = plate_thickness(sec);
-        let f = steel_f_value_prefix(&mat.name, t).unwrap_or(235.0);
+        // プリセット外の直接入力材料は fy を基準強度として用いる（それも無ければ 235）。
+        let f = steel_f_value_prefix(&mat.name, t)
+            .or(mat.fy)
+            .unwrap_or(235.0);
         let term = ctx.term;
 
         let cr = match ctx.kind {
@@ -223,6 +226,7 @@ pub(crate) mod test_support {
 
     pub(crate) fn mat(name: &str) -> Material {
         Material {
+            strength_factor: None,
             concrete_class: Default::default(),
             id: MaterialId(0),
             name: name.to_string(),

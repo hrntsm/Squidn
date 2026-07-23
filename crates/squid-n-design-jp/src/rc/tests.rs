@@ -4,6 +4,7 @@ use squid_n_core::section_shape::{BarSet, RcRebar, SectionShape, ShearBar};
 
 pub(crate) fn make_material(fc: f64, grade: &str) -> Material {
     Material {
+        strength_factor: None,
         concrete_class: Default::default(),
         id: MaterialId(0),
         name: grade.to_string(),
@@ -586,6 +587,7 @@ fn test_fc_missing_fallback() {
     let shape = rc_rect_shape(300.0, 600.0, 4, 19.0, 1, 40.0, 10.0, 100.0, 2);
     let sec = make_section(shape);
     let mat = Material {
+        strength_factor: None,
         concrete_class: Default::default(),
         id: MaterialId(0),
         name: "SD345".to_string(),

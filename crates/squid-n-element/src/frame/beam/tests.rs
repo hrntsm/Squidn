@@ -98,6 +98,7 @@ fn test_beam_new_src_cft_composite_props() {
         ],
         materials: vec![
             Material {
+                strength_factor: None,
                 concrete_class: Default::default(),
                 id: MaterialId(0),
                 name: "FC24".into(),
@@ -109,6 +110,7 @@ fn test_beam_new_src_cft_composite_props() {
                 fy: None,
             },
             Material {
+                strength_factor: None,
                 concrete_class: Default::default(),
                 id: MaterialId(1),
                 name: "BCR295(充填FC36)".into(),
@@ -215,6 +217,7 @@ fn test_beam_new_slab_cooperation_width_amplifies_iy() {
         ],
         sections: vec![shape.to_section(SectionId(0), "RC-300x600".into())],
         materials: vec![Material {
+            strength_factor: None,
             concrete_class: Default::default(),
             id: MaterialId(0),
             name: "FC24".into(),
@@ -324,6 +327,7 @@ fn test_beam_new_composite_steel_beam_averages_stiffness() {
         ],
         sections: vec![shape.to_section(SectionId(0), "H-400x200".into())],
         materials: vec![Material {
+            strength_factor: None,
             concrete_class: Default::default(),
             id: MaterialId(0),
             name: "SN400B".into(),
@@ -708,6 +712,7 @@ fn test_auto_rigid_zone_standard_formula() {
         shape: None,
     };
     let mat = Material {
+        strength_factor: None,
         concrete_class: Default::default(),
         id: MaterialId(0),
         name: "steel".to_string(),
@@ -840,6 +845,7 @@ fn test_apply_auto_rigid_zones_and_manual_protection() {
         elements: vec![mk_beam(0, 0, 1, 0), mk_beam(1, 1, 2, 1)], // 柱(せい600)・梁(せい700)
         sections: vec![mk_sec(0, 600.0), mk_sec(1, 700.0)],
         materials: vec![Material {
+            strength_factor: None,
             concrete_class: Default::default(),
             id: MaterialId(0),
             name: String::new(),
@@ -905,6 +911,7 @@ fn test_eval_sections_from_face_distance() {
         shape: None,
     };
     let mat = Material {
+        strength_factor: None,
         concrete_class: Default::default(),
         id: MaterialId(0),
         name: String::new(),
@@ -1058,6 +1065,7 @@ fn test_auto_rigid_zone_steel_joint_is_zero() {
     }
     .to_section(SectionId(1), "beam-H500".to_string());
     let mat = Material {
+        strength_factor: None,
         concrete_class: Default::default(),
         id: MaterialId(0),
         name: "steel".to_string(),
@@ -1160,6 +1168,7 @@ fn test_auto_rigid_zone_steel_beam_rc_column() {
     }
     .to_section(SectionId(1), "beam-H500".to_string());
     let rc_mat = Material {
+        strength_factor: None,
         concrete_class: Default::default(),
         id: MaterialId(0),
         name: "concrete".to_string(),
@@ -1171,6 +1180,7 @@ fn test_auto_rigid_zone_steel_beam_rc_column() {
         fy: None,
     };
     let s_mat = Material {
+        strength_factor: None,
         concrete_class: Default::default(),
         id: MaterialId(1),
         name: "steel".to_string(),
@@ -1273,6 +1283,7 @@ fn test_auto_rigid_zone_rc_beam_steel_column_only_is_zero() {
     }
     .to_section(SectionId(1), "beam-RC600".to_string());
     let s_mat = Material {
+        strength_factor: None,
         concrete_class: Default::default(),
         id: MaterialId(0),
         name: "steel".to_string(),
@@ -1284,6 +1295,7 @@ fn test_auto_rigid_zone_rc_beam_steel_column_only_is_zero() {
         fy: Some(235.0),
     };
     let rc_mat = Material {
+        strength_factor: None,
         concrete_class: Default::default(),
         id: MaterialId(1),
         name: "concrete".to_string(),
@@ -1417,6 +1429,7 @@ fn test_auto_rigid_zone_wall_does_not_affect_orthogonal_search() {
         shape: None,
     };
     let mat = Material {
+        strength_factor: None,
         concrete_class: Default::default(),
         id: MaterialId(0),
         name: "steel".to_string(),
@@ -1548,6 +1561,7 @@ fn test_beam_new_wall_girder_bottom_edge_scales_stiffness() {
         shape: None,
     };
     let mat = Material {
+        strength_factor: None,
         concrete_class: Default::default(),
         id: MaterialId(0),
         name: "conc".to_string(),
@@ -1663,6 +1677,7 @@ fn test_beam_new_wall_girder_requires_both_nodes_shared() {
         shape: None,
     };
     let mat = Material {
+        strength_factor: None,
         concrete_class: Default::default(),
         id: MaterialId(0),
         name: "conc".to_string(),
@@ -1755,6 +1770,7 @@ fn test_beam_new_wall_girder_vertical_member_not_scaled() {
         shape: None,
     };
     let mat = Material {
+        strength_factor: None,
         concrete_class: Default::default(),
         id: MaterialId(0),
         name: "conc".to_string(),
@@ -1863,6 +1879,7 @@ fn test_beam_new_misc_wall_wing_augments_column_inplane_stiffness() {
         ps: 0.0025,
     };
     let mat = Material {
+        strength_factor: None,
         concrete_class: Default::default(),
         id: MaterialId(0),
         name: "FC24".into(),
@@ -2009,6 +2026,7 @@ fn test_beam_new_misc_wall_strip_augments_girder_iy_without_100x() {
         ps: 0.0025,
     };
     let mat = Material {
+        strength_factor: None,
         concrete_class: Default::default(),
         id: MaterialId(0),
         name: "FC24".into(),
@@ -2176,6 +2194,7 @@ fn test_beam_new_seismic_wall_no_misc_wall_augmentation() {
         ps: 0.0025,
     };
     let mat = Material {
+        strength_factor: None,
         concrete_class: Default::default(),
         id: MaterialId(0),
         name: "FC24".into(),
@@ -2313,6 +2332,7 @@ fn test_vertical_bending_stiffness_uses_section_strong_axis() {
         shape: None,
     };
     let mat = Material {
+        strength_factor: None,
         concrete_class: Default::default(),
         id: MaterialId(0),
         name: "SN400".into(),

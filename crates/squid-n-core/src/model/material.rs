@@ -27,6 +27,14 @@ pub struct Material {
     /// 旧スキーマ（フィールド無し）は Normal 扱い。
     #[serde(default)]
     pub concrete_class: crate::units::ConcreteClass,
+    /// 保有水平耐力計算（プッシュオーバー）用の材料強度割増係数の直接入力。
+    /// `None`（既定）の場合は自動判定（鋼材グレードは 1.1、590N 級の
+    /// SA440・TMCP440 は 1.05、RC 主筋は 1.1。せん断補強筋は割増対象外）。
+    /// 直接入力材料など自動判定できない材料に対して割増を指定する用途。
+    /// 許容応力度計算（一次設計）には影響しない。
+    /// 旧スキーマ（フィールド無し）は None（自動判定）扱い。
+    #[serde(default)]
+    pub strength_factor: Option<f64>,
 }
 
 impl Material {
