@@ -676,6 +676,13 @@ pub struct App {
     /// 点線は節点数が多いと他部材が見づらくなるため、既定は非表示にしている。
     #[cfg(feature = "gui")]
     pub show_diaphragm_master: bool,
+    /// 変形図・応力図の変形重ねで、梁を内部たわみ（Hermite 3 次曲線）で描くか
+    /// （既定 ON）。ON では梁の内部たわみと、それに載る床・二次部材の追従を
+    /// 曲線で表示する。OFF では梁を節点間の直線（弦）で描き、床・二次部材の追従も
+    /// 線形補間にする（全体の変形を素直に見る用）。変位図だけでなく N/Q/M 図の
+    /// 変形重ねにも適用する。
+    #[cfg(feature = "gui")]
+    pub show_beam_interpolation: bool,
     /// 床荷重分配の CMQ 結果（P2 §5.1）。描画用。
     pub beam_loads: Vec<squid_n_load::floor::BeamLoad>,
     /// 時刻歴応答データ（描画用）
@@ -852,6 +859,8 @@ impl Default for App {
             deform_scale_factor: 1.0,
             #[cfg(feature = "gui")]
             show_diaphragm_master: false,
+            #[cfg(feature = "gui")]
+            show_beam_interpolation: true,
             beam_loads: Vec::new(),
             #[cfg(feature = "gui")]
             time_history_data: crate::time_history_view::TimeHistoryData::default(),

@@ -598,13 +598,20 @@ pub fn viewer_panel(ui: &mut egui::Ui, app: &mut App) {
             });
         }
     }
-    // 変形倍率スライダー: 変形を表示するモード（変形・モード・応力図の変形重ね）で
-    // 表示する。自動算定倍率への手動係数を対数スライダーで調整し、「リセット」で
-    // 1.0 に戻す。
-    let show_scale_slider = matches!(mode, ViewMode::Deformed | ViewMode::Mode)
+    // 変形表示オプション行: 変形を表示するモード（変形・モード・応力図の変形重ね）で
+    // 表示する。「内部たわみ」トグルで梁の Hermite 曲線表示（＋床・二次部材の曲線
+    // 追従）と直線表示（全体の変形）を切り替え、変形倍率スライダーで自動算定倍率への
+    // 手動係数を対数調整（「リセット」で 1.0）する。
+    let show_deform_options = matches!(mode, ViewMode::Deformed | ViewMode::Mode)
         || (matches!(mode, ViewMode::N | ViewMode::Q | ViewMode::M) && app.overlay_deform);
-    if show_scale_slider {
+    if show_deform_options {
         ui.horizontal(|ui| {
+            ui.toggle_value(&mut app.show_beam_interpolation, "内部たわみ")
+                .on_hover_text(
+                    "梁を内部たわみ（Hermite 曲線）で描き、床・二次部材も曲線に追従。\
+                     OFF で梁を直線（弦）にし全体の変形を見る",
+                );
+            ui.separator();
             ui.label("変形倍率:");
             ui.add(
                 egui::Slider::new(&mut app.deform_scale_factor, 0.1..=10.0)
@@ -733,13 +740,15 @@ pub fn viewer_panel(ui: &mut egui::Ui, app: &mut App) {
     // 梁の Hermite 変形曲線上へ載る（`interpolate_unreferenced_disp`）。続けて剛床
     // 代表節点の鉛直変位をスレーブ平均で補い、代表点も床の変形へ追従させる。
     let disp = disp
-        .map(|d| interpolate_unreferenced_disp(&app.model, d))
+        .map(|d| interpolate_unreferenced_disp(&app.model, d, app.show_beam_interpolation))
         .map(|d| fill_diaphragm_master_disp_for_display(&app.model, d));
 
     // 変形スケール（自動）: バウンディングボックス基準（最大並進変位が対角長の
-    // 10%）と梁スパン基準（梁の内部たわみがスパンの一定割合以内。梁は Hermite 曲線
-    // で描くため端部回転が大きいと中央が過大にふくらむのを抑える）の小さい方を採る。
-    // 手動係数（スライダー `deform_scale_factor`）を掛けた値を実効倍率とする。
+    // 10%）を基本とし、内部たわみ表示が ON のときは梁スパン基準（梁の Hermite 内部
+    // たわみがスパンの一定割合以内。端部回転が大きいと中央が過大にふくらむのを
+    // 抑える）も併用して小さい方を採る。内部たわみ OFF（梁を直線で描く）では
+    // ふくらみが生じないためバウンディングボックス基準のみとする。手動係数
+    // （スライダー `deform_scale_factor`）を掛けた値を実効倍率とする。
     let auto_scale = {
         let max_disp = disp
             .as_ref()
@@ -754,7 +763,7 @@ pub fn viewer_panel(ui: &mut egui::Ui, app: &mut App) {
         } else {
             0.0
         };
-        if bbox_scale > 0.0 {
+        if bbox_scale > 0.0 && app.show_beam_interpolation {
             match disp
                 .as_ref()
                 .and_then(|d| beam_deflection_scale_limit(&app.model, d))
@@ -763,7 +772,7 @@ pub fn viewer_panel(ui: &mut egui::Ui, app: &mut App) {
                 None => bbox_scale,
             }
         } else {
-            0.0
+            bbox_scale
         }
     };
     let deform_scale_actual = auto_scale * app.deform_scale_factor as f64;
@@ -1028,10 +1037,13 @@ pub fn viewer_panel(ui: &mut egui::Ui, app: &mut App) {
             continue;
         }
 
-        // 変形図・モード形の梁は、端部の並進・回転から Hermite 3 次で曲げ変形を
-        // 内挿して曲線描画する（節点間の直線ではたわみが見えないため）。
-        let curved_beam = matches!(mode, ViewMode::Deformed | ViewMode::Mode)
-            && elem.kind == squid_n_core::model::ElementKind::Beam;
+        // 変形を表示する全モード（変形図・モード形・応力図の変形重ね）で、「内部
+        // たわみ」トグルが ON のとき、梁は端部の並進・回転から Hermite 3 次で曲げ
+        // 変形を内挿して曲線描画する（節点間の直線ではたわみが見えないため）。
+        // トグル OFF では梁も直線で描き、全体の変形だけを素直に見る。変形を表示
+        // していない（`disp` が None）モードでは常に直線。
+        let curved_beam =
+            app.show_beam_interpolation && elem.kind == squid_n_core::model::ElementKind::Beam;
         if let (true, Some(d)) = (curved_beam, &disp) {
             let p_i = app.model.nodes[n0].coord;
             let p_j = app.model.nodes[n1].coord;
@@ -1971,9 +1983,12 @@ fn dist_point_to_segment(p: egui::Pos2, a: egui::Pos2, b: egui::Pos2) -> f32 {
 /// 補間は 2 段階で行う:
 ///
 /// 1. **大梁への直付き（線上に載る）節点**: 最寄りの主架構 2 節点要素（線材）へ
-///    射影し、垂線距離が許容値（モデル寸法の 0.1%）以内なら、その線分上の
-///    射影位置 t の両端変位の線形補間を採用する。ST-Bridge 取り込みモデルで
-///    二次部材の支持点が大梁のスパン中間へ節点共有なしで載る典型ケースを追従。
+///    射影し、垂線距離が許容値（モデル寸法の 0.1%）以内なら、その線分上の射影
+///    位置 t で追従させる。梁（`Beam`）に載る場合、`use_beam_hermite` が真なら
+///    梁の Hermite 変位（描画曲線と一致）で並進を追従させ（回転は線形補間）、
+///    偽なら両端変位の線形補間とする（梁を直線で描く「全体変形」表示に合わせる）。
+///    梁以外の線材は常に線形補間。ST-Bridge 取り込みモデルで二次部材の支持点が
+///    大梁のスパン中間へ節点共有なしで載る典型ケースを追従する。
 /// 2. **大梁に直付きしない二次部材節点**: 二次部材（小梁・間柱）の接続グラフを
 ///    辿り、最寄りの確定節点（1. のアンカー、または主架構節点）の変位へ剛体的に
 ///    追従させる（辺長を距離とする Dijkstra 的伝播）。最寄り線分への単純射影では
@@ -1985,6 +2000,7 @@ fn dist_point_to_segment(p: egui::Pos2, a: egui::Pos2, b: egui::Pos2) -> f32 {
 fn interpolate_unreferenced_disp(
     model: &squid_n_core::model::Model,
     mut disp: Vec<[f64; 6]>,
+    use_beam_hermite: bool,
 ) -> Vec<[f64; 6]> {
     let n = model.nodes.len().min(disp.len());
 
@@ -2086,9 +2102,10 @@ fn interpolate_unreferenced_disp(
         if let Some((d2, si, t)) = best {
             let s = &segments[si];
             let (da, db) = (disp[s.a], disp[s.b]);
-            // 梁は Hermite 変位で追従（並進 3 成分は描画曲線上へ載せ、回転は端点の
-            // 線形補間で補う）。梁以外は全 6 成分を線形補間する。
-            let interp: [f64; 6] = if s.beam {
+            // 梁で内部たわみ表示が有効なときのみ Hermite 変位で追従（並進 3 成分は
+            // 描画曲線上へ載せ、回転は端点の線形補間で補う）。梁以外、または内部
+            // たわみ表示 OFF（梁を直線で描く）のときは全 6 成分を線形補間する。
+            let interp: [f64; 6] = if s.beam && use_beam_hermite {
                 let hermite = beam_hermite_disp_at(
                     model.nodes[s.a].coord,
                     model.nodes[s.b].coord,
@@ -2575,7 +2592,7 @@ mod tests {
             [1.0, 2.0, 3.0, 0.1, 0.2, 0.3],
             [4.0, 5.0, 6.0, 0.4, 0.5, 0.6],
         ];
-        let out = interpolate_unreferenced_disp(&model, disp.clone());
+        let out = interpolate_unreferenced_disp(&model, disp.clone(), true);
         assert_eq!(out, disp);
     }
 
@@ -2595,7 +2612,7 @@ mod tests {
             [4.0, 8.0, -12.0, 0.0, 0.0, 0.0],
             [0.0; 6], // 未参照節点は解析結果ではゼロ
         ];
-        let out = interpolate_unreferenced_disp(&model, disp);
+        let out = interpolate_unreferenced_disp(&model, disp, true);
         // t = 2000/8000 = 0.25。端部回転は 0 のため、軸方向（+X）は線形（0.25·4=1.0）、
         // 材軸直交成分（Y,Z）は Hermite の N3(0.25)=0.15625 倍で追従する
         // （線形補間の 0.25 倍より小さく、梁の描画曲線上に載る）。
@@ -2606,6 +2623,28 @@ mod tests {
             "Z={}",
             out[2][2]
         );
+    }
+
+    #[test]
+    fn 大梁スパン中間の未参照節点は内部たわみオフで線形補間になる() {
+        // 内部たわみ表示 OFF（梁を直線で描く「全体変形」表示）では、直付き節点も
+        // 端点の線形補間で追従する（梁の直線＝弦の上に載る）。
+        let mut model = Model::default();
+        model.nodes.push(test_node(0, [0.0, 0.0, 0.0]));
+        model.nodes.push(test_node(1, [8000.0, 0.0, 0.0]));
+        model.nodes.push(test_node(2, [2000.0, 0.0, 0.0]));
+        model.elements.push(test_beam(0, 0, 1));
+
+        let disp = vec![
+            [0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            [4.0, 8.0, -12.0, 0.0, 0.0, 0.0],
+            [0.0; 6],
+        ];
+        let out = interpolate_unreferenced_disp(&model, disp, false);
+        // t = 0.25 の線形補間（全成分）。
+        assert!((out[2][0] - 1.0).abs() < 1e-12, "X={}", out[2][0]);
+        assert!((out[2][1] - 2.0).abs() < 1e-12, "Y={}", out[2][1]);
+        assert!((out[2][2] + 3.0).abs() < 1e-12, "Z={}", out[2][2]);
     }
 
     #[test]
@@ -2622,7 +2661,7 @@ mod tests {
         let d_i = [0.0, 0.0, 0.0, 0.0, 0.0, 0.01];
         let d_j = [0.0, 0.0, 0.0, 0.0, 0.0, -0.01];
         let disp = vec![d_i, d_j, [0.0; 6]];
-        let out = interpolate_unreferenced_disp(&model, disp);
+        let out = interpolate_unreferenced_disp(&model, disp, true);
 
         // 同じ端部変位で梁曲線を無倍率描画し、中央点（12 分割の index 6=ξ0.5）の
         // 変位（曲線点 − 未変形材軸点）を取る。
@@ -2663,7 +2702,7 @@ mod tests {
         model.elements.push(test_beam(0, 0, 1));
 
         let disp = vec![[0.0; 6], [10.0, 0.0, 0.0, 0.0, 0.0, 0.0], [0.0; 6]];
-        let out = interpolate_unreferenced_disp(&model, disp);
+        let out = interpolate_unreferenced_disp(&model, disp, true);
         // 射影点は t=0.5 → 5.0
         assert!((out[2][0] - 5.0).abs() < 1e-12);
     }
@@ -2674,7 +2713,7 @@ mod tests {
         model.nodes.push(test_node(0, [0.0, 0.0, 0.0]));
         model.nodes.push(test_node(1, [1000.0, 0.0, 0.0]));
         // 要素なし → 補間ソースがなく、変位はゼロのまま
-        let out = interpolate_unreferenced_disp(&model, vec![[0.0; 6]; 2]);
+        let out = interpolate_unreferenced_disp(&model, vec![[0.0; 6]; 2], true);
         assert!(out.iter().all(|v| v.iter().all(|&x| x == 0.0)));
     }
 
@@ -2701,7 +2740,7 @@ mod tests {
             [10.0, 0.0, 0.0, 0.0, 0.0, 0.0],
             [7.0, 0.0, 0.0, 0.0, 0.0, 0.0], // マスターの解析変位（補間値 5.0 とは異なる）
         ];
-        let out = interpolate_unreferenced_disp(&model, disp.clone());
+        let out = interpolate_unreferenced_disp(&model, disp.clone(), true);
         assert_eq!(out, disp);
     }
 
@@ -2781,7 +2820,7 @@ mod tests {
             [0.0; 6],                         // 4
             [0.0; 6],                         // 5
         ];
-        let out = interpolate_unreferenced_disp(&model, disp);
+        let out = interpolate_unreferenced_disp(&model, disp, true);
         // node 2 は G1 上 t=0.25 → 25.0
         assert!((out[2][0] - 25.0).abs() < 1e-9, "node2={:?}", out[2]);
         // node 3 は最寄り大梁 G2（変位 0）ではなく、二次部材で node 2 に追従 → 25.0
@@ -2813,7 +2852,7 @@ mod tests {
             [0.0; 6],                       // 4
             [0.0; 6],                       // 5
         ];
-        let out = interpolate_unreferenced_disp(&model, disp);
+        let out = interpolate_unreferenced_disp(&model, disp, true);
         // node 2, 3 とも連鎖を辿って node 1 の変位 8.0 に追従する。
         assert!((out[2][0] - 8.0).abs() < 1e-9, "node2={:?}", out[2]);
         assert!((out[3][0] - 8.0).abs() < 1e-9, "node3={:?}", out[3]);
