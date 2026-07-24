@@ -495,7 +495,8 @@ fn test_default_load_cases_and_model() {
 }
 
 /// 標準荷重組合せ（`default_combinations`）の構成を確認する。
-/// 長期 G+P（DL+LL(架構用)）と短期地震 G+P±Kx・G+P±Ky（±EX・±EY）の計5組合せ。
+/// 長期 DL+LL（DL+LL(架構用)）と短期地震 DL+LL±EX・DL+LL±EY の計5組合せ。
+/// 組合せ名は荷重ケースの直接的な名前（DL・LL・EX・EY）を用いる。
 #[test]
 fn test_default_combinations() {
     let combos = default_combinations();
@@ -503,19 +504,19 @@ fn test_default_combinations() {
     assert_eq!(
         names,
         vec![
-            "G + P",
-            "G + P + Kx",
-            "G + P - Kx",
-            "G + P + Ky",
-            "G + P - Ky"
+            "DL + LL",
+            "DL + LL + EX",
+            "DL + LL - EX",
+            "DL + LL + EY",
+            "DL + LL - EY"
         ]
     );
-    // 長期 G+P: DL(0)+LL(架構用=1) を各1.0で参照する。
+    // 長期 DL+LL: DL(0)+LL(架構用=1) を各1.0で参照する。
     assert_eq!(
         combos[0].terms,
         vec![(LoadCaseId(0), 1.0), (LoadCaseId(1), 1.0)]
     );
-    // 短期地震: G+P に EX(3)/EY(4) を ±1.0 で加える。
+    // 短期地震: DL+LL に EX(3)/EY(4) を ±1.0 で加える。
     assert_eq!(
         combos[1].terms,
         vec![

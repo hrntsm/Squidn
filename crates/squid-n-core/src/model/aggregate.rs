@@ -470,7 +470,7 @@ impl Model {
     }
 
     /// 標準荷重ケース一式（DL・LL(架構用)・LL(地震用)・EX・EY）と標準荷重組合せ
-    /// （長期 G+P、短期地震 G+P±Kx・G+P±Ky）を持つ空モデルを作る
+    /// （長期 DL+LL、短期地震 DL+LL±EX・DL+LL±EY）を持つ空モデルを作る
     /// （新規作成の既定。[`default_load_cases`]・[`default_combinations`] 参照）。
     pub fn with_default_load_cases() -> Self {
         Model {

@@ -3775,7 +3775,7 @@ fn test_new_model_has_default_load_cases() {
             EY_CASE_NAME
         ]
     );
-    // 標準荷重組合せ（長期 G+P、短期地震 G+P±Kx・G+P±Ky）も既定で用意される。
+    // 標準荷重組合せ（長期 DL+LL、短期地震 DL+LL±EX・DL+LL±EY）も既定で用意される。
     let combo_names: Vec<&str> = app
         .model
         .combinations
@@ -3785,11 +3785,11 @@ fn test_new_model_has_default_load_cases() {
     assert_eq!(
         combo_names,
         vec![
-            "G + P",
-            "G + P + Kx",
-            "G + P - Kx",
-            "G + P + Ky",
-            "G + P - Ky"
+            "DL + LL",
+            "DL + LL + EX",
+            "DL + LL - EX",
+            "DL + LL + EY",
+            "DL + LL - EY"
         ]
     );
 }

@@ -117,8 +117,8 @@ impl App {
     /// ST-Bridge（XML, サブセット）ファイルを読み込む。
     /// Squid-N プロジェクト（.scz）とは別物なので project_path はクリアする。
     /// ファイルが荷重情報（`StbLoadCase`）を持たない場合は、標準荷重ケース
-    /// （DL・LL(架構用)・LL(地震用)・EX・EY）と標準荷重組合せ（長期 G+P、
-    /// 短期地震 G+P±Kx・G+P±Ky）を自動作成する（新規モデルと同じ出発点。
+    /// （DL・LL(架構用)・LL(地震用)・EX・EY）と標準荷重組合せ（長期 DL+LL、
+    /// 短期地震 DL+LL±EX・DL+LL±EY）を自動作成する（新規モデルと同じ出発点。
     /// DL の自重・スラブ荷重は解析実行前の同期アクションが自動計算する）。
     pub fn import_stbridge_from(&mut self, path: std::path::PathBuf) {
         self.last_error = None;
