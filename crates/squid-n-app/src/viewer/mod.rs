@@ -65,6 +65,26 @@ pub enum ViewMode {
     CheckRatio,
 }
 
+/// N/Q/M 図で表示する成分の作用軸。
+///
+/// 部材は 2 軸曲げ・2 方向せん断を受けるため（特に柱）、Q 図・M 図は局所 y 軸
+/// まわりの成分だけでなく z 軸まわりの成分・ねじりも切り替えて表示できる。
+/// - `Y`（既定）: Q 図→Qy、M 図→Mz（`ref_vector` が定める曲げ面＝局所 y 面）。
+/// - `Z`: Q 図→Qz、M 図→My（局所 z 面）。
+/// - `Torsion`: M 図→Mx（ねじりモーメント）。Q 図では意味を持たず Qy にフォールバックする。
+///
+/// 内力ベクトルの並びは `[N, Qy, Qz, Mx, My, Mz]`（`frame/beam/forces.rs`）。
+#[derive(Clone, Copy, Debug, PartialEq, Default)]
+pub enum DiagramComponent {
+    /// 局所 y 軸に関する成分（Q 図→Qy、M 図→Mz）。
+    #[default]
+    Y,
+    /// 局所 z 軸に関する成分（Q 図→Qz、M 図→My）。
+    Z,
+    /// ねじり（M 図→Mx）。
+    Torsion,
+}
+
 /// CMQ 図で表示する成分（C: 固定端モーメント／M: 単純梁中央モーメント／Q: せん断）。
 #[derive(Clone, Copy, Debug, PartialEq, Default)]
 pub enum CmqComponent {
@@ -509,6 +529,7 @@ pub fn viewer_panel(ui: &mut egui::Ui, app: &mut App) {
     let mut mode = app.view_mode;
     let mut mode_idx = app.view_mode_idx;
     let mut cmq_component = app.cmq_component;
+    let mut diagram_component = app.diagram_component;
     let mut check_ratio_filter = app.check_ratio_filter;
 
     // --- コントロール ---
@@ -556,6 +577,26 @@ pub fn viewer_panel(ui: &mut egui::Ui, app: &mut App) {
             ui.selectable_value(&mut cmq_component, CmqComponent::C, "C(モーメント)");
             ui.selectable_value(&mut cmq_component, CmqComponent::M, "M(中央)");
             ui.selectable_value(&mut cmq_component, CmqComponent::Q, "Q(せん断)");
+        });
+    }
+    // Q 図・M 図: 作用軸の成分を切り替える（部材は 2 軸曲げ・2 方向せん断を受けるため、
+    // 局所 y 軸まわり（Qy/Mz）だけでなく z 軸まわり（Qz/My）・ねじり（Mx）も表示できる）。
+    // N 図は軸力の 1 成分のみのためセレクタを出さない。
+    if matches!(mode, ViewMode::Q | ViewMode::M) {
+        ui.horizontal(|ui| {
+            ui.label("成分:");
+            if mode == ViewMode::Q {
+                ui.selectable_value(&mut diagram_component, DiagramComponent::Y, "Qy(局所y)");
+                ui.selectable_value(&mut diagram_component, DiagramComponent::Z, "Qz(局所z)");
+            } else {
+                ui.selectable_value(&mut diagram_component, DiagramComponent::Y, "Mz(局所y)");
+                ui.selectable_value(&mut diagram_component, DiagramComponent::Z, "My(局所z)");
+                ui.selectable_value(
+                    &mut diagram_component,
+                    DiagramComponent::Torsion,
+                    "Mx(ねじり)",
+                );
+            }
         });
     }
     // N/Q/M 図: 単色塗り／コンター（値に応じた色分け）を切替。
@@ -680,6 +721,7 @@ pub fn viewer_panel(ui: &mut egui::Ui, app: &mut App) {
     app.view_mode = mode;
     app.view_mode_idx = mode_idx;
     app.cmq_component = cmq_component;
+    app.diagram_component = diagram_component;
     app.check_ratio_filter = check_ratio_filter;
 
     // CMQ 図はモデル編集に常に追従させるため、表示中は毎フレーム再計算する
@@ -1275,13 +1317,20 @@ pub fn viewer_panel(ui: &mut egui::Ui, app: &mut App) {
     app.camera = cam;
 }
 
-/// 応力図・CMQ 図のオフセット方向（要素ローカル y 軸）をワールド座標で返す。
+/// 応力図・CMQ 図のオフセット方向をワールド座標で返す。
 ///
-/// N/Qy/Mz はローカル x-y 平面（曲げ平面）の成分のため、図はローカル y 方向へ
-/// 張り出す。解析と同じ局所座標系（[`LocalFrame`]: ex=材軸, ey=ref_vector 直交化）
-/// を使うことで、ビューを回転しても図が要素座標系に固定される。
-fn diagram_offset_dir(p_i: [f64; 3], p_j: [f64; 3], ref_vector: [f64; 3]) -> [f64; 3] {
-    squid_n_element::transform::LocalFrame::from_nodes(p_i, p_j, ref_vector).rot[1]
+/// `axis_row` は要素ローカル基底 [`LocalFrame::rot`] の行番号（1=ey, 2=ez）。
+/// Qy/Mz はローカル x-y 平面（局所 y 面）の成分のため ey（=1）方向へ、Qz/My は
+/// ローカル x-z 平面（局所 z 面）の成分のため ez（=2）方向へ張り出す。解析と同じ
+/// 局所座標系（[`LocalFrame`]: ex=材軸, ey=ref_vector 直交化, ez=ex×ey）を使うことで、
+/// ビューを回転しても図が要素座標系に固定される。
+fn diagram_offset_dir(
+    p_i: [f64; 3],
+    p_j: [f64; 3],
+    ref_vector: [f64; 3],
+    axis_row: usize,
+) -> [f64; 3] {
+    squid_n_element::transform::LocalFrame::from_nodes(p_i, p_j, ref_vector).rot[axis_row]
 }
 
 /// 部材両端間のワールド距離。ゼロ長部材（材軸が定まらない）の除外判定に使う。
@@ -1599,7 +1648,8 @@ fn draw_cmq_diagram(painter: &egui::Painter, app: &App, coords3: &[[f64; 3]], pr
         let p_i = coords3[g.n0];
         let p_j = coords3[g.n1];
         let l = member_len3(p_i, p_j);
-        let ey = diagram_offset_dir(p_i, p_j, g.ref_vec);
+        // CMQ 図は主架構梁の鉛直曲げ（局所 y 面）を対象とするため ey（行1）へ張り出す。
+        let ey = diagram_offset_dir(p_i, p_j, g.ref_vec, 1);
         let p0 = proj.project(p_i);
         let p1 = proj.project(p_j);
 

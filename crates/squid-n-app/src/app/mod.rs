@@ -639,6 +639,9 @@ pub struct App {
     /// CMQ 図で表示する成分（C: モーメント／Q: せん断）
     #[cfg(feature = "gui")]
     pub cmq_component: crate::viewer::CmqComponent,
+    /// Q 図・M 図で表示する成分の作用軸（局所 y／局所 z／ねじり）
+    #[cfg(feature = "gui")]
+    pub diagram_component: crate::viewer::DiagramComponent,
     /// 検定比図の着色対象（最大＝全式の max、または特定の検定式のみ）
     #[cfg(feature = "gui")]
     pub check_ratio_filter: crate::viewer::CheckRatioFilter,
@@ -837,6 +840,8 @@ impl Default for App {
             view_mode: crate::viewer::ViewMode::default(),
             #[cfg(feature = "gui")]
             cmq_component: crate::viewer::CmqComponent::default(),
+            #[cfg(feature = "gui")]
+            diagram_component: crate::viewer::DiagramComponent::default(),
             #[cfg(feature = "gui")]
             check_ratio_filter: crate::viewer::CheckRatioFilter::default(),
             #[cfg(feature = "gui")]

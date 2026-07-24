@@ -22,7 +22,9 @@
 use crate::app::App;
 use crate::theme;
 
-use super::{diagram_offset_dir, member_len3, BeamDeflection, Projector, ViewMode};
+use super::{
+    diagram_offset_dir, member_len3, BeamDeflection, DiagramComponent, Projector, ViewMode,
+};
 
 /// 張り出しピークがこの px 未満の図形は描かない。60px 正規化に対して値が
 /// 相対的に極小の部材（ほぼ潰れた図形）は、輪郭の折り返し点で epaint のマイター
@@ -114,6 +116,30 @@ pub(crate) fn contour_color(t: f64, map: theme::ColorMap) -> egui::Color32 {
     map.sample((t + 1.0) * 0.5)
 }
 
+/// 表示モード `mode` と成分 `component` から、描画する内力の
+/// `(内力インデックス, 張り出し軸行, 凡例ラベル)` を返す（純粋関数）。
+///
+/// 内力ベクトルの並びは `[N, Qy, Qz, Mx, My, Mz]`（`frame/beam/forces.rs`）。
+/// 張り出し軸行は要素ローカル基底 [`LocalFrame::rot`] の行番号（1=ey/局所 y 面,
+/// 2=ez/局所 z 面）。柱の 2 軸曲げ・2 方向せん断を表示できるよう、Q 図・M 図は
+/// 局所 y／局所 z／ねじりを切り替える。N/Q/M 以外のモードは `None`。
+pub(crate) fn force_diagram_spec(
+    mode: ViewMode,
+    component: DiagramComponent,
+) -> Option<(usize, usize, &'static str)> {
+    Some(match (mode, component) {
+        (ViewMode::N, _) => (0, 1, "N"),
+        (ViewMode::Q, DiagramComponent::Z) => (2, 2, "Qz"),
+        // Q 図にねじりは無いため Qy にフォールバックする。
+        (ViewMode::Q, _) => (1, 1, "Qy"),
+        (ViewMode::M, DiagramComponent::Z) => (4, 2, "My"),
+        // ねじり Mx は曲げ面を持たないため、慣例として局所 y 面（ey）へ張り出す。
+        (ViewMode::M, DiagramComponent::Torsion) => (3, 1, "Mx"),
+        (ViewMode::M, _) => (5, 1, "Mz"),
+        _ => return None,
+    })
+}
+
 /// 部材ローカルに沿って N/Q/M 図を描く。
 pub(super) fn draw_force_diagram(
     painter: &egui::Painter,
@@ -125,17 +151,8 @@ pub(super) fn draw_force_diagram(
     proj: &Projector,
 ) {
     let scale = proj.scale();
-    let force_idx = match mode {
-        ViewMode::N => 0, // N
-        ViewMode::Q => 1, // Qy
-        ViewMode::M => 5, // Mz
-        _ => return,
-    };
-    let label = match mode {
-        ViewMode::N => "N",
-        ViewMode::Q => "Q",
-        ViewMode::M => "M",
-        _ => "",
+    let Some((force_idx, axis_row, label)) = force_diagram_spec(mode, app.diagram_component) else {
+        return;
     };
 
     let Some(results) = &app.results else {
@@ -183,7 +200,8 @@ pub(super) fn draw_force_diagram(
             continue; // ゼロ長部材（同一節点間）は材軸が定まらず図を描けない
         }
         let ref_vec = elem.local_axis.ref_vector;
-        let ey = diagram_offset_dir(p_i, p_j, ref_vec);
+        // 表示成分の作用面に応じた張り出し方向（局所 y 面→ey, 局所 z 面→ez）。
+        let ey = diagram_offset_dir(p_i, p_j, ref_vec, axis_row);
         // 内部たわみ表示が有効な梁は、張り出しの基準線を変形後の Hermite 曲線に
         // する（`disp` が Some＝変形重ね時のみ）。梁の線描画と同じ `BeamDeflection`
         // で評価するため、基準線が梁の描画曲線に厳密一致する。それ以外（梁以外・
@@ -344,6 +362,100 @@ fn draw_contour_legend(painter: &egui::Painter, max_abs: f64, colormap: theme::C
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── force_diagram_spec ──────────────────────────────────────────────
+
+    /// N 図は成分によらず軸力（index 0）・局所 y 張り出し・ラベル "N"。
+    #[test]
+    fn force_diagram_spec_n_is_axial_regardless_of_component() {
+        for c in [
+            DiagramComponent::Y,
+            DiagramComponent::Z,
+            DiagramComponent::Torsion,
+        ] {
+            assert_eq!(force_diagram_spec(ViewMode::N, c), Some((0, 1, "N")));
+        }
+    }
+
+    /// Q 図は Y→Qy（index1・ey）、Z→Qz（index2・ez）。ねじりは Qy へフォールバック。
+    #[test]
+    fn force_diagram_spec_q_selects_shear_axis() {
+        assert_eq!(
+            force_diagram_spec(ViewMode::Q, DiagramComponent::Y),
+            Some((1, 1, "Qy"))
+        );
+        assert_eq!(
+            force_diagram_spec(ViewMode::Q, DiagramComponent::Z),
+            Some((2, 2, "Qz"))
+        );
+        assert_eq!(
+            force_diagram_spec(ViewMode::Q, DiagramComponent::Torsion),
+            Some((1, 1, "Qy"))
+        );
+    }
+
+    /// M 図は Y→Mz（index5・ey）、Z→My（index4・ez）、ねじり→Mx（index3・ey）。
+    #[test]
+    fn force_diagram_spec_m_selects_bending_axis_and_torsion() {
+        assert_eq!(
+            force_diagram_spec(ViewMode::M, DiagramComponent::Y),
+            Some((5, 1, "Mz"))
+        );
+        assert_eq!(
+            force_diagram_spec(ViewMode::M, DiagramComponent::Z),
+            Some((4, 2, "My"))
+        );
+        assert_eq!(
+            force_diagram_spec(ViewMode::M, DiagramComponent::Torsion),
+            Some((3, 1, "Mx"))
+        );
+    }
+
+    /// N/Q/M 以外のモードは None（図を描かない）。
+    #[test]
+    fn force_diagram_spec_other_modes_are_none() {
+        for m in [
+            ViewMode::Shape,
+            ViewMode::Deformed,
+            ViewMode::Mode,
+            ViewMode::Cmq,
+            ViewMode::CheckRatio,
+        ] {
+            assert_eq!(force_diagram_spec(m, DiagramComponent::Y), None);
+        }
+    }
+
+    /// 局所 y 成分（Qy/Mz）は張り出し軸 ey（行1）、局所 z 成分（Qz/My）は ez（行2）。
+    /// 作用面と張り出し方向の対応が保たれることを確認する。
+    #[test]
+    fn force_diagram_spec_offset_axis_matches_action_plane() {
+        // y 面成分 → 行1（ey）
+        assert_eq!(
+            force_diagram_spec(ViewMode::Q, DiagramComponent::Y)
+                .unwrap()
+                .1,
+            1
+        );
+        assert_eq!(
+            force_diagram_spec(ViewMode::M, DiagramComponent::Y)
+                .unwrap()
+                .1,
+            1
+        );
+        // z 面成分 → 行2（ez）
+        assert_eq!(
+            force_diagram_spec(ViewMode::Q, DiagramComponent::Z)
+                .unwrap()
+                .1,
+            2
+        );
+        assert_eq!(
+            force_diagram_spec(ViewMode::M, DiagramComponent::Z)
+                .unwrap()
+                .1,
+            2
+        );
+    }
 
     /// 単調増加（同符号）の区間は、各細分区間が台形（材軸2点＋張り出し2点）になり、
     /// 符号は常に非負（片側符号のみ）であることを確認する。
