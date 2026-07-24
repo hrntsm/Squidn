@@ -1330,6 +1330,14 @@ fn test_save_and_open_project_roundtrip() {
     assert!(app.last_error.is_none(), "{:?}", app.last_error);
     assert!(!app.staleness.unsaved_changes);
     assert_eq!(app.project_path.as_ref(), Some(&path));
+    // ショートカット保存はダイアログが出ず無反応になるため、成功通知で明示する。
+    assert!(
+        app.last_notice
+            .as_deref()
+            .is_some_and(|n| n.contains("保存しました") && n.contains("roundtrip.scz")),
+        "{:?}",
+        app.last_notice
+    );
 
     let saved_model = app.model.clone();
     let mut app2 = App::default();

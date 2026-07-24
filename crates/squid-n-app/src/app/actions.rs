@@ -84,6 +84,13 @@ impl App {
         self.last_error = None;
         match squid_n_io::scz::save_scz(&path, &self.model) {
             Ok(()) => {
+                // ショートカット保存はダイアログも出ず無反応になるため、
+                // 成功をステータスバーとログで明示する。
+                let name = path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| path.display().to_string());
+                self.report_notice(format!("保存しました: {}", name));
                 self.project_path = Some(path);
                 self.staleness.unsaved_changes = false;
             }

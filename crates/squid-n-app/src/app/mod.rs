@@ -1551,6 +1551,18 @@ mod actions;
 #[cfg(feature = "gui")]
 mod panels;
 
+/// 保存（Windows/Linux: Ctrl+S、macOS: ⌘S）。
+#[cfg(feature = "gui")]
+pub(crate) const SHORTCUT_SAVE: egui::KeyboardShortcut =
+    egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::S);
+
+/// 名前を付けて保存（Windows/Linux: Ctrl+Shift+S、macOS: ⇧⌘S）。
+#[cfg(feature = "gui")]
+pub(crate) const SHORTCUT_SAVE_AS: egui::KeyboardShortcut = egui::KeyboardShortcut::new(
+    egui::Modifiers::COMMAND.plus(egui::Modifiers::SHIFT),
+    egui::Key::S,
+);
+
 #[cfg(feature = "gui")]
 impl eframe::App for App {
     // eframe のデフォルトは (12,12,12) ≒ 黒なので、テーマに合わせた白灰色で上書きする
@@ -1574,6 +1586,18 @@ impl eframe::App for App {
             self.reset_draw_modes();
         }
 
+        // 保存ショートカット。consume_shortcut がイベントを消費するため後続の
+        // ウィジェットには流れない。セル編集中でも発火する（保存されるのは
+        // 確定済みの状態。未確定の編集は確定時に未保存マーカーが再点灯する）。
+        if ui
+            .ctx()
+            .input_mut(|i| i.consume_shortcut(&SHORTCUT_SAVE_AS))
+        {
+            self.save_project_dialog(true);
+        } else if ui.ctx().input_mut(|i| i.consume_shortcut(&SHORTCUT_SAVE)) {
+            self.save_project_dialog(false);
+        }
+
         // 上部ツールバー: ファイルメニュー + 工程タブ（自由遷移）+ Undo/Redo
         egui::Panel::top("top_toolbar").show_inside(ui, |ui| {
             ui.horizontal(|ui| {
@@ -1594,11 +1618,15 @@ impl eframe::App for App {
                         self.open_project_dialog();
                         ui.close();
                     }
-                    if ui.button("💾 保存").clicked() {
+                    let save_btn = egui::Button::new("💾 保存")
+                        .shortcut_text(ui.ctx().format_shortcut(&SHORTCUT_SAVE));
+                    if ui.add(save_btn).clicked() {
                         self.save_project_dialog(false);
                         ui.close();
                     }
-                    if ui.button("💾 名前を付けて保存…").clicked() {
+                    let save_as_btn = egui::Button::new("💾 名前を付けて保存…")
+                        .shortcut_text(ui.ctx().format_shortcut(&SHORTCUT_SAVE_AS));
+                    if ui.add(save_as_btn).clicked() {
                         self.save_project_dialog(true);
                         ui.close();
                     }
