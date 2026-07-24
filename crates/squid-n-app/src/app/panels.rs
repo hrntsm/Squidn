@@ -186,6 +186,10 @@ impl App {
             });
 
             // 結果ケース：静的解析結果／荷重組合せ結果をクリックで表示対象に選択できる。
+            // 選択は変位図だけでなく応力図・断面検定（長期/短期）まで切り替える
+            // （`select_displayed_result`）。クロージャ内では self を可変借用できないため、
+            // クリックされたキーを一旦退避し、クロージャの外で適用する。
+            let mut nav_selected: Option<StaticKey> = None;
             let header = egui::CollapsingHeader::new("結果ケース")
                 .default_open(true)
                 .id_salt("nav_result_cases");
@@ -217,7 +221,7 @@ impl App {
                             };
                             let is_sel = self.nav.focus_result == Some(StaticKey::Case(*key));
                             if ui.selectable_label(is_sel, label).clicked() {
-                                self.nav.focus_result = Some(StaticKey::Case(*key));
+                                nav_selected = Some(StaticKey::Case(*key));
                             }
                         }
                         for (i, (name, _)) in r.combos.iter().enumerate() {
@@ -226,7 +230,7 @@ impl App {
                                 .selectable_label(is_sel, format!("組合せ {}", name))
                                 .clicked()
                             {
-                                self.nav.focus_result = Some(StaticKey::Combo(i));
+                                nav_selected = Some(StaticKey::Combo(i));
                             }
                         }
                         if r.modal.is_some() {
@@ -237,6 +241,9 @@ impl App {
                     ui.label("（未実行）");
                 }
             });
+            if let Some(key) = nav_selected {
+                self.select_displayed_result(key);
+            }
 
             // 階/レベル（階の自動生成結果を上階→下階順に表示）
             let _ = ui.collapsing("階/レベル", |ui| {
@@ -1324,8 +1331,44 @@ impl App {
         self.start_time_history_job(wave);
     }
 
+    /// 結果タブの「表示対象」ドロップダウン用の選択肢（キーと表示名）を収集する。
+    /// 静的ケース（ユーザー荷重・地震静的・風静的）に続けて荷重組合せを並べる。
+    fn result_display_options(&self) -> Vec<(StaticKey, String)> {
+        let mut opts = Vec::new();
+        if let Some(r) = &self.results {
+            for (key, _) in r.statics.iter() {
+                let label = match key {
+                    StaticCaseKey::User(id) => {
+                        let nm = self
+                            .model
+                            .load_cases
+                            .iter()
+                            .find(|lc| lc.id == *id)
+                            .map(|lc| lc.name.as_str())
+                            .unwrap_or("");
+                        format!("LC {} {}", id.0, nm)
+                    }
+                    StaticCaseKey::Seismic(SeismicDir::X) => "地震静的 (X方向)".to_string(),
+                    StaticCaseKey::Seismic(SeismicDir::Y) => "地震静的 (Y方向)".to_string(),
+                    StaticCaseKey::Wind(SeismicDir::X) => "風静的 (X方向)".to_string(),
+                    StaticCaseKey::Wind(SeismicDir::Y) => "風静的 (Y方向)".to_string(),
+                };
+                opts.push((StaticKey::Case(*key), label));
+            }
+            for (i, (name, _)) in r.combos.iter().enumerate() {
+                opts.push((StaticKey::Combo(i), name.clone()));
+            }
+        }
+        opts
+    }
+
     /// 結果タブ：3Dビューア と 時刻歴グラフを切替。
     pub(crate) fn results_tab_panel(&mut self, ui: &mut egui::Ui) {
+        // 表示対象（荷重ケース／組合せ）の選択肢を先に収集する
+        // （クロージャ内で self を可変借用しないため）。current_key は現在の表示対象。
+        let result_options = self.result_display_options();
+        let current_key = self.nav.focus_result.or(self.last_static);
+        let mut selected_result: Option<StaticKey> = None;
         ui.horizontal(|ui| {
             let sel_spatial = self.results_view == ResultsView::Spatial;
             let sel_th = self.results_view == ResultsView::TimeHistory;
@@ -1356,7 +1399,32 @@ impl App {
             } else {
                 ui.colored_label(crate::theme::GRAY_600, "▷ 未実行");
             }
+            // 表示対象（荷重ケース／組合せ）の選択。変位図に加え、応力図・断面検定
+            // （その組合せの長期/短期）まで切り替える。
+            if !result_options.is_empty() {
+                ui.separator();
+                ui.label("表示対象:");
+                let cur_label = current_key
+                    .and_then(|k| result_options.iter().find(|(o, _)| *o == k))
+                    .map(|(_, l)| l.clone())
+                    .unwrap_or_else(|| "（選択）".to_string());
+                egui::ComboBox::from_id_salt("results_display_selector")
+                    .selected_text(cur_label)
+                    .show_ui(ui, |ui| {
+                        for (opt_key, label) in &result_options {
+                            if ui
+                                .selectable_label(current_key == Some(*opt_key), label)
+                                .clicked()
+                            {
+                                selected_result = Some(*opt_key);
+                            }
+                        }
+                    });
+            }
         });
+        if let Some(key) = selected_result {
+            self.select_displayed_result(key);
+        }
         ui.separator();
         match self.results_view {
             ResultsView::Spatial => crate::viewer::viewer_panel(ui, self),
@@ -1368,6 +1436,11 @@ impl App {
 
     /// 設計タブ：検定表（許容応力度・保有水平耐力）と MN 相関曲面ビューを切り替える。
     pub(crate) fn design_tab_panel(&mut self, ui: &mut egui::Ui) {
+        // 断面算定の対象荷重（ケース／組合せ）を選ぶドロップダウン用の選択肢。
+        // 長期/短期区分は上部ツールバーの「荷重: 長期/短期」に表示される。
+        let result_options = self.result_display_options();
+        let current_key = self.nav.focus_result.or(self.last_static);
+        let mut selected_result: Option<StaticKey> = None;
         ui.horizontal(|ui| {
             let sel_table = self.design_view == DesignView::Table;
             let sel_ult = self.design_view == DesignView::Ultimate;
@@ -1385,7 +1458,31 @@ impl App {
             if ui.selectable_label(sel_qty, "数量積算").clicked() {
                 self.design_view = DesignView::Quantities;
             }
+            // 対象荷重の選択。選ぶとその組合せの内力・長期/短期で断面算定が再実行される。
+            if !result_options.is_empty() {
+                ui.separator();
+                ui.label("対象荷重:");
+                let cur_label = current_key
+                    .and_then(|k| result_options.iter().find(|(o, _)| *o == k))
+                    .map(|(_, l)| l.clone())
+                    .unwrap_or_else(|| "（選択）".to_string());
+                egui::ComboBox::from_id_salt("design_display_selector")
+                    .selected_text(cur_label)
+                    .show_ui(ui, |ui| {
+                        for (opt_key, label) in &result_options {
+                            if ui
+                                .selectable_label(current_key == Some(*opt_key), label)
+                                .clicked()
+                            {
+                                selected_result = Some(*opt_key);
+                            }
+                        }
+                    });
+            }
         });
+        if let Some(key) = selected_result {
+            self.select_displayed_result(key);
+        }
         ui.separator();
         match self.design_view {
             DesignView::Table => crate::design_view::design_table(ui, self),

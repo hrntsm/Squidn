@@ -662,6 +662,46 @@ impl App {
             .or_else(|| self.last_static.and_then(resolve))
     }
 
+    /// 結果表示の対象を切り替える（ナビゲータ・結果タブの選択ドロップダウン共通）。
+    ///
+    /// 変位図・層指標だけでなく、応力図（N/Q/M）・断面検定が参照する
+    /// [`ResultsBundle::member_forces`] も選択結果へ差し替える。荷重組合せを選んだ
+    /// 場合は荷重継続性区分（長期/短期）を組合せ名から `is_short_term_combo` で
+    /// 再判定し、断面検定を再実行する。これにより、選んだ荷重（組合せ）の長期/短期に
+    /// 応じた断面算定結果が表示される。単一荷重ケースを選んだ場合は現在の区分を維持する
+    /// （`apply_static_case_result` と同じ扱い）。該当キーの解析結果が無い場合は何もしない。
+    pub fn select_displayed_result(&mut self, key: StaticKey) {
+        // 選択キーに対応する解析結果（内力と、組合せなら名前）を取り出す。
+        let resolved = self.results.as_ref().and_then(|bundle| match key {
+            StaticKey::Case(case_key) => bundle
+                .statics
+                .iter()
+                .find(|(k, _)| *k == case_key)
+                .map(|(_, s)| (s.member_forces.clone(), None)),
+            StaticKey::Combo(idx) => bundle
+                .combos
+                .get(idx)
+                .map(|(name, s)| (s.member_forces.clone(), Some(name.clone()))),
+        });
+        let Some((member_forces, combo_name)) = resolved else {
+            return;
+        };
+        self.nav.focus_result = Some(key);
+        self.last_static = Some(key);
+        if let Some(bundle) = self.results.as_mut() {
+            bundle.member_forces = member_forces;
+        }
+        // 組合せは名前から長期/短期を再判定する（単一ケースは現在の区分を維持）。
+        if let Some(name) = combo_name {
+            self.design_term = if squid_n_load::combo::is_short_term_combo(&name) {
+                LoadTerm::Short
+            } else {
+                LoadTerm::Long
+            };
+        }
+        self.run_design_check();
+    }
+
     /// 保有水平耐力の層別判定を行う。前提データが不足していれば Err(案内文)。
     ///
     /// 戻り値の第 2 要素は層ごとに採用された部材ランク（`design_rank_auto` が
