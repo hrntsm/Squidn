@@ -137,10 +137,10 @@ pub struct LoadCombination {
 /// - 短期地震: `DL + LL + EX`／`DL + LL - EX`
 /// - 短期地震: `DL + LL + EY`／`DL + LL - EY`
 ///
-/// 長期には架構用の積載（令85条1項の長期骨組解析用）を用いる。係数構成
-/// （参照ケース・係数・順序）は `squid_n_load::combo::auto_combinations` と同一で、
-/// 表示名のみ直接的なケース名にしている。長短期の判別は `is_short_term_combo` が
-/// 名前から行い、地震ケース名の "E" を含む短期4件が短期、`DL + LL` が長期となる。
+/// 長期には架構用の積載（令85条1項の長期骨組解析用）を用いる。命名・係数構成とも
+/// `squid_n_load::combo::auto_combinations`（DL/LL/EX/EY 指定）と一致する。長短期の
+/// 判別は `is_short_term_combo` が名前から行い、地震ケース名の "E" を含む短期4件が
+/// 短期、`DL + LL` が長期となる。
 pub fn default_combinations() -> Vec<LoadCombination> {
     // ID は default_load_cases() の並びに対応する。
     let dl = LoadCaseId(0);

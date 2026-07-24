@@ -1395,9 +1395,9 @@ impl App {
     /// Wind（任意）を各先頭1件選び、`squid_n_load::combo::standard_combinations` で
     /// 標準組合せを生成し、undo 可能に一括追加する（`AddCombination` を使用）。
     ///
-    /// 地震（Seismic 種別）は対象外とする: Kx/Ky の正確な組合せは方向別の地震静的
+    /// 地震（Seismic 種別）は対象外とする: EX/EY の正確な組合せは方向別の地震静的
     /// 解析（`run_seismic`）が別途扱うため、`kind` だけでは方向を判別できない
-    /// 単一の LoadCase から機械的に Kx/Ky を割り当てることは行わない
+    /// 単一の LoadCase から機械的に EX/EY を割り当てることは行わない
     /// （既存の手動選択 UI [`combinations_section`] が方向を明示して生成する経路を持つ）。
     /// 同じ理由により、Wind も見つかった先頭1件は `wind_x` にのみ割り当てる
     /// （`wind_y` は常に `None`）。
@@ -1938,9 +1938,9 @@ impl App {
         let Some(results) = &self.results else {
             return;
         };
-        // 地震時短期の設計用せん断力 QD = min(QD1, QD2) 用の長期(G+P)内力。
+        // 地震時短期の設計用せん断力 QD = min(QD1, QD2) 用の長期(DL+LL)内力。
         // 現在の結果が地震時組合せ（名前に K/E を含む）かつ短期のときのみ、
-        // 解析済みの長期組合せ（"G + P" 優先、無ければ長期判定の組合せ）を引く。
+        // 解析済みの長期組合せ（"DL + LL" 優先、無ければ長期判定の組合せ）を引く。
         // 長期が未解析なら None（QD 割増なし＝従来動作）。
         let is_seismic_combo = match self.last_static {
             Some(StaticKey::Combo(idx)) => results
@@ -1958,7 +1958,7 @@ impl App {
                 results
                     .combos
                     .iter()
-                    .find(|(n, _)| n == "G + P")
+                    .find(|(n, _)| n == "DL + LL")
                     .or_else(|| {
                         results
                             .combos

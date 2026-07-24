@@ -3287,8 +3287,8 @@ fn test_auto_generate_combinations_from_kinds() {
     app.auto_generate_combinations_action();
     assert!(app.last_error.is_none(), "{:?}", app.last_error);
 
-    // 多雪区域=false: G+P(1) + G+P+S(1) + 風±(2) = 4 ケース
-    // （地震(Kx/Ky)は kind だけでは方向を判別できないため対象外の仕様）。
+    // 多雪区域=false: DL+LL(1) + DL+LL+SL(1) + 風±(2) = 4 ケース
+    // （地震(EX/EY)は kind だけでは方向を判別できないため対象外の仕様）。
     let names: Vec<&str> = app
         .model
         .combinations
@@ -3297,10 +3297,10 @@ fn test_auto_generate_combinations_from_kinds() {
         .collect();
     assert_eq!(
         names,
-        vec!["G + P", "G + P + S", "G + P + Wx", "G + P - Wx"]
+        vec!["DL + LL", "DL + LL + SL", "DL + LL + WX", "DL + LL - WX"]
     );
 
-    // G+P の中身は Dead(0)+Live(1) を各1.0で参照する。
+    // DL+LL の中身は Dead(0)+Live(1) を各1.0で参照する。
     assert_eq!(
         app.model.combinations[0].terms,
         vec![(LoadCaseId(0), 1.0), (LoadCaseId(1), 1.0)]
@@ -3337,9 +3337,9 @@ fn test_auto_generate_combinations_heavy_snow() {
         .iter()
         .map(|c| c.name.as_str())
         .collect();
-    assert!(names.contains(&"G + P + 0.7S"), "{names:?}");
-    assert!(names.contains(&"G + P + 0.35S + Wx"), "{names:?}");
-    assert!(names.contains(&"G + P + 0.35S - Wx"), "{names:?}");
+    assert!(names.contains(&"DL + LL + 0.7SL"), "{names:?}");
+    assert!(names.contains(&"DL + LL + 0.35SL + WX"), "{names:?}");
+    assert!(names.contains(&"DL + LL + 0.35SL - WX"), "{names:?}");
 }
 
 /// Dead ケースが無い場合はエラーメッセージが設定され、組合せは生成されないこと。
