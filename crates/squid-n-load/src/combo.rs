@@ -466,6 +466,25 @@ mod tests {
     }
 
     #[test]
+    fn test_default_combinations_matches_auto_combinations() {
+        // squid-n-core の default_combinations（新規モデルの既定）は、標準ケースの
+        // 並び（0:DL, 1:LL(架構用), 3:EX, 4:EY）に対する auto_combinations と一致する。
+        // 両者の命名・構成がずれていないことを保証する。
+        let expected = auto_combinations(
+            LoadCaseId(0),
+            LoadCaseId(1),
+            Some(LoadCaseId(3)),
+            Some(LoadCaseId(4)),
+            None,
+        );
+        assert_eq!(
+            squid_n_core::model::default_combinations(),
+            expected,
+            "default_combinations が auto_combinations（DL/LL/EX/EY）と一致していない"
+        );
+    }
+
+    #[test]
     fn test_standard_combinations_empty_optional_cases() {
         let input = ComboInput {
             dl: LoadCaseId(1),

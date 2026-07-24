@@ -3753,7 +3753,7 @@ fn test_compute_cft_ultimate_checks() {
 // 標準荷重ケース（DL・LL(架構用)・LL(地震用)・EX・EY）
 // ------------------------------------------------------------------
 
-/// 新規モデル（`Model::with_default_load_cases`）は標準5ケースを持ち、
+/// 新規モデル（`Model::with_default_load_cases`）は標準5ケースと標準荷重組合せを持ち、
 /// `load_model` を通しても保持されることを確認する。
 #[test]
 fn test_new_model_has_default_load_cases() {
@@ -3773,6 +3773,23 @@ fn test_new_model_has_default_load_cases() {
             LL_SEISMIC_CASE_NAME,
             EX_CASE_NAME,
             EY_CASE_NAME
+        ]
+    );
+    // 標準荷重組合せ（長期 G+P、短期地震 G+P±Kx・G+P±Ky）も既定で用意される。
+    let combo_names: Vec<&str> = app
+        .model
+        .combinations
+        .iter()
+        .map(|c| c.name.as_str())
+        .collect();
+    assert_eq!(
+        combo_names,
+        vec![
+            "G + P",
+            "G + P + Kx",
+            "G + P - Kx",
+            "G + P + Ky",
+            "G + P - Ky"
         ]
     );
 }

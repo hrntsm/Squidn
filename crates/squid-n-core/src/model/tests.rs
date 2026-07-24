@@ -490,6 +490,70 @@ fn test_default_load_cases_and_model() {
     let model = Model::with_default_load_cases();
     assert!(model.validate().is_ok());
     assert_eq!(model.load_cases.len(), 5);
+    // 新規モデルは標準荷重組合せ（長期 G+P、短期地震 G+P±Kx・G+P±Ky）も持つ。
+    assert_eq!(model.combinations, default_combinations());
+}
+
+/// 標準荷重組合せ（`default_combinations`）の構成を確認する。
+/// 長期 G+P（DL+LL(架構用)）と短期地震 G+P±Kx・G+P±Ky（±EX・±EY）の計5組合せ。
+#[test]
+fn test_default_combinations() {
+    let combos = default_combinations();
+    let names: Vec<&str> = combos.iter().map(|c| c.name.as_str()).collect();
+    assert_eq!(
+        names,
+        vec![
+            "G + P",
+            "G + P + Kx",
+            "G + P - Kx",
+            "G + P + Ky",
+            "G + P - Ky"
+        ]
+    );
+    // 長期 G+P: DL(0)+LL(架構用=1) を各1.0で参照する。
+    assert_eq!(
+        combos[0].terms,
+        vec![(LoadCaseId(0), 1.0), (LoadCaseId(1), 1.0)]
+    );
+    // 短期地震: G+P に EX(3)/EY(4) を ±1.0 で加える。
+    assert_eq!(
+        combos[1].terms,
+        vec![
+            (LoadCaseId(0), 1.0),
+            (LoadCaseId(1), 1.0),
+            (LoadCaseId(3), 1.0)
+        ]
+    );
+    assert_eq!(
+        combos[2].terms,
+        vec![
+            (LoadCaseId(0), 1.0),
+            (LoadCaseId(1), 1.0),
+            (LoadCaseId(3), -1.0)
+        ]
+    );
+    assert_eq!(
+        combos[3].terms,
+        vec![
+            (LoadCaseId(0), 1.0),
+            (LoadCaseId(1), 1.0),
+            (LoadCaseId(4), 1.0)
+        ]
+    );
+    assert_eq!(
+        combos[4].terms,
+        vec![
+            (LoadCaseId(0), 1.0),
+            (LoadCaseId(1), 1.0),
+            (LoadCaseId(4), -1.0)
+        ]
+    );
+    // 参照する荷重ケース ID は default_load_cases() の DL/LL(架構用)/EX/EY に対応する。
+    let cases = default_load_cases();
+    assert_eq!(cases[0].name, DL_CASE_NAME);
+    assert_eq!(cases[1].name, LL_FRAME_CASE_NAME);
+    assert_eq!(cases[3].name, EX_CASE_NAME);
+    assert_eq!(cases[4].name, EY_CASE_NAME);
 }
 
 /// 旧スキーマの自動生成ケース名の移行: 改名（床荷重(自動)→DL 等）と、
