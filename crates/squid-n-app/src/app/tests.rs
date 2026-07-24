@@ -1495,6 +1495,70 @@ fn test_combination_flow() {
     assert_eq!(app.last_static, Some(StaticKey::Combo(0)));
 }
 
+/// 結果表示の切替 `select_displayed_result`（結果タブのドロップダウン・ナビゲータ共通）:
+/// 選んだ組合せへ member_forces（応力図・断面検定が参照）を差し替え、長期/短期区分を
+/// 組合せ名から再判定し、断面検定を再実行することを確認する。
+#[test]
+fn test_select_displayed_result_switches_forces_and_term() {
+    use squid_n_design_jp::LoadTerm;
+
+    let mut app = App::default();
+    app.load_model(crate::sample::portal_frame());
+    app.analysis_cfg.threads = 1;
+    // 長期 DL+LL（重力 LC0 のみ）と短期 DL+LL+EX（地震 LC1 入り）の 2 組合せ。
+    for combo in [
+        squid_n_core::model::LoadCombination {
+            name: "DL + LL".into(),
+            terms: vec![(LoadCaseId(0), 1.0)],
+        },
+        squid_n_core::model::LoadCombination {
+            name: "DL + LL + EX".into(),
+            terms: vec![(LoadCaseId(0), 1.0), (LoadCaseId(1), 1.0)],
+        },
+    ] {
+        app.undo.run(
+            &mut app.model,
+            Box::new(squid_n_edit::AddCombination { combo }),
+        );
+    }
+    app.run_all_combinations();
+    assert!(app.last_error.is_none(), "{:?}", app.last_error);
+    // 一括解析後は最後の組合せ（短期 DL+LL+EX）が表示対象。
+    assert_eq!(app.last_static, Some(StaticKey::Combo(1)));
+    assert_eq!(app.design_term, LoadTerm::Short);
+    // 長期・短期で部材内力が異なる（表示切替が実質的に効く前提）。
+    {
+        let b = app.results.as_ref().unwrap();
+        assert!(!b.member_forces.is_empty());
+        assert_ne!(
+            b.combos[0].1.member_forces[0].1.at,
+            b.combos[1].1.member_forces[0].1.at
+        );
+    }
+
+    // 長期組合せ（Combo(0)）へ表示切替 → focus/last/member_forces/design_term が長期へ。
+    app.select_displayed_result(StaticKey::Combo(0));
+    assert_eq!(app.nav.focus_result, Some(StaticKey::Combo(0)));
+    assert_eq!(app.last_static, Some(StaticKey::Combo(0)));
+    assert_eq!(app.design_term, LoadTerm::Long);
+    {
+        let b = app.results.as_ref().unwrap();
+        assert_eq!(b.member_forces[0].1.at, b.combos[0].1.member_forces[0].1.at);
+    }
+
+    // 短期組合せ（Combo(1)）へ戻す → design_term が短期へ、member_forces も一致。
+    app.select_displayed_result(StaticKey::Combo(1));
+    assert_eq!(app.design_term, LoadTerm::Short);
+    {
+        let b = app.results.as_ref().unwrap();
+        assert_eq!(b.member_forces[0].1.at, b.combos[1].1.member_forces[0].1.at);
+    }
+
+    // 存在しないキーは no-op（表示対象は変わらない）。
+    app.select_displayed_result(StaticKey::Combo(99));
+    assert_eq!(app.last_static, Some(StaticKey::Combo(1)));
+}
+
 /// `run_all_combinations` は個別に `run_combination` を実行した場合と
 /// 同じ結果（combos の名前・変位）を与える（並列/一括経路と単発経路の一致確認）。
 /// 決定性のため `threads=1`（Deterministic）を明示する。
@@ -3287,8 +3351,8 @@ fn test_auto_generate_combinations_from_kinds() {
     app.auto_generate_combinations_action();
     assert!(app.last_error.is_none(), "{:?}", app.last_error);
 
-    // 多雪区域=false: G+P(1) + G+P+S(1) + 風±(2) = 4 ケース
-    // （地震(Kx/Ky)は kind だけでは方向を判別できないため対象外の仕様）。
+    // 多雪区域=false: DL+LL(1) + DL+LL+SL(1) + 風±(2) = 4 ケース
+    // （地震(EX/EY)は kind だけでは方向を判別できないため対象外の仕様）。
     let names: Vec<&str> = app
         .model
         .combinations
@@ -3297,10 +3361,10 @@ fn test_auto_generate_combinations_from_kinds() {
         .collect();
     assert_eq!(
         names,
-        vec!["G + P", "G + P + S", "G + P + Wx", "G + P - Wx"]
+        vec!["DL + LL", "DL + LL + SL", "DL + LL + WX", "DL + LL - WX"]
     );
 
-    // G+P の中身は Dead(0)+Live(1) を各1.0で参照する。
+    // DL+LL の中身は Dead(0)+Live(1) を各1.0で参照する。
     assert_eq!(
         app.model.combinations[0].terms,
         vec![(LoadCaseId(0), 1.0), (LoadCaseId(1), 1.0)]
@@ -3337,9 +3401,9 @@ fn test_auto_generate_combinations_heavy_snow() {
         .iter()
         .map(|c| c.name.as_str())
         .collect();
-    assert!(names.contains(&"G + P + 0.7S"), "{names:?}");
-    assert!(names.contains(&"G + P + 0.35S + Wx"), "{names:?}");
-    assert!(names.contains(&"G + P + 0.35S - Wx"), "{names:?}");
+    assert!(names.contains(&"DL + LL + 0.7SL"), "{names:?}");
+    assert!(names.contains(&"DL + LL + 0.35SL + WX"), "{names:?}");
+    assert!(names.contains(&"DL + LL + 0.35SL - WX"), "{names:?}");
 }
 
 /// Dead ケースが無い場合はエラーメッセージが設定され、組合せは生成されないこと。
@@ -3753,7 +3817,7 @@ fn test_compute_cft_ultimate_checks() {
 // 標準荷重ケース（DL・LL(架構用)・LL(地震用)・EX・EY）
 // ------------------------------------------------------------------
 
-/// 新規モデル（`Model::with_default_load_cases`）は標準5ケースを持ち、
+/// 新規モデル（`Model::with_default_load_cases`）は標準5ケースと標準荷重組合せを持ち、
 /// `load_model` を通しても保持されることを確認する。
 #[test]
 fn test_new_model_has_default_load_cases() {
@@ -3773,6 +3837,23 @@ fn test_new_model_has_default_load_cases() {
             LL_SEISMIC_CASE_NAME,
             EX_CASE_NAME,
             EY_CASE_NAME
+        ]
+    );
+    // 標準荷重組合せ（長期 DL+LL、短期地震 DL+LL±EX・DL+LL±EY）も既定で用意される。
+    let combo_names: Vec<&str> = app
+        .model
+        .combinations
+        .iter()
+        .map(|c| c.name.as_str())
+        .collect();
+    assert_eq!(
+        combo_names,
+        vec![
+            "DL + LL",
+            "DL + LL + EX",
+            "DL + LL - EX",
+            "DL + LL + EY",
+            "DL + LL - EY"
         ]
     );
 }

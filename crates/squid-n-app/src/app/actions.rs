@@ -117,8 +117,9 @@ impl App {
     /// ST-Bridge（XML, サブセット）ファイルを読み込む。
     /// Squid-N プロジェクト（.scz）とは別物なので project_path はクリアする。
     /// ファイルが荷重情報（`StbLoadCase`）を持たない場合は、標準荷重ケース
-    /// （DL・LL(架構用)・LL(地震用)・EX・EY）を自動作成する（新規モデルと同じ
-    /// 出発点。DL の自重・スラブ荷重は解析実行前の同期アクションが自動計算する）。
+    /// （DL・LL(架構用)・LL(地震用)・EX・EY）と標準荷重組合せ（長期 DL+LL、
+    /// 短期地震 DL+LL±EX・DL+LL±EY）を自動作成する（新規モデルと同じ出発点。
+    /// DL の自重・スラブ荷重は解析実行前の同期アクションが自動計算する）。
     pub fn import_stbridge_from(&mut self, path: std::path::PathBuf) {
         self.last_error = None;
         let xml = match squid_n_io::stbridge::read_stbridge_file(&path) {
@@ -136,6 +137,10 @@ impl App {
                 }
                 if model.load_cases.is_empty() {
                     model.load_cases = squid_n_core::model::default_load_cases();
+                    // 荷重ケースを補完した場合は標準荷重組合せも用意する（新規モデルと同じ出発点）。
+                    if model.combinations.is_empty() {
+                        model.combinations = squid_n_core::model::default_combinations();
+                    }
                 }
                 self.load_model(model);
                 self.project_path = None;
@@ -655,6 +660,46 @@ impl App {
             .focus_result
             .and_then(resolve)
             .or_else(|| self.last_static.and_then(resolve))
+    }
+
+    /// 結果表示の対象を切り替える（ナビゲータ・結果タブの選択ドロップダウン共通）。
+    ///
+    /// 変位図・層指標だけでなく、応力図（N/Q/M）・断面検定が参照する
+    /// [`ResultsBundle::member_forces`] も選択結果へ差し替える。荷重組合せを選んだ
+    /// 場合は荷重継続性区分（長期/短期）を組合せ名から `is_short_term_combo` で
+    /// 再判定し、断面検定を再実行する。これにより、選んだ荷重（組合せ）の長期/短期に
+    /// 応じた断面算定結果が表示される。単一荷重ケースを選んだ場合は現在の区分を維持する
+    /// （`apply_static_case_result` と同じ扱い）。該当キーの解析結果が無い場合は何もしない。
+    pub fn select_displayed_result(&mut self, key: StaticKey) {
+        // 選択キーに対応する解析結果（内力と、組合せなら名前）を取り出す。
+        let resolved = self.results.as_ref().and_then(|bundle| match key {
+            StaticKey::Case(case_key) => bundle
+                .statics
+                .iter()
+                .find(|(k, _)| *k == case_key)
+                .map(|(_, s)| (s.member_forces.clone(), None)),
+            StaticKey::Combo(idx) => bundle
+                .combos
+                .get(idx)
+                .map(|(name, s)| (s.member_forces.clone(), Some(name.clone()))),
+        });
+        let Some((member_forces, combo_name)) = resolved else {
+            return;
+        };
+        self.nav.focus_result = Some(key);
+        self.last_static = Some(key);
+        if let Some(bundle) = self.results.as_mut() {
+            bundle.member_forces = member_forces;
+        }
+        // 組合せは名前から長期/短期を再判定する（単一ケースは現在の区分を維持）。
+        if let Some(name) = combo_name {
+            self.design_term = if squid_n_load::combo::is_short_term_combo(&name) {
+                LoadTerm::Short
+            } else {
+                LoadTerm::Long
+            };
+        }
+        self.run_design_check();
     }
 
     /// 保有水平耐力の層別判定を行う。前提データが不足していれば Err(案内文)。
@@ -1390,9 +1435,9 @@ impl App {
     /// Wind（任意）を各先頭1件選び、`squid_n_load::combo::standard_combinations` で
     /// 標準組合せを生成し、undo 可能に一括追加する（`AddCombination` を使用）。
     ///
-    /// 地震（Seismic 種別）は対象外とする: Kx/Ky の正確な組合せは方向別の地震静的
+    /// 地震（Seismic 種別）は対象外とする: EX/EY の正確な組合せは方向別の地震静的
     /// 解析（`run_seismic`）が別途扱うため、`kind` だけでは方向を判別できない
-    /// 単一の LoadCase から機械的に Kx/Ky を割り当てることは行わない
+    /// 単一の LoadCase から機械的に EX/EY を割り当てることは行わない
     /// （既存の手動選択 UI [`combinations_section`] が方向を明示して生成する経路を持つ）。
     /// 同じ理由により、Wind も見つかった先頭1件は `wind_x` にのみ割り当てる
     /// （`wind_y` は常に `None`）。
@@ -1933,9 +1978,9 @@ impl App {
         let Some(results) = &self.results else {
             return;
         };
-        // 地震時短期の設計用せん断力 QD = min(QD1, QD2) 用の長期(G+P)内力。
+        // 地震時短期の設計用せん断力 QD = min(QD1, QD2) 用の長期(DL+LL)内力。
         // 現在の結果が地震時組合せ（名前に K/E を含む）かつ短期のときのみ、
-        // 解析済みの長期組合せ（"G + P" 優先、無ければ長期判定の組合せ）を引く。
+        // 解析済みの長期組合せ（"DL + LL" 優先、無ければ長期判定の組合せ）を引く。
         // 長期が未解析なら None（QD 割増なし＝従来動作）。
         let is_seismic_combo = match self.last_static {
             Some(StaticKey::Combo(idx)) => results
@@ -1953,7 +1998,7 @@ impl App {
                 results
                     .combos
                     .iter()
-                    .find(|(n, _)| n == "G + P")
+                    .find(|(n, _)| n == "DL + LL")
                     .or_else(|| {
                         results
                             .combos
