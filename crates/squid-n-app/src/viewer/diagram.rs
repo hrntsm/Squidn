@@ -23,8 +23,7 @@ use crate::app::App;
 use crate::theme;
 
 use super::{
-    beam_deformed_point_at, diagram_offset_dir, member_len3, project, project_offset, CameraState,
-    ViewMode,
+    diagram_offset_dir, member_len3, project, project_offset, BeamDeflection, CameraState, ViewMode,
 };
 
 /// 張り出しピークがこの px 未満の図形は描かない。60px 正規化に対して値が
@@ -190,18 +189,26 @@ pub(super) fn draw_force_diagram(
         let ref_vec = elem.local_axis.ref_vector;
         let ey = diagram_offset_dir(p_i, p_j, ref_vec);
         // 内部たわみ表示が有効な梁は、張り出しの基準線を変形後の Hermite 曲線に
-        // する（`disp` が Some＝変形重ね時のみ）。梁の線描画と同じ `beam_deformed_
-        // point_at` で評価するため、基準線が梁の描画曲線に厳密一致する。それ以外
-        // （梁以外・内部たわみ OFF・変形重ね無し）は変形後の節点間直線（弦）を
-        // 基準線にする（従来どおり）。
-        let curve_ends: Option<([f64; 6], [f64; 6])> =
+        // する（`disp` が Some＝変形重ね時のみ）。梁の線描画と同じ `BeamDeflection`
+        // で評価するため、基準線が梁の描画曲線に厳密一致する。それ以外（梁以外・
+        // 内部たわみ OFF・変形重ね無し）は変形後の節点間直線（弦）を基準線にする
+        // （従来どおり）。未変形材軸端点から一度だけ前処理する。
+        let deflection: Option<BeamDeflection> =
             if app.show_beam_interpolation && elem.kind == squid_n_core::model::ElementKind::Beam {
-                disp.and_then(|d| (n0 < d.len() && n1 < d.len()).then(|| (d[n0], d[n1])))
+                disp.and_then(|d| {
+                    (n0 < d.len() && n1 < d.len()).then(|| {
+                        BeamDeflection::new(
+                            app.model.nodes[n0].coord,
+                            app.model.nodes[n1].coord,
+                            d[n0],
+                            d[n1],
+                            ref_vec,
+                        )
+                    })
+                })
             } else {
                 None
             };
-        // 曲線評価に使う未変形材軸端点。
-        let (pu_i, pu_j) = (app.model.nodes[n0].coord, app.model.nodes[n1].coord);
         let p0 = {
             let p = project(p_i, center3, cam, scale, screen_center);
             egui::pos2(p[0], p[1])
@@ -226,12 +233,10 @@ pub(super) fn draw_force_diagram(
         }
 
         // (xi, val) → スクリーン座標。val=0 は基準線そのもの（オフセット無し）。
-        // 基準線は curve_ends があれば梁の変形後 Hermite 曲線、無ければ節点間直線。
+        // 基準線は deflection があれば梁の変形後 Hermite 曲線、無ければ節点間直線。
         let to_screen = |xi: f64, val: f64| -> egui::Pos2 {
-            let base3 = match curve_ends {
-                Some((di, dj)) => {
-                    beam_deformed_point_at(pu_i, pu_j, di, dj, ref_vec, deform_scale, xi)
-                }
+            let base3 = match &deflection {
+                Some(bd) => bd.point_at(xi, deform_scale),
                 None => [
                     p_i[0] + (p_j[0] - p_i[0]) * xi,
                     p_i[1] + (p_j[1] - p_i[1]) * xi,

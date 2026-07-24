@@ -1048,15 +1048,8 @@ pub fn viewer_panel(ui: &mut egui::Ui, app: &mut App) {
             let p_i = app.model.nodes[n0].coord;
             let p_j = app.model.nodes[n1].coord;
             if member_len3(p_i, p_j) > 1e-9 {
-                let poly3 = beam_deformed_polyline(
-                    p_i,
-                    p_j,
-                    d[n0],
-                    d[n1],
-                    elem.local_axis.ref_vector,
-                    deform_scale_actual,
-                    DEFORM_CURVE_SEGMENTS,
-                );
+                let poly3 = BeamDeflection::new(p_i, p_j, d[n0], d[n1], elem.local_axis.ref_vector)
+                    .polyline(deform_scale_actual, DEFORM_CURVE_SEGMENTS);
                 let screen: Vec<egui::Pos2> = poly3
                     .iter()
                     .map(|&p| {
@@ -1355,110 +1348,103 @@ fn member_len3(p_i: [f64; 3], p_j: [f64; 3]) -> f64 {
 /// 変形図・モード形で梁の曲げ変形曲線を描く際の要素分割数（点数は +1）。
 const DEFORM_CURVE_SEGMENTS: usize = 12;
 
-/// 梁要素の変形形状を Hermite 3 次多項式で内挿し、変形後の 3D 点列を返す。
+/// 梁要素の Hermite 3 次変形曲線を評価するための前処理データ。
 ///
-/// 端部の並進・回転（節点変位 6 成分）から、要素ローカル系で
-/// - 軸方向 (x): 線形内挿（1−ξ, ξ）
-/// - 曲げ 2 面 (y, z): Hermite 3 次形状関数（等価節点力 [`squid_n_element::member_load`]
-///   と同一の形状関数・符号規約）
+/// 端部 6 自由度（節点変位、無倍率）を要素ローカル系へ一度だけ変換して保持し、
+/// 材軸パラメータ ξ∈[0,1] での変位・曲線上の点を安価に評価する。曲線描画・応力図
+/// の基準線・床節点の追従・変形スケール上限で共有し、「梁の変形後の形」の評価を
+/// 一箇所へ集約する（ループでの `LocalFrame` 再構築も避ける）。
 ///
-/// により要素内部の変位場を評価し、グローバル系へ戻して未変形材軸上の各点へ
-/// 加える。両端を含む `segments + 1` 点の折れ線を返す。ξ=0,1 では回転項が消え、
-/// 端部は節点変位に厳密に一致する（節点マーカーと連続）。
-///
-/// 本内挿は表示専用であり解析結果（節点変位・内力）は一切変更しない。要素は
-/// せん断変形を含む Timoshenko 梁だが、変形図は Euler-Bernoulli の Hermite 曲線で
-/// 近似する（変形形状の可視化として実務上標準的）。
-fn beam_deformed_polyline(
+/// 軸方向は線形内挿、曲げ 2 面は Hermite 3 次形状関数で内挿する（等価節点力
+/// [`squid_n_element::member_load`] と同一の形状関数・符号規約。局所 z 面は θy の
+/// 符号反転）。ξ=0,1 では回転項が消え端点は節点変位に一致する。本内挿は表示専用
+/// であり解析結果（節点変位・内力）は変更しない。要素はせん断変形を含む
+/// Timoshenko 梁だが、変形図は Euler–Bernoulli の Hermite 曲線で近似する
+/// （変形形状の可視化として実務上標準的）。
+struct BeamDeflection {
+    /// 要素ローカル系（`rot` 行 = ex, ey, ez）。
+    frame: squid_n_element::transform::LocalFrame,
+    /// 部材長。
+    l: f64,
+    /// 未変形材軸の始点・終点（グローバル）。
     p_i: [f64; 3],
     p_j: [f64; 3],
-    d_i: [f64; 6],
-    d_j: [f64; 6],
-    ref_vector: [f64; 3],
-    scale: f64,
-    segments: usize,
-) -> Vec<[f64; 3]> {
-    let seg = segments.max(1);
-    (0..=seg)
-        .map(|k| {
-            let xi = k as f64 / seg as f64;
-            beam_deformed_point_at(p_i, p_j, d_i, d_j, ref_vector, scale, xi)
-        })
-        .collect()
+    /// i 端のローカル端部変位 `[ux, uy, uz, ry, rz]`。
+    ui: [f64; 5],
+    /// j 端のローカル端部変位 `[ux, uy, uz, ry, rz]`。
+    uj: [f64; 5],
 }
 
-/// 梁要素の変形後曲線上の点を材軸パラメータ ξ∈[0,1] で返す。
-///
-/// 未変形材軸上の点 `p_i + (p_j−p_i)·ξ` に、端部 6 自由度からの Hermite 変位
-/// （[`beam_hermite_disp_at`]、無倍率）へ表示倍率 `scale` を掛けたものを加える。
-/// 曲線描画（[`beam_deformed_polyline`]）と、応力図（N/Q/M）の張り出しを梁の
-/// 変形曲線へ載せる処理（`diagram.rs`）とで共有し、両者の基準線を一致させる。
-/// ξ=0,1 では回転項が消え、端点は節点変位（＝節点マーカー位置）に一致する。
-fn beam_deformed_point_at(
-    p_i: [f64; 3],
-    p_j: [f64; 3],
-    d_i: [f64; 6],
-    d_j: [f64; 6],
-    ref_vector: [f64; 3],
-    scale: f64,
-    xi: f64,
-) -> [f64; 3] {
-    let dg = beam_hermite_disp_at(p_i, p_j, d_i, d_j, ref_vector, xi);
-    [
-        p_i[0] + (p_j[0] - p_i[0]) * xi + dg[0] * scale,
-        p_i[1] + (p_j[1] - p_i[1]) * xi + dg[1] * scale,
-        p_i[2] + (p_j[2] - p_i[2]) * xi + dg[2] * scale,
-    ]
-}
+impl BeamDeflection {
+    /// 端部変位 `d_i`, `d_j`（節点変位 6 成分、無倍率）から前処理する。
+    fn new(
+        p_i: [f64; 3],
+        p_j: [f64; 3],
+        d_i: [f64; 6],
+        d_j: [f64; 6],
+        ref_vector: [f64; 3],
+    ) -> Self {
+        let l = member_len3(p_i, p_j);
+        let frame = squid_n_element::transform::LocalFrame::from_nodes(p_i, p_j, ref_vector);
+        let g = [
+            d_i[0], d_i[1], d_i[2], d_i[3], d_i[4], d_i[5], d_j[0], d_j[1], d_j[2], d_j[3], d_j[4],
+            d_j[5],
+        ];
+        let u = frame.rotate_to_local(&g);
+        // 端部: 並進(ux,uy,uz)=u[0..3]/u[6..9]、曲げ回転(ry,rz)=u[4..6]/u[10..12]。
+        Self {
+            frame,
+            l,
+            p_i,
+            p_j,
+            ui: [u[0], u[1], u[2], u[4], u[5]],
+            uj: [u[6], u[7], u[8], u[10], u[11]],
+        }
+    }
 
-/// 梁要素の Hermite 変位場を材軸パラメータ ξ∈[0,1] で評価し、未変形材軸上の点へ
-/// 加える「グローバル並進変位（無倍率）」を返す。
-///
-/// 端部変位 `d_i`, `d_j`（節点変位 6 成分、無倍率）から、要素ローカル系で
-/// - 軸方向 (x): 線形内挿（1−ξ, ξ）
-/// - 曲げ 2 面 (y, z): Hermite 3 次形状関数（等価節点力 [`squid_n_element::member_load`]
-///   と同一の形状関数・符号規約）
-///
-/// により変位場を評価し、グローバル系へ戻す。ξ=0,1 では回転項が消え、端点は
-/// 節点並進変位に厳密一致する。[`beam_deformed_polyline`]（曲線描画）と、床・
-/// 二次部材の節点を梁曲線へ載せる補間（[`interpolate_unreferenced_disp`]）とで
-/// この関数を共有し、床節点が梁の描画曲線から浮かないようにする。
-fn beam_hermite_disp_at(
-    p_i: [f64; 3],
-    p_j: [f64; 3],
-    d_i: [f64; 6],
-    d_j: [f64; 6],
-    ref_vector: [f64; 3],
-    xi: f64,
-) -> [f64; 3] {
-    let l = member_len3(p_i, p_j);
-    let frame = squid_n_element::transform::LocalFrame::from_nodes(p_i, p_j, ref_vector);
+    /// 材軸パラメータ ξ での「未変形材軸上の点へ加えるグローバル並進変位」（無倍率）。
+    /// 床・二次部材の節点を梁曲線へ載せる補間で用いる（描画曲線から浮かないよう
+    /// 同じ評価を共有する）。
+    fn disp_at(&self, xi: f64) -> [f64; 3] {
+        let l = self.l;
+        // Hermite 3 次形状関数（N2,N4 は L 倍を含む回転項）。
+        let n1 = 1.0 - 3.0 * xi * xi + 2.0 * xi * xi * xi;
+        let n2 = l * (xi - 2.0 * xi * xi + xi * xi * xi);
+        let n3 = 3.0 * xi * xi - 2.0 * xi * xi * xi;
+        let n4 = l * (-xi * xi + xi * xi * xi);
+        let [uxi, uyi, uzi, ryi, rzi] = self.ui;
+        let [uxj, uyj, uzj, ryj, rzj] = self.uj;
+        // ローカル変位場: y 面は θz、z 面は θy（符号反転、member_load の msign=-1 と一致）。
+        let ux = (1.0 - xi) * uxi + xi * uxj;
+        let uy = n1 * uyi + n2 * rzi + n3 * uyj + n4 * rzj;
+        let uz = n1 * uzi - n2 * ryi + n3 * uzj - n4 * ryj;
+        // ローカル→グローバル（rot 行 = ex,ey,ez。global = ux·ex + uy·ey + uz·ez）。
+        let r = &self.frame.rot;
+        [
+            r[0][0] * ux + r[1][0] * uy + r[2][0] * uz,
+            r[0][1] * ux + r[1][1] * uy + r[2][1] * uz,
+            r[0][2] * ux + r[1][2] * uy + r[2][2] * uz,
+        ]
+    }
 
-    // 端部変位（並進・回転）をローカル系へ回転する。
-    let g = [
-        d_i[0], d_i[1], d_i[2], d_i[3], d_i[4], d_i[5], d_j[0], d_j[1], d_j[2], d_j[3], d_j[4],
-        d_j[5],
-    ];
-    let u = frame.rotate_to_local(&g);
-    // i 端: 並進(ux,uy,uz)=u[0..3]、回転(-, ry, rz)=u[3..6]
-    let (uxi, uyi, uzi, ryi, rzi) = (u[0], u[1], u[2], u[4], u[5]);
-    let (uxj, uyj, uzj, ryj, rzj) = (u[6], u[7], u[8], u[10], u[11]);
+    /// 変形後曲線上の点（未変形材軸上の点 + 倍率付き変位）を ξ で返す。
+    /// ξ=0,1 では端点＝節点変位（`scale` 倍）に厳密一致する（節点マーカーと連続）。
+    fn point_at(&self, xi: f64, scale: f64) -> [f64; 3] {
+        let dg = self.disp_at(xi);
+        [
+            self.p_i[0] + (self.p_j[0] - self.p_i[0]) * xi + dg[0] * scale,
+            self.p_i[1] + (self.p_j[1] - self.p_i[1]) * xi + dg[1] * scale,
+            self.p_i[2] + (self.p_j[2] - self.p_i[2]) * xi + dg[2] * scale,
+        ]
+    }
 
-    // Hermite 3 次形状関数（N2,N4 は L 倍を含む回転項）
-    let n1 = 1.0 - 3.0 * xi * xi + 2.0 * xi * xi * xi;
-    let n2 = l * (xi - 2.0 * xi * xi + xi * xi * xi);
-    let n3 = 3.0 * xi * xi - 2.0 * xi * xi * xi;
-    let n4 = l * (-xi * xi + xi * xi * xi);
-    // ローカル変位場: y 面は θz、z 面は θy（符号反転、member_load の msign=-1 と一致）
-    let ux = (1.0 - xi) * uxi + xi * uxj;
-    let uy = n1 * uyi + n2 * rzi + n3 * uyj + n4 * rzj;
-    let uz = n1 * uzi - n2 * ryi + n3 * uzj - n4 * ryj;
-    // ローカル→グローバル（rot 行 = ex,ey,ez。global = ux·ex + uy·ey + uz·ez）
-    [
-        frame.rot[0][0] * ux + frame.rot[1][0] * uy + frame.rot[2][0] * uz,
-        frame.rot[0][1] * ux + frame.rot[1][1] * uy + frame.rot[2][1] * uz,
-        frame.rot[0][2] * ux + frame.rot[1][2] * uy + frame.rot[2][2] * uz,
-    ]
+    /// 変形後曲線を両端含む `segments + 1` 点の折れ線で返す（曲線描画用）。
+    fn polyline(&self, scale: f64, segments: usize) -> Vec<[f64; 3]> {
+        let seg = segments.max(1);
+        (0..=seg)
+            .map(|k| self.point_at(k as f64 / seg as f64, scale))
+            .collect()
+    }
 }
 
 /// 3D 位置 `base3` から `dir3` 方向へ `off_world` だけ張り出した点を投影する。
@@ -2131,14 +2117,14 @@ fn interpolate_unreferenced_disp(
             // 描画曲線上へ載せ、回転は端点の線形補間で補う）。梁以外、または内部
             // たわみ表示 OFF（梁を直線で描く）のときは全 6 成分を線形補間する。
             let interp: [f64; 6] = if s.beam && use_beam_hermite {
-                let hermite = beam_hermite_disp_at(
+                let hermite = BeamDeflection::new(
                     model.nodes[s.a].coord,
                     model.nodes[s.b].coord,
                     da,
                     db,
                     s.ref_vec,
-                    t,
-                );
+                )
+                .disp_at(t);
                 std::array::from_fn(|k| match k {
                     0..=2 => hermite[k],
                     _ => da[k] * (1.0 - t) + db[k] * t,
@@ -2308,10 +2294,12 @@ fn beam_deflection_scale_limit(
         }
         let (d_i, d_j) = (disp[a], disp[b]);
         // 無倍率での弦からの最大逸脱（弦＝端部並進の線形補間、曲線＝Hermite 変位）。
+        // 端部 DOF のローカル化は ξ に依らないため、梁ごとに 1 回だけ前処理する。
+        let bd = BeamDeflection::new(p_i, p_j, d_i, d_j, elem.local_axis.ref_vector);
         let mut max_dev = 0.0_f64;
         for k in 1..SAMPLES {
             let xi = k as f64 / SAMPLES as f64;
-            let h = beam_hermite_disp_at(p_i, p_j, d_i, d_j, elem.local_axis.ref_vector, xi);
+            let h = bd.disp_at(xi);
             let dev = ((h[0] - (d_i[0] * (1.0 - xi) + d_j[0] * xi)).powi(2)
                 + (h[1] - (d_i[1] * (1.0 - xi) + d_j[1] * xi)).powi(2)
                 + (h[2] - (d_i[2] * (1.0 - xi) + d_j[2] * xi)).powi(2))
@@ -2675,7 +2663,7 @@ mod tests {
     #[test]
     fn 梁上の未参照節点は梁の描画曲線に厳密一致する() {
         // 端部に回転を与えた梁のスパン中央に未参照節点を置く。その補間変位が、同じ
-        // 端部変位で beam_deformed_polyline を描いた曲線の同一パラメータ位置の変位に
+        // 端部変位で BeamDeflection::polyline を描いた曲線の同一パラメータ位置の変位に
         // 厳密一致すること（床・二次部材の節点が梁の描画たわみ曲線から浮かない）。
         let mut model = Model::default();
         model.nodes.push(test_node(0, [0.0, 0.0, 0.0]));
@@ -2690,15 +2678,14 @@ mod tests {
 
         // 同じ端部変位で梁曲線を無倍率描画し、中央点（12 分割の index 6=ξ0.5）の
         // 変位（曲線点 − 未変形材軸点）を取る。
-        let poly = beam_deformed_polyline(
+        let poly = BeamDeflection::new(
             [0.0, 0.0, 0.0],
             [6000.0, 0.0, 0.0],
             d_i,
             d_j,
             [0.0, 0.0, 1.0],
-            1.0,
-            12,
-        );
+        )
+        .polyline(1.0, 12);
         let curve_disp = [poly[6][0] - 3000.0, poly[6][1] - 0.0, poly[6][2] - 0.0];
         for k in 0..3 {
             assert!(
@@ -2778,7 +2765,7 @@ mod tests {
         let d_i = [0.0, 1.0, 0.0, 0.0, 0.0, 0.001];
         let d_j = [2.0, 3.0, 0.0, 0.0, 0.0, -0.002];
         let scale = 2.0;
-        let poly = beam_deformed_polyline(p_i, p_j, d_i, d_j, [0.0, 0.0, 1.0], scale, 12);
+        let poly = BeamDeflection::new(p_i, p_j, d_i, d_j, [0.0, 0.0, 1.0]).polyline(scale, 12);
         assert_eq!(poly.len(), 13);
         // i 端 = p_i + scale·d_i(並進)
         for k in 0..3 {
@@ -2805,7 +2792,7 @@ mod tests {
         let p_j = [1000.0, 0.0, 0.0];
         let d_i = [0.0, 0.0, 0.0, 0.0, 0.0, 0.01];
         let d_j = [0.0, 0.0, 0.0, 0.0, 0.0, -0.01];
-        let poly = beam_deformed_polyline(p_i, p_j, d_i, d_j, [0.0, 1.0, 0.0], 1.0, 12);
+        let poly = BeamDeflection::new(p_i, p_j, d_i, d_j, [0.0, 1.0, 0.0]).polyline(1.0, 12);
         let mid = poly[6];
         // 中央の材軸位置は x=500、たわみは局所 y=+Y 方向へ非ゼロ
         assert!((mid[0] - 500.0).abs() < 1e-6, "中央 x={}", mid[0]);
@@ -2820,16 +2807,17 @@ mod tests {
 
     #[test]
     fn 梁変形後曲線の端点は節点変位に一致し中央は弦から外れる() {
-        // 応力図の基準線に使う beam_deformed_point_at の検証。端点（ξ=0,1）は節点
-        // 変位（scale 倍）に一致し、中央（ξ=0.5）は端部回転により弦（端点の線形
-        // 補間）から外れてたわむ。
+        // 応力図の基準線に使う BeamDeflection::point_at の検証。端点（ξ=0,1）は
+        // 節点変位（scale 倍）に一致し、中央（ξ=0.5）は端部回転により弦（端点の
+        // 線形補間）から外れてたわむ。
         let p_i = [0.0, 0.0, 0.0];
         let p_j = [6000.0, 0.0, 0.0];
         let d_i = [0.0, 0.0, 0.0, 0.0, 0.0, 0.01];
         let d_j = [0.0, 0.0, 0.0, 0.0, 0.0, -0.01];
         let scale = 2.0;
-        let a = beam_deformed_point_at(p_i, p_j, d_i, d_j, [0.0, 0.0, 1.0], scale, 0.0);
-        let b = beam_deformed_point_at(p_i, p_j, d_i, d_j, [0.0, 0.0, 1.0], scale, 1.0);
+        let bd = BeamDeflection::new(p_i, p_j, d_i, d_j, [0.0, 0.0, 1.0]);
+        let a = bd.point_at(0.0, scale);
+        let b = bd.point_at(1.0, scale);
         for k in 0..3 {
             assert!(
                 (a[k] - (p_i[k] + scale * d_i[k])).abs() < 1e-6,
@@ -2840,7 +2828,7 @@ mod tests {
                 "端点j k={k}"
             );
         }
-        let mid = beam_deformed_point_at(p_i, p_j, d_i, d_j, [0.0, 0.0, 1.0], scale, 0.5);
+        let mid = bd.point_at(0.5, scale);
         let chord_mid = [
             (a[0] + b[0]) * 0.5,
             (a[1] + b[1]) * 0.5,
