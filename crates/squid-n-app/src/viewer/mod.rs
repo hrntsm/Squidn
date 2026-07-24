@@ -794,43 +794,16 @@ pub fn viewer_panel(ui: &mut egui::Ui, app: &mut App) {
     // 主架構部材の変位から補間し、床・二次部材を変形へ追従させる。梁に載る節点は
     // 梁の Hermite 変形曲線上へ載る（`interpolate_unreferenced_disp`）。続けて剛床
     // 代表節点の鉛直変位をスレーブ平均で補い、代表点も床の変形へ追従させる。
-    let disp = disp
-        .map(|d| interpolate_unreferenced_disp(&app.model, d, app.show_beam_interpolation))
-        .map(|d| fill_diaphragm_master_disp_for_display(&app.model, d));
+    let disp = disp.map(|d| display_disp(&app.model, d, app.show_beam_interpolation));
 
-    // 変形スケール（自動）: バウンディングボックス基準（最大並進変位が対角長の
-    // 10%）を基本とし、内部たわみ表示が ON のときは梁スパン基準（梁の Hermite 内部
-    // たわみがスパンの一定割合以内。端部回転が大きいと中央が過大にふくらむのを
-    // 抑える）も併用して小さい方を採る。内部たわみ OFF（梁を直線で描く）では
-    // ふくらみが生じないためバウンディングボックス基準のみとする。手動係数
-    // （スライダー `deform_scale_factor`）を掛けた値を実効倍率とする。
-    let auto_scale = {
-        let max_disp = disp
-            .as_ref()
-            .map(|d| {
-                d.iter()
-                    .map(|v| v[0].abs().max(v[1].abs()).max(v[2].abs()))
-                    .fold(0.0_f64, f64::max)
-            })
-            .unwrap_or(0.0);
-        let bbox_scale = if max_disp > 1e-12 {
-            model_size * 0.1 / max_disp
-        } else {
-            0.0
-        };
-        if bbox_scale > 0.0 && app.show_beam_interpolation {
-            match disp
-                .as_ref()
-                .and_then(|d| beam_deflection_scale_limit(&app.model, d))
-            {
-                Some(beam_limit) => bbox_scale.min(beam_limit),
-                None => bbox_scale,
-            }
-        } else {
-            bbox_scale
-        }
-    };
-    let deform_scale_actual = auto_scale * app.deform_scale_factor as f64;
+    // 実効表示倍率（自動倍率 × 手動係数）。詳細は [`deform_display_scale`]。
+    let deform_scale_actual = deform_display_scale(
+        &app.model,
+        disp.as_deref(),
+        model_size,
+        app.show_beam_interpolation,
+        app.deform_scale_factor,
+    );
 
     // 表示用の節点 3D 座標（変形図・モード形では変位を加味）。
     // 断面ソリッド描画でも 3D 座標が要るため、投影前の座標を保持する。
@@ -856,13 +829,7 @@ pub fn viewer_panel(ui: &mut egui::Ui, app: &mut App) {
         if let Some(click_pos) = response.interact_pointer_pos() {
             if app.beam_draw_mode {
                 // 梁作成モード：クリック位置に最も近い節点を選ぶ
-                let mut best: Option<(usize, f32)> = None;
-                for (i, &p) in pts.iter().enumerate() {
-                    let d = (click_pos - egui::pos2(p[0], p[1])).length();
-                    if best.is_none_or(|(_, bd)| d < bd) {
-                        best = Some((i, d));
-                    }
-                }
+                let best = pick_nearest_node(&pts, click_pos);
                 // 節点ピッキング許容距離（px）
                 const NODE_PICK_THRESHOLD: f32 = 10.0;
                 if let Some((i, d)) = best {
@@ -911,13 +878,7 @@ pub fn viewer_panel(ui: &mut egui::Ui, app: &mut App) {
                 }
             } else if app.wall_draw_mode {
                 // 壁作成モード：クリック位置に最も近い節点を選ぶ
-                let mut best: Option<(usize, f32)> = None;
-                for (i, &p) in pts.iter().enumerate() {
-                    let d = (click_pos - egui::pos2(p[0], p[1])).length();
-                    if best.is_none_or(|(_, bd)| d < bd) {
-                        best = Some((i, d));
-                    }
-                }
+                let best = pick_nearest_node(&pts, click_pos);
                 // 節点ピッキング許容距離（px）
                 const NODE_PICK_THRESHOLD: f32 = 10.0;
                 if let Some((i, d)) = best {
@@ -959,13 +920,7 @@ pub fn viewer_panel(ui: &mut egui::Ui, app: &mut App) {
                 }
             } else if app.slab_draw_mode {
                 // スラブ作成モード：クリック位置に最も近い節点を外周順に追加する。
-                let mut best: Option<(usize, f32)> = None;
-                for (i, &p) in pts.iter().enumerate() {
-                    let d = (click_pos - egui::pos2(p[0], p[1])).length();
-                    if best.is_none_or(|(_, bd)| d < bd) {
-                        best = Some((i, d));
-                    }
-                }
+                let best = pick_nearest_node(&pts, click_pos);
                 // 節点ピッキング許容距離（px）
                 const NODE_PICK_THRESHOLD: f32 = 10.0;
                 if let Some((i, d)) = best {
@@ -979,26 +934,9 @@ pub fn viewer_panel(ui: &mut egui::Ui, app: &mut App) {
                 }
             } else {
                 // 通常モード：クリック位置に最も近い部材線分を選び、閾値内なら選択。
-                let mut best: Option<(squid_n_core::ids::ElemId, f32)> = None;
-                for elem in &app.model.elements {
-                    if elem.nodes.len() < 2 {
-                        continue;
-                    }
-                    let n0 = elem.nodes[0].index();
-                    let n1 = elem.nodes[1].index();
-                    if n0 >= pts.len() || n1 >= pts.len() {
-                        continue;
-                    }
-                    let a = pts[n0];
-                    let b = pts[n1];
-                    let d = dist_point_to_segment(click_pos, a, b);
-                    if best.is_none_or(|(_, bd)| d < bd) {
-                        best = Some((elem.id, d));
-                    }
-                }
                 // ピッキング許容距離（px）
                 const PICK_THRESHOLD: f32 = 8.0;
-                match best {
+                match pick_nearest_member(&app.model, &pts, click_pos) {
                     Some((id, d)) if d <= PICK_THRESHOLD => {
                         app.selection.members = vec![id];
                         app.nav.focus_member = Some(id);
@@ -1166,25 +1104,8 @@ pub fn viewer_panel(ui: &mut egui::Ui, app: &mut App) {
         // 同じ最近傍部材探索・8px 閾値で最寄り部材を求め、ヒットしたらツールチップ表示）。
         if cube_hover.is_none() {
             if let Some(hover_pos) = response.hover_pos() {
-                let mut best: Option<(squid_n_core::ids::ElemId, f32)> = None;
-                for elem in &app.model.elements {
-                    if elem.nodes.len() < 2 {
-                        continue;
-                    }
-                    let n0 = elem.nodes[0].index();
-                    let n1 = elem.nodes[1].index();
-                    if n0 >= pts.len() || n1 >= pts.len() {
-                        continue;
-                    }
-                    let a = pts[n0];
-                    let b = pts[n1];
-                    let d = dist_point_to_segment(hover_pos, a, b);
-                    if best.is_none_or(|(_, bd)| d < bd) {
-                        best = Some((elem.id, d));
-                    }
-                }
                 const HOVER_PICK_THRESHOLD: f32 = 8.0;
-                if let Some((id, d)) = best {
+                if let Some((id, d)) = pick_nearest_member(&app.model, &pts, hover_pos) {
                     if d <= HOVER_PICK_THRESHOLD {
                         check_ratio::show_check_tooltip(ui, app, id);
                     }
@@ -1567,7 +1488,7 @@ fn cmq_m_sample_xis(loads: &[squid_n_core::model::MemberLoadKind], l: f64) -> Ve
             }
         }
     }
-    xis.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    xis.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     xis.dedup_by(|a, b| (*a - *b).abs() < 1e-9);
     xis
 }
@@ -1672,13 +1593,8 @@ fn draw_cmq_diagram(painter: &egui::Painter, app: &App, coords3: &[[f64; 3]], pr
     let q_amp = 60.0 / max_q.max(1e-12) / scale as f64;
     let m_amp = 60.0 / max_m.max(1e-12) / scale as f64;
 
-    // 張り出し量がこの px 未満の図形は描かない。60px 正規化に対して荷重が
-    // 相対的に極小のスパン（ペントハウス階の梁など）は、ほぼ潰れた（自己折り返しの）
-    // ポリゴンになり、epaint のストローク描画（マイター結合）が折り返し点で発散して
-    // 部材軸方向に画面外まで伸びるスパイク描画になるため、視認不能な図形は
-    // 端から描かずスキップする。
-    const MIN_DIAGRAM_PX: f32 = 0.5;
-
+    // 張り出しピーク px が閾値未満の潰れた図形はスキップ（マイター発散対策。
+    // N/Q/M 図と共有する `diagram::MIN_DIAGRAM_PX`）。
     for g in &groups {
         let p_i = coords3[g.n0];
         let p_j = coords3[g.n1];
@@ -1692,7 +1608,7 @@ fn draw_cmq_diagram(painter: &egui::Painter, app: &App, coords3: &[[f64; 3]], pr
                 let (c_i, c_j) = sum_fixed_end_moments(&g.loads, l);
                 // 張り出しピーク px が閾値未満の潰れたポリゴンはスキップ（上記コメント参照）
                 let peak_px = (60.0 * c_i.abs().max(c_j.abs()) / max_c.max(1e-12)) as f32;
-                if peak_px < MIN_DIAGRAM_PX {
+                if peak_px < diagram::MIN_DIAGRAM_PX {
                     continue;
                 }
                 // C 図（モーメント）: 両端の合算 c_i, c_j を結ぶ折れ線ポリゴン。M図の規約
@@ -1737,19 +1653,18 @@ fn draw_cmq_diagram(painter: &egui::Painter, app: &App, coords3: &[[f64; 3]], pr
                     .collect();
                 // 張り出しピーク px が閾値未満の潰れたポリゴンはスキップ（上記コメント参照）
                 let peak_px = (60.0 * val_max / max_m.max(1e-12)) as f32;
-                if peak_px < MIN_DIAGRAM_PX {
+                if peak_px < diagram::MIN_DIAGRAM_PX {
                     continue;
                 }
                 let mut m_poly = Vec::with_capacity(samples.len() + 2);
                 m_poly.push(p0);
                 // 直前の点とスクリーン距離が近すぎるサンプル点は重複点として除外する
-                // （ゼロ長セグメントも epaint のマイター結合発散の原因になるため）。
-                // p0/p1 は常に残す。
-                const MIN_SEGMENT_PX: f32 = 0.25;
+                // （ゼロ長セグメントも epaint のマイター結合発散の原因になるため。
+                // N/Q/M 図と共有する `diagram::MIN_SEGMENT_PX`）。p0/p1 は常に残す。
                 let mut last = p0;
                 for (val, base3) in samples {
                     let pt = proj.project_offset(base3, ey, -val * m_amp);
-                    if (pt.x - last.x).hypot(pt.y - last.y) < MIN_SEGMENT_PX {
+                    if (pt.x - last.x).hypot(pt.y - last.y) < diagram::MIN_SEGMENT_PX {
                         continue;
                     }
                     last = pt;
@@ -1768,7 +1683,7 @@ fn draw_cmq_diagram(painter: &egui::Painter, app: &App, coords3: &[[f64; 3]], pr
                 let (q_i, q_j) = sum_simple_reactions(&g.loads, l);
                 // 張り出しピーク px が閾値未満の潰れたポリゴンはスキップ（上記コメント参照）
                 let peak_px = (60.0 * q_i.abs().max(q_j.abs()) / max_q.max(1e-12)) as f32;
-                if peak_px < MIN_DIAGRAM_PX {
+                if peak_px < diagram::MIN_DIAGRAM_PX {
                     continue;
                 }
                 // Q 図（せん断）: 両端の合算 q_i, q_j を結ぶ折れ線ポリゴン（+ey 側に描画）
@@ -1963,6 +1878,44 @@ fn dist_point_to_segment(p: egui::Pos2, a: egui::Pos2, b: egui::Pos2) -> f32 {
     let t = ((ap.x * ab.x + ap.y * ab.y) / len_sq).clamp(0.0, 1.0);
     let proj = egui::pos2(a.x + ab.x * t, a.y + ab.y * t);
     (p - proj).length()
+}
+
+/// スクリーン座標 `pos` に最も近い節点の `(index, 距離px)` を返す（同距離は先勝ち）。
+/// ピッキング（節点選択・作成モード）で共有する。
+fn pick_nearest_node(pts: &[egui::Pos2], pos: egui::Pos2) -> Option<(usize, f32)> {
+    let mut best: Option<(usize, f32)> = None;
+    for (i, &p) in pts.iter().enumerate() {
+        let d = (pos - p).length();
+        if best.is_none_or(|(_, bd)| d < bd) {
+            best = Some((i, d));
+        }
+    }
+    best
+}
+
+/// スクリーン座標 `pos` に最も近い部材（2 節点線分）の `(ElemId, 距離px)` を返す。
+/// 2 節点未満の要素・節点参照が範囲外の要素は対象外。部材ピック・ホバーで共有する。
+fn pick_nearest_member(
+    model: &squid_n_core::model::Model,
+    pts: &[egui::Pos2],
+    pos: egui::Pos2,
+) -> Option<(squid_n_core::ids::ElemId, f32)> {
+    let mut best: Option<(squid_n_core::ids::ElemId, f32)> = None;
+    for elem in &model.elements {
+        if elem.nodes.len() < 2 {
+            continue;
+        }
+        let n0 = elem.nodes[0].index();
+        let n1 = elem.nodes[1].index();
+        if n0 >= pts.len() || n1 >= pts.len() {
+            continue;
+        }
+        let d = dist_point_to_segment(pos, pts[n0], pts[n1]);
+        if best.is_none_or(|(_, bd)| d < bd) {
+            best = Some((elem.id, d));
+        }
+    }
+    best
 }
 
 /// 主架構要素（`model.elements`）に接続しない節点の変位を、主架構の変形へ
@@ -2236,6 +2189,59 @@ fn fill_diaphragm_master_disp_for_display(
         }
     }
     disp
+}
+
+/// 解析変位を表示用に加工する（いずれも描画専用の近似で、解析結果は変更しない）。
+///
+/// 1. 主架構に接続しない床・二次部材の節点を主架構の変形へ追従させる
+///    （[`interpolate_unreferenced_disp`]。梁に載る節点は内部たわみ表示 ON なら
+///    梁の Hermite 曲線上へ、OFF なら弦上へ）。
+/// 2. 剛床代表節点の鉛直変位をスレーブ平均で補い、代表点を床の変形へ追従させる
+///    （[`fill_diaphragm_master_disp_for_display`]）。
+fn display_disp(
+    model: &squid_n_core::model::Model,
+    raw: Vec<[f64; 6]>,
+    use_beam_hermite: bool,
+) -> Vec<[f64; 6]> {
+    let d = interpolate_unreferenced_disp(model, raw, use_beam_hermite);
+    fill_diaphragm_master_disp_for_display(model, d)
+}
+
+/// 変形図の実効表示倍率（自動倍率 × 手動係数）を算定する。変位が無い（`None`）・
+/// 全並進成分がゼロなら 0 を返す（変形を描かない）。
+///
+/// 自動倍率は次の小さい方:
+/// - **バウンディングボックス基準**: 最大並進変位がモデル対角長の 10% で表示される
+///   倍率 `0.1 · model_size / δ_max`。
+/// - **梁スパン基準**（`use_beam_interpolation` が真のときのみ）: 各梁の Hermite 内部
+///   たわみがスパンの一定割合を超えない上限（[`beam_deflection_scale_limit`]）。
+///   内部たわみ OFF（梁を直線で描く）ではふくらみが生じないため併用しない。
+///
+/// これに手動係数 `factor`（スライダー）を掛けた値を実効倍率とする。
+fn deform_display_scale(
+    model: &squid_n_core::model::Model,
+    disp: Option<&[[f64; 6]]>,
+    model_size: f64,
+    use_beam_interpolation: bool,
+    factor: f32,
+) -> f64 {
+    let Some(d) = disp else {
+        return 0.0;
+    };
+    let max_disp = d
+        .iter()
+        .map(|v| v[0].abs().max(v[1].abs()).max(v[2].abs()))
+        .fold(0.0_f64, f64::max);
+    if max_disp <= 1e-12 {
+        return 0.0;
+    }
+    let bbox_scale = model_size * 0.1 / max_disp;
+    let auto = if use_beam_interpolation {
+        beam_deflection_scale_limit(model, d).map_or(bbox_scale, |lim| bbox_scale.min(lim))
+    } else {
+        bbox_scale
+    };
+    auto * factor as f64
 }
 
 /// 梁のスパンに対する内部たわみが過大にならないよう、表示倍率の上限を算定する。
@@ -2934,5 +2940,52 @@ mod tests {
         model.elements.push(test_beam(0, 0, 1));
         let disp = vec![[0.0; 6], [0.0; 6]];
         assert!(beam_deflection_scale_limit(&model, &disp).is_none());
+    }
+
+    #[test]
+    fn 表示倍率は変位なし又は全ゼロでゼロ() {
+        let mut model = Model::default();
+        model.nodes.push(test_node(0, [0.0, 0.0, 0.0]));
+        model.nodes.push(test_node(1, [10000.0, 0.0, 0.0]));
+        let size = model_bbox_size(&model);
+        assert_eq!(deform_display_scale(&model, None, size, true, 1.0), 0.0);
+        let zero = vec![[0.0; 6], [0.0; 6]];
+        assert_eq!(
+            deform_display_scale(&model, Some(&zero), size, true, 1.0),
+            0.0
+        );
+    }
+
+    #[test]
+    fn 内部たわみオフの表示倍率はbox基準に手動係数を掛ける() {
+        // 梁要素が無く（＝梁スパン基準は無関係）、box 基準 × 手動係数になる。
+        let mut model = Model::default();
+        model.nodes.push(test_node(0, [0.0, 0.0, 0.0]));
+        model.nodes.push(test_node(1, [10000.0, 0.0, 0.0]));
+        let disp = vec![[0.0; 6], [100.0, 0.0, 0.0, 0.0, 0.0, 0.0]];
+        let size = model_bbox_size(&model); // 対角 10000
+                                            // box 基準 = 0.1·10000 / 100 = 10、手動係数 2 → 20。
+        let s = deform_display_scale(&model, Some(&disp), size, false, 2.0);
+        assert!((s - 20.0).abs() < 1e-9, "s={}", s);
+    }
+
+    #[test]
+    fn 内部たわみオンは梁スパン上限で倍率が制限される() {
+        // box 基準が梁スパン上限より大きい配置。ON では min(box, 梁スパン) になる。
+        let mut model = Model::default();
+        model.nodes.push(test_node(0, [0.0, 0.0, 0.0]));
+        model.nodes.push(test_node(1, [6000.0, 0.0, 0.0]));
+        model.elements.push(test_beam(0, 0, 1));
+        // 端部回転で内部たわみを生み、並進は微小にして box 基準を大きくする。
+        let disp = vec![
+            [0.0, 0.0, 0.0, 0.0, 0.0, 0.01],
+            [0.001, 0.0, 0.0, 0.0, 0.0, -0.01],
+        ];
+        let size = model_bbox_size(&model); // 6000
+        let on = deform_display_scale(&model, Some(&disp), size, true, 1.0);
+        let off = deform_display_scale(&model, Some(&disp), size, false, 1.0);
+        // OFF は box 基準のみ、ON は梁スパン上限（前掲テストの 40.5）も併用。
+        assert!(on < off, "on={on} off={off}");
+        assert!((on - 40.5).abs() < 1e-6, "on={on}");
     }
 }

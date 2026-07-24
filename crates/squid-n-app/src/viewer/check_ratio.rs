@@ -69,7 +69,11 @@ pub(super) fn ratio_for_filter(
 fn dominant_kind_of(components: &[CheckComponent]) -> Option<CheckKind> {
     components
         .iter()
-        .max_by(|a, b| a.ratio.partial_cmp(&b.ratio).unwrap())
+        .max_by(|a, b| {
+            a.ratio
+                .partial_cmp(&b.ratio)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
         .map(|c| c.kind)
 }
 
@@ -353,7 +357,11 @@ pub(super) fn draw_check_ratio(painter: &egui::Painter, app: &App, pts: &[egui::
                     CheckOutcome::Checked(cr) => Some(cr),
                     CheckOutcome::Skipped { .. } => None,
                 })
-                .max_by(|a, b| a.ratio().partial_cmp(&b.ratio()).unwrap())
+                .max_by(|a, b| {
+                    a.ratio()
+                        .partial_cmp(&b.ratio())
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
                 .and_then(dominant_kind)
         } else {
             None

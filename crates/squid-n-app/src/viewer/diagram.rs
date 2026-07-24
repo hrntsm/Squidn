@@ -27,12 +27,13 @@ use super::{diagram_offset_dir, member_len3, BeamDeflection, Projector, ViewMode
 /// 張り出しピークがこの px 未満の図形は描かない。60px 正規化に対して値が
 /// 相対的に極小の部材（ほぼ潰れた図形）は、輪郭の折り返し点で epaint のマイター
 /// 結合が発散し部材軸方向に画面外まで伸びるスパイク描画になるため、視認不能な
-/// 図形は端から描かずスキップする（CMQ 図の `MIN_DIAGRAM_PX` と同じ考え方）。
-const MIN_DIAGRAM_PX: f32 = 0.5;
+/// 図形は端から描かずスキップする。N/Q/M 図・CMQ 図で共有する。
+pub(super) const MIN_DIAGRAM_PX: f32 = 0.5;
 
 /// 輪郭の折れ線で、直前の点とのスクリーン距離がこの px 未満の連続点は間引く
 /// （ゼロ長セグメントも epaint のマイター結合発散の原因になるため）。
-const MIN_SEGMENT_PX: f32 = 0.25;
+/// N/Q/M 図・CMQ 図で共有する。
+pub(super) const MIN_SEGMENT_PX: f32 = 0.25;
 
 /// コンター表示時、各サンプル区間を細分する分割数（滑らかな色階調のため）。
 const CONTOUR_SUBDIV: usize = 8;
@@ -52,7 +53,7 @@ pub(crate) fn diagram_fill_polygons(samples: &[(f64, f64)], subdiv: usize) -> Ve
         return Vec::new();
     }
     let mut sorted = samples.to_vec();
-    sorted.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+    sorted.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
 
     let mut polys = Vec::new();
     for w in sorted.windows(2) {
@@ -210,7 +211,7 @@ pub(super) fn draw_force_diagram(
         // xi 昇順にソート（保険）
         let mut samples: Vec<(f64, f64)> =
             mf.at.iter().map(|(xi, f)| (*xi, f[force_idx])).collect();
-        samples.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+        samples.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
         if samples.len() < 2 {
             continue;
         }
